@@ -28,5 +28,11 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 python -m pip install -e .
 
+if (Get-Command ollama -ErrorAction SilentlyContinue) {
+    if (Test-Path 'scripts\pull-models.ps1') {
+        & scripts\pull-models.ps1
+    }
+}
+
 Write-Host "`nSetup complete!"
 Write-Host 'Run the assistant with: scripts\run.ps1'

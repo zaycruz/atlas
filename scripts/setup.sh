@@ -23,5 +23,9 @@ pip install --upgrade pip
 pip install -r requirements.txt
 pip install -e .
 
+if command -v ollama >/dev/null 2>&1 && [ -x "scripts/pull_models.sh" ]; then
+  ./scripts/pull_models.sh || true
+fi
+
 echo "\nSetup complete!"
 echo "Run the assistant with: ./scripts/run.sh"
