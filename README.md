@@ -45,6 +45,8 @@ sessions while keeping prompts compact.
      terminal and run `atlas`.
 
 Type into the REPL to chat. Press `Ctrl+D` (macOS/Linux) or `Ctrl+Z` then `Enter` (Windows) to exit, or type `/quit`.
+Responses stream token-by-token so you can watch ideas form in real time.
+Atlas can also request internal tools; you'll be prompted for approval when that happens.
 
 ### Ollama requirements
 
@@ -64,10 +66,17 @@ before running the launcher.
 - **Semantic memory**: after each turn the assistant asks the LLM to extract
   durable profile facts, preferences, and goals which are persisted separately
   and summarised at the start of each response.
+- **Reflective journal**: the agent can decide to write a short reflection to
+  `~/.local/share/atlas/journal.json`. Use `/journal recent` or `/journal search`
+  in the CLI to review entries.
+- **Tool registry**: Atlas can request helper actions (e.g. creating journal
+  entries or reviewing recent turns). Use `/tool list` and `/tool run` to manage
+  these manually.
 
 All memory is written to `~/.local/share/atlas/` by default. You can change the
 paths or models with environment variables: `ATLAS_MEMORY_PATH`,
-`ATLAS_SEMANTIC_PATH`, `ATLAS_CHAT_MODEL`, and `ATLAS_EMBED_MODEL`.
+`ATLAS_SEMANTIC_PATH`, `ATLAS_JOURNAL_PATH`, `ATLAS_CHAT_MODEL`, and
+`ATLAS_EMBED_MODEL`.
 
 ## Development notes
 

@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 from atlas_main.memory import EpisodicMemory, MemoryRecord, WorkingMemory, render_memory_snippets
+from atlas_main.journal import Journal
 
 
 def keyword_embedder(text: str):
@@ -59,6 +60,23 @@ class RenderSnippetsTests(unittest.TestCase):
         snippets = render_memory_snippets(records)
         self.assertIn("hello there", snippets)
         self.assertTrue(snippets.startswith("- "))
+
+
+class JournalTests(unittest.TestCase):
+    def test_add_and_search(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "journal.json"
+            journal = Journal(path)
+            journal.add_entry("Day 1", "Reflected on alpha project")
+            journal.add_entry("Day 2", "Beta thoughts and next steps")
+
+            recent = journal.recent(1)
+            self.assertEqual(len(recent), 1)
+            self.assertIn("beta", recent[0].content.lower())
+
+            matches = journal.find_by_keyword("alpha")
+            self.assertEqual(len(matches), 1)
+            self.assertIn("alpha", matches[0].content.lower())
 
 
 if __name__ == "__main__":
