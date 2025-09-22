@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.env
+.DS_Store
+pytest_cache/
+.tmp/
+*.log
+
+# Local data directories
+atlas_data/
+
+# VSCode
+.vscode/

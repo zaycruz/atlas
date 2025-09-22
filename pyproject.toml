@@ -1,0 +1,22 @@
+[tool.poetry]
+name = "atlas-main"
+version = "0.1.0"
+description = "Terminal chat interface for local Ollama models with persistent memory."
+authors = ["Your Name <you@example.com>"]
+readme = "README.md"
+packages = [{include = "atlas_main", from = "src"}]
+
+[tool.poetry.dependencies]
+python = "^3.9"
+numpy = "^1.26"
+requests = "^2.32"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3"
+
+[tool.poetry.scripts]
+atlas-chat = "atlas_main.cli:main"
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
