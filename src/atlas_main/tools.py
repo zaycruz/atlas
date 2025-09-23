@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, TYPE_CHECKING
 
@@ -127,6 +128,36 @@ register_tool(
             "Payload JSON with 'system_prompt'."
         ),
         handler=_tool_update_prompt,
+        requires_confirmation=True,
+    )
+)
+
+
+def _tool_git_update(agent: "AtlasAgent", payload: str) -> ToolResult:
+    """Pull latest git changes and optionally install requirements."""
+    repo_dir = payload.strip() or "."
+    try:
+        result = subprocess.run(
+            ["git", "pull"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        return ToolResult(False, "git command not found on PATH.")
+    if result.returncode != 0:
+        return ToolResult(False, f"git pull failed: {result.stderr.strip() or result.stdout.strip()}")
+
+    message = result.stdout.strip() or "Repository updated."
+    return ToolResult(True, message)
+
+
+register_tool(
+    Tool(
+        name="git_update",
+        description="Run 'git pull' (payload optional path). Requires confirmation.",
+        handler=_tool_git_update,
         requires_confirmation=True,
     )
 )
