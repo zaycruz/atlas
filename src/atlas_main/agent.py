@@ -44,13 +44,11 @@ These are your moment-to-moment operating instructions, guided by your Core Dire
 )
 
 AVAILABLE_TOOLS = (
-    "Available tools you can reference during reasoning:\n"
-    "- working_memory: recent user/assistant turns (already included).\n"
-    "- episodic_memory: retrieved snippets listed below.\n"
-    "- semantic_memory: profile summary listed below.\n"
-    "- journal_writer: you may suggest reflective notes; persistence is automatic.\n"
-    "- user_commands: instruct the user to run /journal or other commands when manual actions are needed.\n"
-    "If you want a tool executed, append <<tool_request:tool_name|payload>> after your response."
+    "Tool registry (request via <<tool_request:name|payload>>):\n"
+    "- journal_entry: persist reflections; payload JSON with 'title' and 'entry'.\n"
+    "- memory_snapshot: show latest turns; optional numeric payload for count.\n"
+    "- prompt_update: replace the current system prompt; payload JSON with 'system_prompt'.\n"
+    "You may also remind the user to run CLI commands (e.g., /tool list, /journal recent)."
 )
 
 TOOL_REQUEST_PATTERN = re.compile(r"<<tool_request:(?P<name>[^|>]+)\|(?P<payload>.*?)>>", re.DOTALL)

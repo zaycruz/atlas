@@ -122,7 +122,10 @@ def _tool_update_prompt(agent: "AtlasAgent", payload: str) -> ToolResult:
 register_tool(
     Tool(
         name="prompt_update",
-        description="Update the agent's system prompt. Payload JSON with 'system_prompt'.",
+        description=(
+            "Update the agent's system prompt via the tool registry. "
+            "Payload JSON with 'system_prompt'."
+        ),
         handler=_tool_update_prompt,
         requires_confirmation=True,
     )
