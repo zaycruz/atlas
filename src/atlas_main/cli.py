@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import textwrap
 import time
+import logging
 
 from rich.console import Console
 from rich.panel import Panel
@@ -11,6 +12,7 @@ from rich.table import Table
 
 from .agent import AtlasAgent
 from .ollama import OllamaClient
+from .atlas_core.controller import ReasoningController
 from . import tools as tool_registry
 
 ASCII_ATLAS = r"""
@@ -26,6 +28,9 @@ console = Console()
 
 
 def main() -> None:
+    # Set up logging
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    
     console.print(Panel.fit(ASCII_ATLAS, style="cyan"))
     console.print("[bold cyan]Make of this what you will.[/bold cyan]")
     console.print(textwrap.fill("Atlas ready. Type your prompt and press Enter. Use Ctrl+D or /quit to exit.", width=72))
@@ -33,6 +38,7 @@ def main() -> None:
     console.print(textwrap.fill("use /model list to view available models.", width=72))
     client = OllamaClient()
     agent = AtlasAgent(client)
+    controller = ReasoningController(agent, agent.policies_path)
 
     try:
         while True:
@@ -55,7 +61,7 @@ def main() -> None:
                 break
 
             if stripped.startswith("/"):
-                if _handle_command(agent, stripped):
+                if _handle_command(agent, controller, stripped):
                     continue
 
             console.print("[bold cyan]atlas:[/bold cyan]")
@@ -65,7 +71,7 @@ def main() -> None:
                 buffer.append(chunk)
                 console.print(chunk, end="", highlight=False, soft_wrap=True)
 
-            agent.respond(user_text, stream_callback=stream_chunk)
+            controller.process_turn(user_text, stream_callback=stream_chunk)
             console.print("")  # Final newline after streaming
 
             pending_tool = agent.pop_tool_request()
@@ -75,7 +81,7 @@ def main() -> None:
         client.close()
 
 
-def _handle_command(agent: AtlasAgent, command_line: str) -> bool:
+def _handle_command(agent: AtlasAgent, controller: ReasoningController, command_line: str) -> bool:
     parts = command_line[1:].strip().split()
     if not parts:
         return True
@@ -90,7 +96,25 @@ def _handle_command(agent: AtlasAgent, command_line: str) -> bool:
         _handle_tool(agent, rest)
         return True
     if cmd == "model":
-        _handle_model(agent, rest)
+        _handle_model(agent, rest, controller)
+        return True
+    if cmd == "memory":
+        _handle_memory(agent, rest)
+        return True
+    if cmd == "log":
+        _handle_log(rest)
+        return True
+    if cmd == "thinking":
+        _handle_thinking(agent, rest)
+        return True
+    if cmd == "identity":
+        _handle_identity(agent, rest)
+        return True
+    if cmd == "desires":
+        _handle_desires(agent, rest)
+        return True
+    if cmd == "loopsteps":
+        _handle_loopsteps(controller, rest)
         return True
     console.print(f"Unknown command: {cmd}. Type /help for options.", style="yellow")
     return True
@@ -104,8 +128,108 @@ def _print_help() -> None:
     table.add_row("  /tool list", "list available tools")
     table.add_row("  /tool run <name> [args]", "execute a tool manually")
     table.add_row("  /model <name>", "switch the active Ollama model")
+    table.add_row("  /memory status", "show memory store paths and stats")
+    table.add_row("  /memory recent [N]", "show the most recent episodic memories (default 5)")
+    table.add_row("  /identity summary", "show Atlas's current identity summary")
+    table.add_row("  /identity history [N]", "show recent identity changes (default 5)")
+    table.add_row("  /desires summary", "show current active motivations")
+    table.add_row("  /desires history [N]", "show recent desire updates (default 5)")
+    table.add_row("  /log <off|error|warn|info|debug>", "set logging verbosity or turn it off")
+    table.add_row("  /thinking <on|off>", "show or hide model reasoning (e.g., <think> blocks)")
+    table.add_row("  /loopsteps <N>", "set internal reasoning+tools loop steps (1+)")
     table.add_row("  /quit", "exit the chat")
     console.print(table)
+
+
+def _handle_memory(agent: AtlasAgent, args: list[str]) -> None:
+    if not args:
+        console.print("Usage: /memory <status|reindex>", style="yellow")
+        return
+    sub, *rest = args
+    if sub == "status":
+        result = tool_registry.execute_tool(agent, "memory_status", "")
+        style = "green" if result.success else "red"
+        console.print(result.message, style=style)
+        return
+    if sub == "recent":
+        n = 5
+        if rest:
+            try:
+                n = max(1, int(rest[0]))
+            except ValueError:
+                n = 5
+        try:
+            records = agent.episodic_memory.get_recent(n)
+        except Exception as exc:
+            console.print(f"Failed to fetch recent memories: {exc}", style="red")
+            return
+        if not records:
+            console.print("(no episodic memories)", style="dim")
+            return
+        console.print(f"[bold]Most recent {len(records)} episodic memories:[/bold]")
+        for rec in records:
+            ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(rec.timestamp)) if getattr(rec, 'timestamp', None) else ""
+            user_snip = (rec.user or "").replace("\n", " ")[:120]
+            asst_snip = (rec.assistant or "").replace("\n", " ")[:120]
+            console.print(f"- [cyan]{ts}[/cyan] | user: {user_snip}")
+            if asst_snip:
+                console.print(f"  assistant: {asst_snip}")
+        return
+    if sub == "reindex":
+        bs = None
+        if rest:
+            try:
+                bs = int(rest[0])
+            except ValueError:
+                bs = None
+        payload = json.dumps({"batch_size": bs}) if bs else ""
+        tool = tool_registry.get_tool("memory_reindex")
+        if tool and tool.requires_confirmation:
+            answer = console.input("Reindex episodic memory now? This will rebuild the vector store. [y/N] ").strip().lower()
+            if answer not in {"y", "yes"}:
+                console.print("Skipped reindex.", style="yellow")
+                return
+        result = tool_registry.execute_tool(agent, "memory_reindex", payload)
+        style = "green" if result.success else "red"
+        console.print(result.message, style=style)
+        return
+    console.print(f"Unknown memory command: {sub}", style="yellow")
+
+
+def _handle_log(args: list[str]) -> None:
+    if not args:
+        console.print("Usage: /log <off|error|warn|info|debug>", style="yellow")
+        return
+    level = args[0].lower()
+    root = logging.getLogger()
+    if level == "off":
+        logging.disable(logging.CRITICAL)
+        console.print("Logging disabled (off)", style="green")
+        return
+    # Re-enable if previously disabled
+    logging.disable(logging.NOTSET)
+    mapping = {
+        "error": logging.ERROR,
+        "warn": logging.WARNING,
+        "warning": logging.WARNING,
+        "info": logging.INFO,
+        "debug": logging.DEBUG,
+    }
+    selected = mapping.get(level)
+    if selected is None:
+        console.print("Usage: /log <off|error|warn|info|debug>", style="yellow")
+        return
+    root.setLevel(selected)
+    console.print(f"Logging level set to {level.upper()}", style="green")
+
+
+def _handle_thinking(agent: AtlasAgent, args: list[str]) -> None:
+    if not args or args[0].lower() not in {"on", "off"}:
+        console.print("Usage: /thinking <on|off>", style="yellow")
+        return
+    agent.show_thinking = (args[0].lower() == "on")
+    state = "ON" if agent.show_thinking else "OFF"
+    console.print(f"Thinking visibility set to {state}", style="green")
 
 
 def _handle_journal(agent: AtlasAgent, args: list[str]) -> None:
@@ -162,9 +286,22 @@ def _process_tool_request(agent: AtlasAgent, request: dict) -> None:
         console.print("Tool request skipped.", style="yellow")
         return
     result = tool_registry.execute_tool(agent, tool.name, payload)
-    status = "✔" if result.success else "✖"
-    style = "green" if result.success else "red"
-    console.print(f"{status} {result.message}", style=style)
+    if result.success:
+        console.print(f"✔ {result.message}", style="green")
+        return
+    # Auto-retry: feed error back into the agent to let it correct the tool request once
+    console.print(f"✖ {result.message}", style="red")
+    hint = (
+        f"The tool '{tool.name}' failed with: {result.message}. "
+        f"If this is a path issue, call 'repo_info' first and then retry with a repo-relative path."
+    )
+    # Let the agent reason and possibly emit a corrected tool request
+    followup = agent.respond(hint)
+    # Process one more potential tool request
+    pending = agent.pop_tool_request()
+    if pending:
+        console.print("[bold magenta]Retrying tool with corrected request...[/bold magenta]")
+        _process_tool_request(agent, pending)
 
 
 def _handle_tool(agent: AtlasAgent, args: list[str]) -> None:
@@ -204,7 +341,86 @@ def _handle_tool(agent: AtlasAgent, args: list[str]) -> None:
     console.print(f"Unknown tool command: {sub}", style="yellow")
 
 
-def _handle_model(agent: AtlasAgent, args: list[str]) -> None:
+def _handle_identity(agent: AtlasAgent, args: list[str]) -> None:
+    if not args:
+        console.print("Usage: /identity <summary|history [N]>", style="yellow")
+        return
+    sub, *rest = args
+    if sub == "summary":
+        console.print("[bold]Identity summary:[/bold]")
+        console.print(agent.identity.summary(), soft_wrap=True)
+        return
+    if sub == "history":
+        n = 5
+        if rest:
+            try:
+                n = max(1, int(rest[0]))
+            except ValueError:
+                pass
+        entries = agent.identity.list_history(limit=n)
+        if not entries:
+            console.print("(no identity changes yet)", style="dim")
+            return
+        console.print(f"[bold]Last {len(entries)} identity change sets:[/bold]")
+        for h in entries:
+            ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(h.get("timestamp", 0)))
+            changes = h.get("changes", {})
+            added = changes.get("added", [])
+            adjusted = changes.get("adjusted", [])
+            removed = changes.get("removed", [])
+            console.print(f"- [cyan]{ts}[/cyan]")
+            if added:
+                console.print("  added: " + ", ".join([f"{a.get('category')}: {a.get('text')} ({a.get('confidence', '')})" for a in added]))
+            if adjusted:
+                console.print("  adjusted: " + ", ".join([f"{a.get('category')}: {a.get('text')} -> {a.get('confidence', '')}" for a in adjusted]))
+            if removed:
+                console.print("  removed: " + ", ".join([f"{a.get('category')}: {a.get('text')}" for a in removed]))
+        return
+    console.print(f"Unknown identity command: {sub}", style="yellow")
+
+
+def _handle_desires(agent: AtlasAgent, args: list[str]) -> None:
+    if not args:
+        console.print("Usage: /desires <summary|history [N]>", style="yellow")
+        return
+    sub, *rest = args
+    if sub == "summary":
+        console.print("[bold]Active motivations:[/bold]")
+        console.print(agent.desires.summary(), soft_wrap=True)
+        return
+    if sub == "history":
+        n = 5
+        if rest:
+            try:
+                n = max(1, int(rest[0]))
+            except ValueError:
+                pass
+        entries = agent.desires.list_history(limit=n)
+        if not entries:
+            console.print("(no desire updates yet)", style="dim")
+            return
+        console.print(f"[bold]Last {len(entries)} desire updates:[/bold]")
+        for h in entries:
+            ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(h.get("timestamp", 0)))
+            changes = h.get("changes", {})
+            added = changes.get("added", [])
+            boosted = changes.get("boosted", [])
+            dampened = changes.get("dampened", [])
+            removed = changes.get("removed", [])
+            console.print(f"- [cyan]{ts}[/cyan]")
+            if added:
+                console.print("  added: " + ", ".join([f"{a.get('name')}: {a.get('intensity', '')}" for a in added]))
+            if boosted:
+                console.print("  boosted: " + ", ".join([f"{a.get('name')}: {a.get('intensity', '')}" for a in boosted]))
+            if dampened:
+                console.print("  dampened: " + ", ".join([f"{a.get('name')}: {a.get('intensity', '')}" for a in dampened]))
+            if removed:
+                console.print("  removed: " + ", ".join([f"{a.get('name')}" for a in removed]))
+        return
+    console.print(f"Unknown desires command: {sub}", style="yellow")
+
+
+def _handle_model(agent: AtlasAgent, args: list[str], controller: ReasoningController | None = None) -> None:
     if not args:
         console.print(f"Current model: [cyan]{agent.chat_model}[/cyan]", style="bold")
         console.print("Usage: /model <name> | /model list", style="yellow")
@@ -230,7 +446,26 @@ def _handle_model(agent: AtlasAgent, args: list[str]) -> None:
         console.print("Usage: /model <name>", style="yellow")
         return
     agent.set_chat_model(new_model)
+    # Reset controller loop steps based on model defaults, if available
+    if controller is not None:
+        controller.set_max_steps(ReasoningController.default_max_steps_for_model(new_model))
     console.print(f"Switched to model [cyan]{new_model}[/cyan].")
+
+
+def _handle_loopsteps(controller: ReasoningController, args: list[str]) -> None:
+    if not args:
+        console.print(f"Current loop steps: {controller.max_steps}", style="bold")
+        console.print("Usage: /loopsteps <N>", style="yellow")
+        return
+    try:
+        n = int(args[0])
+        if n < 1:
+            raise ValueError
+    except ValueError:
+        console.print("/loopsteps requires a positive integer.", style="yellow")
+        return
+    controller.set_max_steps(n)
+    console.print(f"Internal loop steps set to {n}", style="green")
 
 
 if __name__ == "__main__":  # pragma: no cover

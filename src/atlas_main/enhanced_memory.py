@@ -23,6 +23,8 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple, Any
 import numpy as np
+import chromadb
+from sentence_transformers import SentenceTransformer
 
 from .memory import MemoryRecord, EmbeddingFunction
 
@@ -1136,12 +1138,21 @@ class EnhancedEpisodicMemory(MemoryBackend):
         self.embedding_fn = embedding_fn
         self.max_records = max(100, max_records)
         
+        # Initialize ChromaDB for vector storage
+        self.chroma_client = chromadb.PersistentClient(path=str(self.storage_path.parent / "vector_store"))
+        self.collection = self.chroma_client.get_or_create_collection(name="episodic_memory")
+        
+        # Initialize embedder if not provided
+        if not self.embedding_fn:
+            self.embedder = SentenceTransformer('intfloat/e5-large-v2')
+            self.embedding_fn = lambda text: self.embedder.encode(text).tolist()
+        
         # Enhanced memory components
         self.chunker = chunker or ContextualChunker()
         self.temporal_weighting = temporal_weighting or TemporalMemoryWeighting()
         self.session_memory = session_memory
         
-        # Record storage
+        # Record storage (keep in memory for now, but persist to Chroma)
         self._records: List[ChunkedMemoryRecord] = []
         self._chunk_index: Dict[str, List[str]] = {}  # parent_id -> child_ids mapping
         
@@ -1149,51 +1160,78 @@ class EnhancedEpisodicMemory(MemoryBackend):
         self._load()
     
     def _load(self) -> None:
-        """Load memory records from persistent storage with migration support."""
-        if not self.storage_path.exists():
-            self._records = []
-            return
-        
+        """Load memory records from ChromaDB, with migration from JSON if needed."""
         try:
-            with open(self.storage_path, 'r', encoding='utf-8') as f:
-                raw_data = json.load(f)
-        except (json.JSONDecodeError, UnicodeDecodeError) as e:
-            # Handle corrupted file
-            backup_path = self.storage_path.with_suffix('.corrupt')
-            if self.storage_path.exists():
-                self.storage_path.rename(backup_path)
-            print(f"Warning: Corrupted memory file backed up to {backup_path}")
+            results = self.collection.get(include=['documents', 'metadatas', 'embeddings'])
             self._records = []
-            return
+            for i, doc in enumerate(results['documents']):
+                metadata = results['metadatas'][i]
+                # Normalize parent_id: store as None for parents (Chroma persists '' for None)
+                raw_parent_id = metadata.get('parent_id')
+                parent_id = None if (raw_parent_id is None or str(raw_parent_id).strip() == "") else str(raw_parent_id)
+                embedding = results['embeddings'][i]
+                record = ChunkedMemoryRecord(
+                    id=metadata.get('id', str(uuid.uuid4())),
+                    parent_id=parent_id,
+                    chunk_index=int(metadata.get('chunk_index', 0)),
+                    user=metadata.get('user', ''),
+                    assistant=metadata.get('assistant', ''),
+                    content=doc,
+                    timestamp=float(metadata.get('timestamp', time.time())),
+                    embedding=list(embedding) if embedding is not None else None,
+                    access_count=int(metadata.get('access_count', 0)),
+                    last_accessed=float(metadata.get('last_accessed', time.time())),
+                    importance_score=float(metadata.get('importance_score', 1.0))
+                )
+                self._records.append(record)
+        except Exception as e:
+            print(f"Warning: Failed to load from Chroma: {e}")
+            self._records = []
         
-        # Handle different file formats for backward compatibility
-        if isinstance(raw_data, dict):
-            if 'format_version' in raw_data:
-                # Enhanced format
-                records_data = raw_data.get('records', [])
-                records = []
-                for record_dict in records_data:
-                    try:
-                        record = ChunkedMemoryRecord.from_dict(record_dict)
-                        records.append(record)
-                    except Exception as e:
-                        print(f"Warning: Failed to load record: {e}")
-                        continue
-                self._records = records
-            elif 'records' in raw_data:
-                # Legacy format v1: {"records": [...]}
-                legacy_records = raw_data['records']
-                self._migrate_legacy_records(legacy_records)
-            else:
-                # Unknown dict format
-                print(f"Warning: Unknown memory file format")
-                self._records = []
-        elif isinstance(raw_data, list):
-            # Legacy format v0: [...]
-            self._migrate_legacy_records(raw_data)
-        else:
-            print(f"Warning: Unsupported memory file format")
-            self._records = []
+        # If no records in Chroma, try migrating from JSON
+        if not self._records and self.storage_path.exists():
+            try:
+                with open(self.storage_path, 'r', encoding='utf-8') as f:
+                    raw_data = json.load(f)
+                
+                if isinstance(raw_data, dict) and 'records' in raw_data:
+                    legacy_records = raw_data['records']
+                    for record_dict in legacy_records:
+                        try:
+                            record = ChunkedMemoryRecord(
+                                id=record_dict.get('id', str(uuid.uuid4())),
+                                user=record_dict.get('user', ''),
+                                assistant=record_dict.get('assistant', ''),
+                                content=f"User: {record_dict.get('user', '')}\nAssistant: {record_dict.get('assistant', '')}",
+                                timestamp=float(record_dict.get('timestamp', time.time())),
+                                embedding=record_dict.get('embedding')
+                            )
+                            self._records.append(record)
+                        except Exception as e:
+                            print(f"Warning: Failed to migrate record: {e}")
+                            continue
+                    
+                    # Add migrated records to Chroma
+                    if self._records:
+                        ids = [r.id for r in self._records]
+                        documents = [r.content for r in self._records]
+                        metadatas = [{
+                            'id': r.id,
+                            'parent_id': r.parent_id or '',
+                            'chunk_index': r.chunk_index,
+                            'user': r.user,
+                            'assistant': r.assistant,
+                            'timestamp': r.timestamp,
+                            'access_count': r.access_count or 0,
+                            'last_accessed': r.last_accessed or r.timestamp,
+                            'importance_score': r.importance_score or 1.0
+                        } for r in self._records]
+                        embeddings = [r.embedding for r in self._records if r.embedding]
+                        if embeddings:
+                            self.collection.add(ids=ids, documents=documents, metadatas=metadatas, embeddings=embeddings)
+                        print(f"Migrated {len(self._records)} records from JSON to ChromaDB.")
+            except Exception as e:
+                print(f"Warning: Migration failed: {e}")
         
         # Rebuild chunk index
         self._rebuild_chunk_index()
@@ -1337,15 +1375,57 @@ class EnhancedEpisodicMemory(MemoryBackend):
         """
         if limit <= 0:
             return []
-        
-        # Get recent records, prioritizing parent records for compatibility
-        recent_records = []
+
+        # Get recent parent records when available
+        recent_records: List[MemoryRecord] = []
+        seen_parent_ids = set()
         for record in reversed(self._records):
             if record.is_parent:
                 recent_records.append(record.to_legacy_record())
+                seen_parent_ids.add(record.id)
+                if len(recent_records) >= limit:
+                    return recent_records
+
+        # Fallback: synthesize from child chunks if no parents (or not enough)
+        if len(recent_records) < limit:
+            for record in reversed(self._records):
+                if not record.is_child:
+                    continue
+                # Skip if we already captured its parent via a parent record
+                if record.parent_id and record.parent_id in seen_parent_ids:
+                    continue
+                # Try to extract the latest user/assistant pair from full_context
+                user_text = ""
+                assistant_text = ""
+                ctx = record.full_context or record.content or ""
+                try:
+                    a_idx = ctx.rfind("Assistant:")
+                    if a_idx != -1:
+                        assistant_text = ctx[a_idx + len("Assistant:"):].strip()
+                        # Find the preceding user
+                        u_idx = ctx.rfind("User:", 0, a_idx)
+                        if u_idx != -1:
+                            user_text = ctx[u_idx + len("User:"):a_idx].strip()
+                    else:
+                        # Fallback to chunk content as assistant snippet
+                        assistant_text = (record.content or "").strip()
+                except Exception:
+                    assistant_text = (record.content or "").strip()
+                # Build a legacy MemoryRecord view
+                legacy = MemoryRecord(
+                    id=record.id,
+                    user=user_text,
+                    assistant=assistant_text,
+                    timestamp=record.timestamp,
+                    embedding=None,
+                )
+                recent_records.append(legacy)
+                # Mark its parent to avoid duplicates from the same conversation
+                if record.parent_id:
+                    seen_parent_ids.add(record.parent_id)
                 if len(recent_records) >= limit:
                     break
-        
+
         return recent_records
     
     def recall(
@@ -1367,47 +1447,40 @@ class EnhancedEpisodicMemory(MemoryBackend):
         Returns:
             List of relevant ChunkedMemoryRecord objects with context
         """
-        if top_k <= 0 or not self._records:
+        if top_k <= 0:
             return []
         
         if not self.embedding_fn:
             # Fallback to recent records if no embedding function
-            return self._records[-top_k:]
+            return self._records[-top_k:] if self._records else []
         
-        # Generate query embedding
+        # Use ChromaDB for similarity search (embed query locally to match collection dim)
         try:
-            query_embedding = self.embedding_fn(query)
-            if not query_embedding:
-                return self._records[-top_k:]
-        except Exception:
-            return self._records[-top_k:]
+            query_vec = None
+            if self.embedding_fn:
+                try:
+                    qemb = self.embedding_fn(query)
+                    if qemb is not None:
+                        query_vec = list(qemb)
+                except Exception as ee:
+                    print(f"Warning: Failed to embed query, falling back to recent: {ee}")
+            if query_vec is None:
+                return self._records[-top_k:] if self._records else []
+
+            results = self.collection.query(query_embeddings=[query_vec], n_results=top_k, include=['metadatas', 'distances'])
+            top_ids = results['ids'][0] if results['ids'] else []
+            distances = results['distances'][0] if results['distances'] else []
+        except Exception as e:
+            print(f"Warning: Chroma query failed: {e}")
+            return self._records[-top_k:] if self._records else []
         
-        query_vec = np.asarray(query_embedding, dtype=float)
-        if not np.isfinite(query_vec).all():
-            return self._records[-top_k:]
-        
-        # Score all records with embeddings
-        scored_records = []
-        
-        for record in self._records:
-            if not record.embedding:
-                continue
-            
-            try:
-                candidate_vec = np.asarray(record.embedding, dtype=float)
-                if candidate_vec.shape != query_vec.shape:
-                    continue
-                
-                # Calculate base cosine similarity
-                denom = np.linalg.norm(query_vec) * np.linalg.norm(candidate_vec)
-                if denom == 0:
-                    continue
-                
-                similarity = float(np.dot(query_vec, candidate_vec) / denom)
-                if math.isnan(similarity):
-                    continue
-                
-                # Apply temporal weighting and importance boosting
+        # Get records by ids
+        top_records = []
+        for i, rec_id in enumerate(top_ids):
+            record = self._find_record_by_id(rec_id)
+            if record:
+                # Apply temporal weighting to the similarity score
+                similarity = 1 - distances[i]  # Chroma returns cosine distance, convert to similarity
                 final_score = self.temporal_weighting.calculate_final_score(
                     similarity_score=similarity,
                     timestamp=record.timestamp,
@@ -1415,16 +1488,12 @@ class EnhancedEpisodicMemory(MemoryBackend):
                     base_importance=record.importance_score,
                     memory_type=memory_type
                 )
-                
-                scored_records.append((final_score, record))
-                
-            except Exception:
-                # Skip records with problematic embeddings
-                continue
+                top_records.append(record)
         
-        # Sort by final score and take top results
-        scored_records.sort(key=lambda x: x[0], reverse=True)
-        top_records = [record for _, record in scored_records[:top_k]]
+        # If not enough from Chroma, fallback to recent
+        if len(top_records) < top_k and self._records:
+            recent = [r for r in self._records[-top_k:] if r not in top_records]
+            top_records.extend(recent[:top_k - len(top_records)])
         
         # Enhance results with parent context if requested
         if include_parents:
@@ -1522,10 +1591,39 @@ class EnhancedEpisodicMemory(MemoryBackend):
         # Add to record storage
         self._records.extend(chunks)
         
+        # Add to ChromaDB
+        try:
+            # Only add records that have embeddings to keep dimensions consistent
+            ids = []
+            documents = []
+            metadatas = []
+            embeddings = []
+            for chunk in chunks:
+                if chunk.embedding is None:
+                    continue
+                ids.append(chunk.id)
+                documents.append(chunk.content)
+                metadatas.append({
+                    'id': chunk.id,
+                    'parent_id': chunk.parent_id or '',
+                    'chunk_index': chunk.chunk_index,
+                    'user': chunk.user,
+                    'assistant': chunk.assistant,
+                    'timestamp': chunk.timestamp,
+                    'access_count': chunk.access_count or 0,
+                    'last_accessed': chunk.last_accessed or chunk.timestamp,
+                    'importance_score': chunk.importance_score or 1.0
+                })
+                embeddings.append(chunk.embedding)
+            if ids:
+                self.collection.add(ids=ids, documents=documents, metadatas=metadatas, embeddings=embeddings)
+        except Exception as e:
+            print(f"Warning: Failed to add to Chroma: {e}")
+        
         # Enforce memory limits
         self._enforce_memory_limits()
         
-        # Persist to storage
+        # Persist to storage (now Chroma handles persistence)
         try:
             self._save()
         except Exception as e:
@@ -1538,12 +1636,98 @@ class EnhancedEpisodicMemory(MemoryBackend):
         self._records = []
         self._chunk_index = {}
         
+        # Clear ChromaDB collection
+        try:
+            self.chroma_client.delete_collection(name="episodic_memory")
+            self.collection = self.chroma_client.create_collection(name="episodic_memory")
+        except Exception as e:
+            print(f"Warning: Failed to clear Chroma: {e}")
+        
         if self.storage_path.exists():
             backup_path = self.storage_path.with_suffix('.backup')
             self.storage_path.rename(backup_path)
             print(f"Memory cleared, backup saved to {backup_path}")
     
     # Enhanced functionality
+
+    def reindex(self, batch_size: int = 128) -> Dict[str, Any]:
+        """Recompute embeddings for all records with current embedding_fn and rebuild Chroma.
+
+        Args:
+            batch_size: number of records to add to Chroma in each batch.
+
+        Returns:
+            Summary dict with counts and timing.
+        """
+        start = time.time()
+        if not self.embedding_fn:
+            return {"reindexed": 0, "skipped": len(self._records), "error": "No embedding_fn configured"}
+
+        # Recompute embeddings consistently with remember()
+        reindexed = 0
+        skipped = 0
+        for rec in self._records:
+            try:
+                embed_text = rec.content
+                if rec.is_parent:
+                    embed_text = f"User: {rec.user}\nAssistant: {rec.assistant}"
+                emb = self.embedding_fn(embed_text)
+                if emb:
+                    rec.embedding = list(emb)
+                    reindexed += 1
+                else:
+                    skipped += 1
+            except Exception:
+                skipped += 1
+
+        # Rebuild Chroma collection
+        try:
+            self.chroma_client.delete_collection(name="episodic_memory")
+        except Exception:
+            # ignore if it doesn't exist
+            pass
+        self.collection = self.chroma_client.get_or_create_collection(name="episodic_memory")
+
+        # Add in batches
+        ids: List[str] = []
+        documents: List[str] = []
+        metadatas: List[Dict[str, Any]] = []
+        embeddings: List[List[float]] = []
+
+        def flush_batch():
+            if ids:
+                self.collection.add(ids=ids, documents=documents, metadatas=metadatas, embeddings=embeddings)
+
+        for rec in self._records:
+            if rec.embedding is None:
+                continue
+            ids.append(rec.id)
+            documents.append(rec.content)
+            metadatas.append({
+                'id': rec.id,
+                'parent_id': rec.parent_id or '',
+                'chunk_index': rec.chunk_index,
+                'user': rec.user,
+                'assistant': rec.assistant,
+                'timestamp': rec.timestamp,
+                'access_count': rec.access_count or 0,
+                'last_accessed': rec.last_accessed or rec.timestamp,
+                'importance_score': rec.importance_score or 1.0
+            })
+            embeddings.append(rec.embedding)
+            if len(ids) >= batch_size:
+                flush_batch()
+                ids.clear(); documents.clear(); metadatas.clear(); embeddings.clear()
+
+        flush_batch()
+        elapsed = time.time() - start
+        # Persist JSON backup with updated embeddings
+        try:
+            self._save()
+        except Exception:
+            pass
+
+        return {"reindexed": reindexed, "skipped": skipped, "elapsed_sec": round(elapsed, 3)}
     
     def get_memory_stats(self) -> Dict[str, Any]:
         """Get comprehensive memory system statistics.
