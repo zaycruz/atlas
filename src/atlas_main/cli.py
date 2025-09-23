@@ -68,6 +68,9 @@ def main() -> None:
 
                 reply = agent.respond(user_text, stream_callback=live_stream)
 
+            if buffer:
+                console.print(Markdown("".join(buffer)))
+
             pending_tool = agent.pop_tool_request()
             if pending_tool:
                 _process_tool_request(agent, pending_tool)

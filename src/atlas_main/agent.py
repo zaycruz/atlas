@@ -162,6 +162,10 @@ class AtlasAgent:
     def set_chat_model(self, model: str) -> None:
         self.chat_model = model.strip() or self.chat_model
 
+    def update_system_prompt(self, prompt: str) -> None:
+        if prompt.strip():
+            self.system_prompt = prompt.strip()
+
     # ------------------------------------------------------------------
     def _maybe_journal(self, user_text: str, assistant_text: str) -> None:
         prompt = (

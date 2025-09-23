@@ -105,6 +105,30 @@ register_tool(
 )
 
 
+def _tool_update_prompt(agent: "AtlasAgent", payload: str) -> ToolResult:
+    if not payload:
+        return ToolResult(False, "prompt_update requires JSON payload with 'system_prompt'.")
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        return ToolResult(False, "Invalid JSON payload for prompt_update.")
+    prompt = str(data.get("system_prompt") or "").strip()
+    if not prompt:
+        return ToolResult(False, "'system_prompt' must be a non-empty string.")
+    agent.update_system_prompt(prompt)
+    return ToolResult(True, "System prompt updated.")
+
+
+register_tool(
+    Tool(
+        name="prompt_update",
+        description="Update the agent's system prompt. Payload JSON with 'system_prompt'.",
+        handler=_tool_update_prompt,
+        requires_confirmation=True,
+    )
+)
+
+
 __all__ = [
     "Tool",
     "ToolResult",
