@@ -159,6 +159,9 @@ class AtlasAgent:
         self._pending_tool_request = None
         return request
 
+    def set_chat_model(self, model: str) -> None:
+        self.chat_model = model.strip() or self.chat_model
+
     # ------------------------------------------------------------------
     def _maybe_journal(self, user_text: str, assistant_text: str) -> None:
         prompt = (
