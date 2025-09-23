@@ -1,8 +1,15 @@
 """Atlas CLI with journaling commands."""
 from __future__ import annotations
 
+import json
 import textwrap
 import time
+
+from rich.console import Console
+from rich.markdown import Markdown
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
 
 from .agent import AtlasAgent
 from .ollama import OllamaClient
@@ -17,28 +24,25 @@ ASCII_ATLAS = r"""
    ╚═╝  ╚═╝   ╚═╝   ╚══════╝╚═╝  ╚═╝╚══════╝
 """
 
-TAGLINE = "Your autistic pal in the terminal."
-BANNER_COLOR = "\033[1;96m"
-TAGLINE_COLOR = "\033[96m"
-RESET_COLOR = "\033[0m"
+console = Console()
 
 
 def main() -> None:
-    print(f"{BANNER_COLOR}{ASCII_ATLAS}{RESET_COLOR}")
-    print(f"{TAGLINE_COLOR}{TAGLINE}{RESET_COLOR}")
-    print(textwrap.fill("Atlas ready. Type your prompt and press Enter. Use Ctrl+D or /quit to exit.", width=72))
+    console.print(Panel.fit(ASCII_ATLAS, style="cyan"))
+    console.print("[bold cyan]Your autistic pal in the terminal.[/bold cyan]")
+    console.print(textwrap.fill("Atlas ready. Type your prompt and press Enter. Use Ctrl+D or /quit to exit.", width=72))
     client = OllamaClient()
     agent = AtlasAgent(client)
 
     try:
         while True:
             try:
-                user_text = input("you> ")
+                user_text = console.input("[bold green]you: [/bold green]")
             except EOFError:
-                print("\nGoodbye.")
+                console.print("\n[bold yellow]Goodbye.[/bold yellow]")
                 break
             except KeyboardInterrupt:
-                print("\n(Interrupted. Type /quit to exit.)")
+                console.print("\n[bold yellow](Interrupted. Type /quit to exit.)[/bold yellow]")
                 continue
 
             stripped = user_text.strip()
@@ -47,21 +51,26 @@ def main() -> None:
 
             lowered = stripped.lower()
             if lowered in {"/quit", "/exit"}:
-                print("Exiting.")
+                console.print("[bold yellow]Exiting.[/bold yellow]")
                 break
 
             if stripped.startswith("/"):
                 if _handle_command(agent, stripped):
                     continue
 
-            print("atlas> ", end="", flush=True)
-            def stream_print(chunk: str) -> None:
-                print(chunk, end="", flush=True)
+            console.print("[bold cyan]atlas:[/bold cyan]")
+            buffer: list[str] = []
 
-            reply = agent.respond(user_text, stream_callback=stream_print)
+            def stream_chunk(chunk: str) -> None:
+                buffer.append(chunk)
+                console.print(chunk, end="", highlight=False, soft_wrap=True)
+
+            reply = agent.respond(user_text, stream_callback=stream_chunk)
+            console.print("")
+            if buffer:
+                console.print(Markdown("".join(buffer)))
+
             pending_tool = agent.pop_tool_request()
-            if reply and not reply.endswith("\n"):
-                print("", flush=True)
             if pending_tool:
                 _process_tool_request(agent, pending_tool)
     finally:
@@ -82,111 +91,148 @@ def _handle_command(agent: AtlasAgent, command_line: str) -> bool:
     if cmd == "tool":
         _handle_tool(agent, rest)
         return True
-    print(f"Unknown command: {cmd}. Type /help for options.")
+    if cmd == "model":
+        _handle_model(agent, rest)
+        return True
+    console.print(f"Unknown command: {cmd}. Type /help for options.", style="yellow")
     return True
 
 
 def _print_help() -> None:
-    print("Commands:")
-    print("  /journal recent            - show the latest journal reflections")
-    print("  /journal search <keyword>  - search the journal for a word or phrase")
-    print("  /tool list                - list available tools")
-    print("  /tool run <name> [args]   - execute a tool manually")
-    print("  /quit                      - exit the chat")
+    table = Table(show_header=False, box=None)
+    table.add_row("[bold]Commands:[/bold]")
+    table.add_row("  /journal recent", "show the latest journal reflections")
+    table.add_row("  /journal search <keyword>", "search the journal for a word or phrase")
+    table.add_row("  /tool list", "list available tools")
+    table.add_row("  /tool run <name> [args]", "execute a tool manually")
+    table.add_row("  /model <name>", "switch the active Ollama model")
+    table.add_row("  /quit", "exit the chat")
+    console.print(table)
 
 
 def _handle_journal(agent: AtlasAgent, args: list[str]) -> None:
     if not args:
-        print("Usage: /journal <recent|search>")
+        console.print("Usage: /journal <recent|search>", style="yellow")
         return
     sub, *rest = args
     if sub == "recent":
         entries = agent.journal.recent(5)
         if not entries:
-            print("(journal is empty)")
+            console.print("[dim](journal is empty)[/dim]")
             return
         for entry in entries:
             timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(entry.created_at))
-            print(f"[{timestamp}] {entry.title}")
-            print(textwrap.fill(entry.content, width=72))
-            print("")
+            console.print(f"[bold]{timestamp}[/] | [cyan]{entry.title}[/]")
+            console.print(textwrap.fill(entry.content, width=72))
+            console.print("")
         return
     if sub == "search":
         if not rest:
-            print("Usage: /journal search <keyword>")
+            console.print("Usage: /journal search <keyword>", style="yellow")
             return
         keyword = " ".join(rest)
         entries = agent.journal.find_by_keyword(keyword)
         if not entries:
-            print("No matching journal entries.")
+            console.print("No matching journal entries.", style="yellow")
             return
         for entry in entries:
             timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(entry.created_at))
-            print(f"[{timestamp}] {entry.title}")
-            print(textwrap.fill(entry.content, width=72))
-            print("")
+            console.print(f"[bold]{timestamp}[/] | [cyan]{entry.title}[/]")
+            console.print(textwrap.fill(entry.content, width=72))
+            console.print("")
         return
-    print(f"Unknown journal command: {sub}")
+    console.print(f"Unknown journal command: {sub}", style="yellow")
 
 
 def _process_tool_request(agent: AtlasAgent, request: dict) -> None:
     name = request.get("name", "?")
     payload = request.get("payload", "")
     tool = tool_registry.get_tool(name)
-    print("Tool request detected.")
+    console.print("[bold magenta]Tool request detected.[/bold magenta]")
     if not tool:
-        print(f"[warn] Unknown tool '{name}'. Skipping.")
+        console.print(f"[yellow]Unknown tool '{name}'. Skipping.[/yellow]")
         return
-    print(f"  Tool: {tool.name}")
-    print(f"  Description: {tool.description}")
+    console.print(f"  Tool: [cyan]{tool.name}[/cyan]")
+    console.print(f"  Description: {tool.description}")
     if payload:
-        print(f"  Payload: {payload}")
+        console.print(f"  Payload: {payload}")
     execute = True
     if tool.requires_confirmation:
-        answer = input("Run this tool? [y/N] ").strip().lower()
+        answer = console.input("Run this tool? [y/N] ").strip().lower()
         execute = answer in {"y", "yes"}
     if not execute:
-        print("Tool request skipped.")
+        console.print("Tool request skipped.", style="yellow")
         return
     result = tool_registry.execute_tool(agent, tool.name, payload)
     status = "✔" if result.success else "✖"
-    print(f"{status} {result.message}")
+    style = "green" if result.success else "red"
+    console.print(f"{status} {result.message}", style=style)
 
 
 def _handle_tool(agent: AtlasAgent, args: list[str]) -> None:
     if not args:
-        print("Usage: /tool <list|run>")
+        console.print("Usage: /tool <list|run>", style="yellow")
         return
     sub, *rest = args
     if sub == "list":
         tools = tool_registry.list_tools()
         if not tools:
-            print("(no tools registered)")
+            console.print("(no tools registered)", style="dim")
             return
         for tool in tools:
             flag = "(confirm)" if tool.requires_confirmation else "(auto)"
-            print(f"- {tool.name} {flag}: {tool.description}")
+            console.print(f"- [cyan]{tool.name}[/cyan] {flag}: {tool.description}")
         return
     if sub == "run":
         if not rest:
-            print("Usage: /tool run <name> [payload]")
+            console.print("Usage: /tool run <name> [payload]", style="yellow")
             return
         name = rest[0]
         payload = " ".join(rest[1:]) if len(rest) > 1 else ""
         tool = tool_registry.get_tool(name)
         if not tool:
-            print(f"Unknown tool '{name}'. Use /tool list to view options.")
+            console.print(f"Unknown tool '{name}'. Use /tool list to view options.", style="yellow")
             return
         if tool.requires_confirmation:
-            answer = input("Run this tool? [y/N] ").strip().lower()
+            answer = console.input("Run this tool? [y/N] ").strip().lower()
             if answer not in {"y", "yes"}:
-                print("Skipped.")
+                console.print("Skipped.", style="yellow")
                 return
         result = tool_registry.execute_tool(agent, name, payload)
         status = "✔" if result.success else "✖"
-        print(f"{status} {result.message}")
+        style = "green" if result.success else "red"
+        console.print(f"{status} {result.message}", style=style)
         return
-    print(f"Unknown tool command: {sub}")
+    console.print(f"Unknown tool command: {sub}", style="yellow")
+
+
+def _handle_model(agent: AtlasAgent, args: list[str]) -> None:
+    if not args:
+        console.print(f"Current model: [cyan]{agent.chat_model}[/cyan]", style="bold")
+        console.print("Usage: /model <name> | /model list", style="yellow")
+        return
+    sub = args[0]
+    if sub == "list":
+        try:
+            models = agent.client.list_models()
+        except Exception as exc:
+            console.print(f"Failed to list models: {exc}", style="red")
+            return
+        if not models:
+            console.print("No models returned by Ollama.", style="yellow")
+            return
+        console.print("[bold]Available models:[/bold]")
+        for name in models:
+            marker = "*" if name == agent.chat_model else "-"
+            console.print(f"  {marker} [cyan]{name}[/cyan]")
+        return
+
+    new_model = " ".join(args).strip()
+    if not new_model:
+        console.print("Usage: /model <name>", style="yellow")
+        return
+    agent.set_chat_model(new_model)
+    console.print(f"Switched to model [cyan]{new_model}[/cyan].")
 
 
 if __name__ == "__main__":  # pragma: no cover

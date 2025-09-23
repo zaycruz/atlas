@@ -47,6 +47,8 @@ sessions while keeping prompts compact.
 Type into the REPL to chat. Press `Ctrl+D` (macOS/Linux) or `Ctrl+Z` then `Enter` (Windows) to exit, or type `/quit`.
 Responses stream token-by-token so you can watch ideas form in real time.
 Atlas can also request internal tools; you'll be prompted for approval when that happens.
+The CLI renders responses as Markdown with color-coded prompts (green for you,
+cyan for Atlas). Use `/model <name>` to switch Ollama models on the fly.
 
 ### Ollama requirements
 

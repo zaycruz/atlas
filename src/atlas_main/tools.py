@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, TYPE_CHECKING
 
@@ -101,6 +102,63 @@ register_tool(
         description="Display the most recent conversation turns (payload optional integer).",
         handler=_tool_memory_snapshot,
         requires_confirmation=False,
+    )
+)
+
+
+def _tool_update_prompt(agent: "AtlasAgent", payload: str) -> ToolResult:
+    if not payload:
+        return ToolResult(False, "prompt_update requires JSON payload with 'system_prompt'.")
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        return ToolResult(False, "Invalid JSON payload for prompt_update.")
+    prompt = str(data.get("system_prompt") or "").strip()
+    if not prompt:
+        return ToolResult(False, "'system_prompt' must be a non-empty string.")
+    agent.update_system_prompt(prompt)
+    return ToolResult(True, "System prompt updated.")
+
+
+register_tool(
+    Tool(
+        name="prompt_update",
+        description=(
+            "Update the agent's system prompt via the tool registry. "
+            "Payload JSON with 'system_prompt'."
+        ),
+        handler=_tool_update_prompt,
+        requires_confirmation=True,
+    )
+)
+
+
+def _tool_git_update(agent: "AtlasAgent", payload: str) -> ToolResult:
+    """Pull latest git changes and optionally install requirements."""
+    repo_dir = payload.strip() or "."
+    try:
+        result = subprocess.run(
+            ["git", "pull"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        return ToolResult(False, "git command not found on PATH.")
+    if result.returncode != 0:
+        return ToolResult(False, f"git pull failed: {result.stderr.strip() or result.stdout.strip()}")
+
+    message = result.stdout.strip() or "Repository updated."
+    return ToolResult(True, message)
+
+
+register_tool(
+    Tool(
+        name="git_update",
+        description="Run 'git pull' (payload optional path). Requires confirmation.",
+        handler=_tool_git_update,
+        requires_confirmation=True,
     )
 )
 
