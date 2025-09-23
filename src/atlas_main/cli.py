@@ -29,8 +29,10 @@ console = Console()
 
 def main() -> None:
     console.print(Panel.fit(ASCII_ATLAS, style="cyan"))
-    console.print("[bold cyan]Your autistic pal in the terminal.[/bold cyan]")
+    console.print("[bold cyan]Make of this what you will.[/bold cyan]")
     console.print(textwrap.fill("Atlas ready. Type your prompt and press Enter. Use Ctrl+D or /quit to exit.", width=72))
+    console.print(textwrap.fill("use /model <model> to switch the active model.", width=72))
+    console.print(textwrap.fill("use /model list to view available models.", width=72))
     client = OllamaClient()
     agent = AtlasAgent(client)
 

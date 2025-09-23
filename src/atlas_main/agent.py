@@ -8,7 +8,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from .memory import EpisodicMemory, WorkingMemory, render_memory_snippets
+from .memory import WorkingMemory, render_memory_snippets
+from .enhanced_memory import EnhancedEpisodicMemory
 from .ollama import OllamaClient, OllamaError
 from .semantic import SemanticMemory
 from .journal import Journal
@@ -72,7 +73,8 @@ class AtlasAgent:
         self.embed_model = embed_model
         self.system_prompt = system_prompt
         self.working_memory = WorkingMemory(capacity=working_memory_limit)
-        self.episodic_memory = EpisodicMemory(
+        # Initialize enhanced episodic memory with backward compatibility
+        self.episodic_memory = EnhancedEpisodicMemory(
             DEFAULT_MEMORY_PATH,
             embedding_fn=self._embed_text,
             max_records=episodic_limit,
