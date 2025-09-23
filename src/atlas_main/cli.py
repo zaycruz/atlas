@@ -6,8 +6,6 @@ import textwrap
 import time
 
 from rich.console import Console
-from rich.markdown import Markdown
-from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 
@@ -67,10 +65,8 @@ def main() -> None:
                 buffer.append(chunk)
                 console.print(chunk, end="", highlight=False, soft_wrap=True)
 
-            reply = agent.respond(user_text, stream_callback=stream_chunk)
-            console.print("")
-            if buffer:
-                console.print(Markdown("".join(buffer)))
+            agent.respond(user_text, stream_callback=stream_chunk)
+            console.print("")  # Final newline after streaming
 
             pending_tool = agent.pop_tool_request()
             if pending_tool:
