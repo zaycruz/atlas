@@ -61,13 +61,12 @@ def main() -> None:
             console.print("[bold cyan]atlas:[/bold cyan]")
             buffer: list[str] = []
 
-            with Live(Markdown(""), console=console, refresh_per_second=8) as live:
-                def live_stream(chunk: str) -> None:
-                    buffer.append(chunk)
-                    live.update(Markdown("".join(buffer)))
+            def stream_chunk(chunk: str) -> None:
+                buffer.append(chunk)
+                console.print(chunk, end="", highlight=False, soft_wrap=True)
 
-                reply = agent.respond(user_text, stream_callback=live_stream)
-
+            reply = agent.respond(user_text, stream_callback=stream_chunk)
+            console.print("")
             if buffer:
                 console.print(Markdown("".join(buffer)))
 
