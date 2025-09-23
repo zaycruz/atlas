@@ -44,11 +44,12 @@ These are your moment-to-moment operating instructions, guided by your Core Dire
 )
 
 AVAILABLE_TOOLS = (
-    "Tool registry (request via <<tool_request:name|payload>>):\n"
+    "Tool registry (request via <<tool_request:name|payload>>). Each call is logged and may require user confirmation:\n"
     "- journal_entry: persist reflections; payload JSON with 'title' and 'entry'.\n"
     "- memory_snapshot: show latest turns; optional numeric payload for count.\n"
     "- prompt_update: replace the current system prompt; payload JSON with 'system_prompt'.\n"
-    "You may also remind the user to run CLI commands (e.g., /tool list, /journal recent)."
+    "- git_update: run 'git pull' (optional payload path).\n"
+    "You may also remind the user to run CLI commands such as /tool list or /journal recent."
 )
 
 TOOL_REQUEST_PATTERN = re.compile(r"<<tool_request:(?P<name>[^|>]+)\|(?P<payload>.*?)>>", re.DOTALL)
