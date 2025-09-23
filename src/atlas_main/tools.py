@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import time
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, TYPE_CHECKING
 
@@ -159,6 +160,169 @@ register_tool(
         description="Run 'git pull' (payload optional path). Requires confirmation.",
         handler=_tool_git_update,
         requires_confirmation=True,
+    )
+)
+
+
+def _tool_goal_tracker(agent: "AtlasAgent", payload: str) -> ToolResult:
+    """Track and manage long-term goals and objectives."""
+    if not payload:
+        return ToolResult(False, "goal_tracker requires JSON payload with 'action' and optional 'goal', 'context'.")
+    
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        return ToolResult(False, "Invalid JSON payload for goal_tracker.")
+    
+    action = data.get("action", "").lower()
+    goal_text = data.get("goal", "")
+    context = data.get("context", "")
+    
+    if action == "add":
+        if not goal_text.strip():
+            return ToolResult(False, "Adding a goal requires 'goal' text.")
+        
+        # Store as special journal entry with goal prefix
+        goal_entry = f"GOAL: {goal_text.strip()}"
+        if context:
+            goal_entry += f"\nContext: {context.strip()}"
+        
+        entry = agent.journal.add_entry(f"Goal: {goal_text[:50]}...", goal_entry)
+        return ToolResult(True, f"Goal added and tracked: '{goal_text[:50]}...'")
+    
+    elif action == "list":
+        # Find all goal entries in journal
+        goal_entries = [e for e in agent.journal.entries if e.content.startswith("GOAL:")]
+        if not goal_entries:
+            return ToolResult(True, "No goals currently tracked.")
+        
+        goals_list = []
+        for entry in goal_entries[-10:]:  # Show last 10 goals
+            goal_line = entry.content.split('\n')[0].replace("GOAL: ", "")
+            timestamp = time.strftime("%Y-%m-%d", time.localtime(entry.created_at))
+            goals_list.append(f"• {goal_line} ({timestamp})")
+        
+        return ToolResult(True, f"Current goals:\n" + "\n".join(goals_list))
+    
+    elif action == "recall":
+        topic = goal_text or context
+        if not topic:
+            return ToolResult(False, "Recall requires 'goal' or 'context' to search for.")
+        
+        # Search journal for goal-related entries
+        relevant_goals = agent.journal.find_by_keyword(topic)
+        goal_matches = [e for e in relevant_goals if "GOAL:" in e.content]
+        
+        if not goal_matches:
+            return ToolResult(True, f"No goals found related to '{topic}'.")
+        
+        matches = []
+        for entry in goal_matches[:5]:
+            goal_line = entry.content.split('\n')[0].replace("GOAL: ", "")
+            matches.append(f"• {goal_line}")
+        
+        return ToolResult(True, f"Goals related to '{topic}':\n" + "\n".join(matches))
+    
+    else:
+        return ToolResult(False, "Action must be 'add', 'list', or 'recall'.")
+
+
+register_tool(
+    Tool(
+        name="goal_tracker",
+        description="Track and manage long-term goals. Payload JSON with 'action': 'add'|'list'|'recall', optional 'goal', 'context'.",
+        handler=_tool_goal_tracker,
+        requires_confirmation=False,
+    )
+)
+
+
+def _tool_context_connector(agent: "AtlasAgent", payload: str) -> ToolResult:
+    """Connect current topic to relevant past conversations and memories."""
+    if not payload:
+        return ToolResult(False, "context_connector requires JSON payload with 'topic' and optional 'depth'.")
+    
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        return ToolResult(False, "Invalid JSON payload for context_connector.")
+    
+    topic = data.get("topic", "").strip()
+    depth = data.get("depth", "medium").lower()
+    
+    if not topic:
+        return ToolResult(False, "context_connector requires 'topic' to search for connections.")
+    
+    # Determine search scope based on depth
+    if depth == "shallow":
+        top_k = 3
+        max_results = 3
+    elif depth == "deep":
+        top_k = 10
+        max_results = 8
+    else:  # medium
+        top_k = 6
+        max_results = 5
+    
+    connections = []
+    
+    # Search episodic memory for related conversations
+    try:
+        memory_results = agent.episodic_memory.recall(topic, top_k=top_k)
+        if memory_results:
+            connections.append("== RELATED CONVERSATIONS ==")
+            for i, memory in enumerate(memory_results[:max_results]):
+                # Get timestamp for context
+                timestamp = time.strftime("%Y-%m-%d", time.localtime(memory.created_at))
+                
+                # Extract key snippet from conversation
+                if hasattr(memory, 'user_input') and hasattr(memory, 'assistant_response'):
+                    # Enhanced memory format
+                    snippet = memory.user_input[:100] + "..." if len(memory.user_input) > 100 else memory.user_input
+                    response_snippet = memory.assistant_response[:150] + "..." if len(memory.assistant_response) > 150 else memory.assistant_response
+                    connections.append(f"{i+1}. ({timestamp}) User: {snippet}")
+                    connections.append(f"   Atlas: {response_snippet}")
+                else:
+                    # Legacy memory format
+                    snippet = memory.user[:100] + "..." if len(memory.user) > 100 else memory.user
+                    response_snippet = memory.assistant[:150] + "..." if len(memory.assistant) > 150 else memory.assistant
+                    connections.append(f"{i+1}. ({timestamp}) User: {snippet}")
+                    connections.append(f"   Atlas: {response_snippet}")
+                
+                if i < len(memory_results) - 1:
+                    connections.append("")
+    except Exception as e:
+        connections.append(f"Memory search error: {str(e)}")
+    
+    # Search journal for related insights
+    try:
+        journal_results = agent.journal.find_by_keyword(topic)
+        if journal_results:
+            connections.append("\n== RELATED INSIGHTS ==")
+            for i, entry in enumerate(journal_results[:3]):
+                timestamp = time.strftime("%Y-%m-%d", time.localtime(entry.created_at))
+                title = entry.title[:60] + "..." if len(entry.title) > 60 else entry.title
+                content_snippet = entry.content[:200] + "..." if len(entry.content) > 200 else entry.content
+                connections.append(f"{i+1}. ({timestamp}) {title}")
+                connections.append(f"   {content_snippet}")
+                if i < len(journal_results) - 1:
+                    connections.append("")
+    except Exception as e:
+        connections.append(f"\nJournal search error: {str(e)}")
+    
+    if not connections or len(connections) <= 2:
+        return ToolResult(True, f"No significant connections found for '{topic}'. This appears to be a new topic area.")
+    
+    result = f"Connections found for '{topic}':\n\n" + "\n".join(connections)
+    return ToolResult(True, result)
+
+
+register_tool(
+    Tool(
+        name="context_connector",
+        description="Find connections between current topic and past conversations. Payload JSON with 'topic', optional 'depth': 'shallow'|'medium'|'deep'.",
+        handler=_tool_context_connector,
+        requires_confirmation=False,
     )
 )
 
