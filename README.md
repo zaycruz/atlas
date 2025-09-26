@@ -1,8 +1,8 @@
 # Atlas Terminal Chat
 
-Atlas is a terminal-first personal assistant for local Ollama models. It layers
-three kinds of memory—working, episodic, and semantic—to stay personal across
-sessions while keeping prompts compact.
+Atlas is a terminal-first Jarvis-style technical copilot for local Ollama models. It layers
+three kinds of memory—working, episodic, and semantic—plus lightweight web search to stay personal and
+actionable across sessions while keeping prompts compact.
 
 ## Quick start
 
@@ -46,7 +46,7 @@ sessions while keeping prompts compact.
 
 Type into the REPL to chat. Press `Ctrl+D` (macOS/Linux) or `Ctrl+Z` then `Enter` (Windows) to exit, or type `/quit`.
 Responses stream token-by-token so you can watch ideas form in real time.
-Atlas can also request internal tools; you'll be prompted for approval when that happens.
+Atlas can also request internal tools; you'll be prompted for approval when that happens (only for potentially destructive tools).
 The CLI renders responses as Markdown with color-coded prompts (green for you,
 cyan for Atlas). Use `/model <name>` to switch Ollama models on the fly.
 
@@ -58,7 +58,7 @@ pull `qwen2.5:latest` for chatting and `mxbai-embed-large` for embeddings.
 To use different models, set `ATLAS_CHAT_MODEL` and `ATLAS_EMBED_MODEL`
 before running the launcher.
 
-## Memory architecture
+## Memory & autonomy architecture
 
 - **Working memory**: the last few turns kept in a sliding buffer so short-term
   context stays coherent.
@@ -68,17 +68,36 @@ before running the launcher.
 - **Semantic memory**: after each turn the assistant asks the LLM to extract
   durable profile facts, preferences, and goals which are persisted separately
   and summarised at the start of each response.
-- **Reflective journal**: the agent can decide to write a short reflection to
-  `~/.local/share/atlas/journal.json`. Use `/journal recent` or `/journal search`
-  in the CLI to review entries.
-- **Tool registry**: Atlas can request helper actions (e.g. creating journal
-  entries or reviewing recent turns). Use `/tool list` and `/tool run` to manage
-  these manually.
+- **Reflective journal**: the agent can decide to write a short reflection to a SQLite journal at `~/.local/share/atlas/journal.sqlite`. Use `/journal recent` or `/journal search` in the CLI to review entries.
+- **Web search tool**: invoke via a tool request `<<tool_request:web_search|{"query":"your topic"}>>` (the model may call it automatically to verify external facts) returning concise DuckDuckGo results.
+- **Tool registry**: Atlas can request helper actions (e.g. creating journal entries or reviewing recent turns). Use `/tool list` and `/tool run` to manage these manually.
+- **Metacognition tools**: Built-in introspective tools help Atlas observe and improve its own process:
+  - `state_snapshot` — write a JSONL snapshot of internal state to `~/.local/share/atlas/state_snapshots.jsonl` (model, recent messages, memory stats, tool usage)
+  - `internal_goal_set` / `internal_goal_list` — manage private, agent-only goals in `~/.local/share/atlas/internal_goals.json`
+  - `relationship_log` — append collaboration events to `~/.local/share/atlas/relationship_log.jsonl`
+  - Lightweight tool usage tracking is stored at `~/.local/share/atlas/tool_usage.json`
+- **Periodic snapshots**: The controller captures a `state_snapshot` automatically every N turns (default 12). You can configure this in `src/atlas_main/config/policies.yaml` under `state_snapshot.turns_since_last`.
 
-All memory is written to `~/.local/share/atlas/` by default. You can change the
+All memory and internal data is written to `~/.local/share/atlas/` by default. You can change the
 paths or models with environment variables: `ATLAS_MEMORY_PATH`,
 `ATLAS_SEMANTIC_PATH`, `ATLAS_JOURNAL_PATH`, `ATLAS_CHAT_MODEL`, and
 `ATLAS_EMBED_MODEL`.
+
+## CLI commands
+
+- `/tool list` — show all tools (auto vs confirm)
+- `/tool run <name> [payload]` — execute a tool
+- `/memory status` — show paths and episodic stats
+- `/memory recent [N]` — recent long‑term memories
+- `/journal recent` — last 5 reflections
+- `/journal search <keyword>` — search reflections
+- `/snapshot [N]` — write a `state_snapshot` (recent messages N)
+- `/igoal set <title> [--notes text] [--status active|paused|done]` — add/update a private goal
+- `/igoal list [N] [status]` — list private goals
+- `/relationship log <event> [--tags a,b] [--sentiment -1..1]` — log a collaboration event
+- `/model <name>` / `/model list` — switch or list models
+- `/thinking <on|off>` — show/hide model “thinking” content
+- `/loopsteps <N>` — set internal reasoning loop steps
 
 ## Development notes
 

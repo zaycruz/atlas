@@ -27,15 +27,17 @@ class OllamaClient:
     # ------------------------------------------------------------------
     # Core HTTP helpers
     # ------------------------------------------------------------------
-    def _post(self, path: str, payload: dict, *, stream: bool = False) -> requests.Response:
+    def _post(self, path: str, payload: dict, *, stream: bool = False, request_timeout: Optional[int] = None) -> requests.Response:
         url = f"{self.base_url}{path}"
-        response = self._session.post(url, json=payload, timeout=self.timeout, stream=stream)
+        timeout = request_timeout if request_timeout is not None else self.timeout
+        response = self._session.post(url, json=payload, timeout=timeout, stream=stream)
         self._raise_for_status(response)
         return response
 
-    def _get(self, path: str) -> requests.Response:
+    def _get(self, path: str, *, request_timeout: Optional[int] = None) -> requests.Response:
         url = f"{self.base_url}{path}"
-        response = self._session.get(url, timeout=self.timeout)
+        timeout = request_timeout if request_timeout is not None else self.timeout
+        response = self._session.get(url, timeout=timeout)
         self._raise_for_status(response)
         return response
 
@@ -61,7 +63,8 @@ class OllamaClient:
         messages: List[Dict[str, str]],
         stream: bool = False,
         options: Optional[Dict] = None,
-        keep_alive: Optional[int] = None,
+    keep_alive: Optional[int] = None,
+    request_timeout: Optional[int] = None,
     ) -> Dict:
         payload = {
             "model": model,
@@ -73,7 +76,7 @@ class OllamaClient:
         if keep_alive is not None:
             payload["keep_alive"] = keep_alive
 
-        response = self._post("/api/chat", payload, stream=stream)
+        response = self._post("/api/chat", payload, stream=stream, request_timeout=request_timeout)
         if stream:
             return {"stream": self._stream_chat(response)}
         return response.json()
@@ -84,7 +87,8 @@ class OllamaClient:
         model: str,
         messages: List[Dict[str, str]],
         options: Optional[Dict] = None,
-        keep_alive: Optional[int] = None,
+    keep_alive: Optional[int] = None,
+    request_timeout: Optional[int] = None,
     ) -> Iterator[str]:
         payload = {
             "model": model,
@@ -95,7 +99,7 @@ class OllamaClient:
             payload["options"] = options
         if keep_alive is not None:
             payload["keep_alive"] = keep_alive
-        response = self._post("/api/chat", payload, stream=True)
+        response = self._post("/api/chat", payload, stream=True, request_timeout=request_timeout)
         yield from self._stream_chat(response)
 
     def _stream_chat(self, response: requests.Response) -> Iterator[str]:

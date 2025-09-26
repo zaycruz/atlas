@@ -101,6 +101,9 @@ def _handle_command(agent: AtlasAgent, controller: ReasoningController, command_
     if cmd == "memory":
         _handle_memory(agent, rest)
         return True
+    if cmd == "snapshot":
+        _handle_snapshot(agent, rest)
+        return True
     if cmd == "log":
         _handle_log(rest)
         return True
@@ -109,12 +112,6 @@ def _handle_command(agent: AtlasAgent, controller: ReasoningController, command_
         return True
     if cmd == "identity":
         _handle_identity(agent, rest)
-        return True
-    if cmd == "desires":
-        _handle_desires(agent, rest)
-        return True
-    if cmd == "loopsteps":
-        _handle_loopsteps(controller, rest)
         return True
     console.print(f"Unknown command: {cmd}. Type /help for options.", style="yellow")
     return True
@@ -130,13 +127,11 @@ def _print_help() -> None:
     table.add_row("  /model <name>", "switch the active Ollama model")
     table.add_row("  /memory status", "show memory store paths and stats")
     table.add_row("  /memory recent [N]", "show the most recent episodic memories (default 5)")
+    table.add_row("  /snapshot [N]", "write an internal state snapshot (optional recent messages N)")
     table.add_row("  /identity summary", "show Atlas's current identity summary")
     table.add_row("  /identity history [N]", "show recent identity changes (default 5)")
     table.add_row("  /desires summary", "show current active motivations")
     table.add_row("  /desires history [N]", "show recent desire updates (default 5)")
-    table.add_row("  /log <off|error|warn|info|debug>", "set logging verbosity or turn it off")
-    table.add_row("  /thinking <on|off>", "show or hide model reasoning (e.g., <think> blocks)")
-    table.add_row("  /loopsteps <N>", "set internal reasoning+tools loop steps (1+)")
     table.add_row("  /quit", "exit the chat")
     console.print(table)
 
@@ -259,11 +254,59 @@ def _handle_journal(agent: AtlasAgent, args: list[str]) -> None:
             return
         for entry in entries:
             timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(entry.created_at))
+
+
+        def _handle_critic(controller: ReasoningController, args: list[str]) -> None:
+            if not args or args[0].lower() in {"status"}:
+                state = "ON" if controller.critic_enabled else "OFF"
+                console.print(
+                    f"Critic: {state} | model={controller.critic_model} | max_rounds={controller.max_critique_rounds}",
+                    style="green" if controller.critic_enabled else "yellow",
+                )
+                return
+            sub = args[0].lower()
+            if sub in {"on", "off"}:
+                controller.critic_enabled = (sub == "on")
+                console.print(f"Critic turned {'ON' if controller.critic_enabled else 'OFF'}", style="green")
+                return
+            if sub == "model":
+                if len(args) < 2:
+                    console.print("Usage: /critic model <name>", style="yellow")
+                    return
+                controller.critic_model = args[1]
+                console.print(f"Critic model set to {controller.critic_model}", style="green")
+                return
+            if sub == "rounds":
+                if len(args) < 2:
+                    console.print("Usage: /critic rounds <N>", style="yellow")
+                    return
+                try:
+                    val = int(args[1])
+                except ValueError:
+                    console.print("Rounds must be an integer", style="yellow")
+                    return
+                controller.max_critique_rounds = max(0, val)
+                console.print(f"Critic max rounds set to {controller.max_critique_rounds}", style="green")
+                return
+            console.print("Usage: /critic <on|off|model <name>|rounds <N>|status>", style="yellow")
             console.print(f"[bold]{timestamp}[/] | [cyan]{entry.title}[/]")
             console.print(textwrap.fill(entry.content, width=72))
             console.print("")
         return
     console.print(f"Unknown journal command: {sub}", style="yellow")
+
+
+def _handle_snapshot(agent: AtlasAgent, args: list[str]) -> None:
+    n = None
+    if args:
+        try:
+            n = int(args[0])
+        except ValueError:
+            n = None
+    payload = json.dumps({"recent_limit": n}) if n else ""
+    result = tool_registry.execute_tool(agent, "state_snapshot", payload)
+    style = "green" if result.success else "red"
+    console.print(result.message, style=style)
 
 
 def _process_tool_request(agent: AtlasAgent, request: dict) -> None:
