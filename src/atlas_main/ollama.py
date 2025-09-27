@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from typing import Dict, Iterable, Iterator, List, Optional
+from typing import Dict, Iterator, List, Optional
 
 import requests
 
@@ -63,8 +63,9 @@ class OllamaClient:
         messages: List[Dict[str, str]],
         stream: bool = False,
         options: Optional[Dict] = None,
-    keep_alive: Optional[int] = None,
-    request_timeout: Optional[int] = None,
+        tools: Optional[List[Dict]] = None,
+        keep_alive: Optional[int] = None,
+        request_timeout: Optional[int] = None,
     ) -> Dict:
         payload = {
             "model": model,
@@ -73,6 +74,8 @@ class OllamaClient:
         }
         if options:
             payload["options"] = options
+        if tools:
+            payload["tools"] = tools
         if keep_alive is not None:
             payload["keep_alive"] = keep_alive
 
@@ -87,9 +90,10 @@ class OllamaClient:
         model: str,
         messages: List[Dict[str, str]],
         options: Optional[Dict] = None,
-    keep_alive: Optional[int] = None,
-    request_timeout: Optional[int] = None,
-    ) -> Iterator[str]:
+        tools: Optional[List[Dict]] = None,
+        keep_alive: Optional[int] = None,
+        request_timeout: Optional[int] = None,
+    ) -> Iterator[Dict[str, str]]:
         payload = {
             "model": model,
             "messages": messages,
@@ -97,22 +101,26 @@ class OllamaClient:
         }
         if options:
             payload["options"] = options
+        if tools:
+            payload["tools"] = tools
         if keep_alive is not None:
             payload["keep_alive"] = keep_alive
         response = self._post("/api/chat", payload, stream=True, request_timeout=request_timeout)
         yield from self._stream_chat(response)
 
-    def _stream_chat(self, response: requests.Response) -> Iterator[str]:
+    def _stream_chat(self, response: requests.Response) -> Iterator[Dict[str, str]]:
         for line in response.iter_lines():
             if not line:
                 continue
             data = json.loads(line)
+            message = data.get("message") or {}
+            content = message.get("content") or data.get("response") or ""
+            thinking = message.get("thinking") or ""
+            full_content = thinking + content
+            tool_calls = message.get("tool_calls") or []
+            yield {"content": full_content, "tool_calls": tool_calls}
             if data.get("done"):
                 break
-            message = data.get("message") or {}
-            content = message.get("content") or data.get("response")
-            if content:
-                yield content
 
     def embed(self, model: str, text: str) -> Optional[List[float]]:
         payload = {"model": model, "prompt": text}

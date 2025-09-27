@@ -8,7 +8,7 @@ import uuid
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, List, Optional, Sequence
+from typing import Any, Callable, Iterable, List, Optional, Sequence
 
 import numpy as np
 
@@ -48,13 +48,15 @@ class WorkingMemory:
 
     def __init__(self, capacity: int = 12) -> None:
         self.capacity = max(2, capacity)
-        self._buffer: deque[dict[str, str]] = deque(maxlen=self.capacity)
+        self._buffer: deque[dict[str, Any]] = deque(maxlen=self.capacity)
 
-    def add(self, role: str, content: str) -> None:
+    def add(self, role: str, content: str, **extra: Any) -> None:
         content = content.strip()
         if not content:
             return
-        self._buffer.append({"role": role, "content": content})
+        message: dict[str, Any] = {"role": role, "content": content}
+        message.update({k: v for k, v in extra.items() if v is not None})
+        self._buffer.append(message)
 
     def add_user(self, content: str) -> None:
         self.add("user", content)
@@ -62,7 +64,14 @@ class WorkingMemory:
     def add_assistant(self, content: str) -> None:
         self.add("assistant", content)
 
-    def to_messages(self) -> list[dict[str, str]]:
+    def add_tool(self, name: str, content: str) -> None:
+        content = content.strip()
+        if not content:
+            return
+        formatted = f"[tool:{name}]\n{content}" if name else content
+        self.add("assistant", formatted)
+
+    def to_messages(self) -> list[dict[str, Any]]:
         return list(self._buffer)
 
     def clear(self) -> None:

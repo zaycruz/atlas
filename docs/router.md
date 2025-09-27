@@ -16,3 +16,4 @@
 - Embeddings use live embedder for retrieval
 - Tools execute via controller validation
 - Critic optional based on policies
+

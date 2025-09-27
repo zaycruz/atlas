@@ -18,3 +18,4 @@ autonomy:
   max_daily_reflections: 5  # Limit reflections per day
   disagreement_cooldown: 10  # Minutes between disagreements
   tool_confirmation_threshold: "high"  # When to require confirmation for tools
+
