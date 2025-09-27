@@ -25,6 +25,16 @@ Atlas expects a local Ollama daemon on `http://localhost:11434`. To use differen
 
 - Working memory: last few turns are kept in a sliding buffer.
 
+### Abstractive episodic summarization
+
+For a short, high-signal summary of recalled episodes, use the helper in `atlas_main/memory.py`:
+
+- Function: `summarize_memories_abstractive(records, client, model=None, max_items=10, style="bullets"|"paragraph")`
+- Default model: `phi3:latest` (override with `ATLAS_SUMMARY_MODEL`).
+- Typical flow:
+   1. `records = episodic.recall("query", top_k=8)`
+   2. `summary = summarize_memories_abstractive(records, client)`
+
 ## CLI commands
 
 - `/model <name>` / `/model list` — switch or list models
