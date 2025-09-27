@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import inspect
 from .memory import WorkingMemory
 from .ollama import OllamaClient, OllamaError
 from .tools import (
@@ -89,16 +90,19 @@ class AtlasAgent:
         working_memory_limit: int = 12,
         system_prompt: str = DEFAULT_PROMPT,
     ):
-        self.client = client
-        self.chat_model = chat_model
-        self.system_prompt = system_prompt
-        self.working_memory = WorkingMemory(capacity=working_memory_limit)
-        self.show_thinking: bool = True
-        self.tools = ToolRegistry()
-        self.tools.register(ReadFileTool())
-        self.tools.register(ListDirectoryTool())
-        self.tools.register(WriteFileTool())
-        self.tools.register(WebSearchTool())
+            self.client = client
+            self.chat_model = chat_model
+            self.system_prompt = system_prompt
+            self.working_memory = WorkingMemory(capacity=working_memory_limit)
+            self.show_thinking = True
+            # KV context buffer reused across turns (opt-in via ATLAS_KV_CACHE != "0")
+            self._kv_context = [] if os.getenv("ATLAS_KV_CACHE", "1") != "0" else None
+            # Tools available to the agent
+            self.tools = ToolRegistry()
+            self.tools.register(ReadFileTool())
+            self.tools.register(ListDirectoryTool())
+            self.tools.register(WriteFileTool())
+            self.tools.register(WebSearchTool())
 
     # ------------------------------------------------------------------
     def _build_system_prompt(self, user_text: str) -> str:
@@ -126,14 +130,29 @@ class AtlasAgent:
             accumulator: list[str] = []
             tool_calls_accum: list[dict] = []
             try:
-                for chunk in self.client.chat_stream(
-                    model=self.chat_model,
-                    messages=messages,
-                    tools=self.tools.render_function_specs(),
-                ):
+                # Build kwargs for chat_stream, adding 'context' only if supported
+                stream_kwargs = {
+                    "model": self.chat_model,
+                    "messages": messages,
+                    "tools": self.tools.render_function_specs(),
+                    "keep_alive": 300,
+                }
+                try:
+                    sig = inspect.signature(self.client.chat_stream)
+                    if "context" in sig.parameters and self._kv_context is not None:
+                        stream_kwargs["context"] = self._kv_context or []
+                except (ValueError, TypeError):
+                    # Fallback: if we can't introspect, don't pass optional args
+                    pass
+
+                for chunk in self.client.chat_stream(**stream_kwargs):
                     content = chunk["content"]
                     accumulator.append(content)
                     tool_calls_accum.extend(chunk["tool_calls"])
+                    # Capture updated KV context if provided on final chunk
+                    ctx = chunk.get("context")
+                    if ctx is not None:
+                        self._kv_context = list(ctx)
                     if stream_callback:
                         stream_callback(content)
             except OllamaError as exc:
@@ -181,6 +200,8 @@ class AtlasAgent:
 
     def reset(self) -> None:
         self.working_memory.clear()
+        if self._kv_context is not None:
+            self._kv_context = []
 
     def set_chat_model(self, model: str) -> None:
         self.chat_model = model.strip() or self.chat_model
