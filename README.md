@@ -35,6 +35,14 @@ For a short, high-signal summary of recalled episodes, use the helper in `atlas_
    1. `records = episodic.recall("query", top_k=8)`
    2. `summary = summarize_memories_abstractive(records, client)`
 
+Try it:
+
+- Run a quick demo script that prints episodes and the generated summary:
+
+```bash
+python scripts/visualize_summarizer.py
+```
+
 ## CLI commands
 
 - `/model <name>` / `/model list` — switch or list models
