@@ -1,19 +1,22 @@
-"""Atlas CLI with journaling commands."""
-from __future__ import annotations
+"""Atlas CLI (ultra-lite): chat + web search tool.
 
-import json
+Supports:
+ - chatting with streaming output
+ - switching/listing models
+ - toggling thinking visibility
+ - adjusting log level
+"""
+from __future__ import annotations
 import textwrap
 import time
+import logging
 
 from rich.console import Console
-from rich.markdown import Markdown
-from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 
 from .agent import AtlasAgent
 from .ollama import OllamaClient
-from . import tools as tool_registry
 
 ASCII_ATLAS = r"""
     █████╗ ████████╗██╗      █████╗ ███████╗
@@ -28,51 +31,52 @@ console = Console()
 
 
 def main() -> None:
+    # Set up logging
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    
     console.print(Panel.fit(ASCII_ATLAS, style="cyan"))
-    console.print("[bold cyan]Your autistic pal in the terminal.[/bold cyan]")
+    console.print("[bold cyan]Make of this what you will.[/bold cyan]")
     console.print(textwrap.fill("Atlas ready. Type your prompt and press Enter. Use Ctrl+D or /quit to exit.", width=72))
+    console.print(textwrap.fill("use /model <model> to switch the active model.", width=72))
+    console.print(textwrap.fill("use /model list to view available models.", width=72))
+    console.print(textwrap.fill("Atlas may call tools automatically (e.g. web_search) when extra information is needed.", width=72))
+    
     client = OllamaClient()
     agent = AtlasAgent(client)
 
     try:
         while True:
-            try:
-                user_text = console.input("[bold green]you: [/bold green]")
-            except EOFError:
-                console.print("\n[bold yellow]Goodbye.[/bold yellow]")
-                break
-            except KeyboardInterrupt:
-                console.print("\n[bold yellow](Interrupted. Type /quit to exit.)[/bold yellow]")
-                continue
-
-            stripped = user_text.strip()
-            if not stripped:
-                continue
-
-            lowered = stripped.lower()
-            if lowered in {"/quit", "/exit"}:
-                console.print("[bold yellow]Exiting.[/bold yellow]")
-                break
-
-            if stripped.startswith("/"):
-                if _handle_command(agent, stripped):
+                try:
+                    user_text = console.input("[bold green]you: [/bold green]")
+                except EOFError:
+                    console.print("\n[bold yellow]Goodbye.[/bold yellow]")
+                    break
+                except KeyboardInterrupt:
+                    console.print("\n[bold yellow](Interrupted. Type /quit to exit.)[/bold yellow]")
                     continue
 
-            console.print("[bold cyan]atlas:[/bold cyan]")
-            buffer: list[str] = []
+                stripped = user_text.strip()
+                if not stripped:
+                    continue
 
-            def stream_chunk(chunk: str) -> None:
-                buffer.append(chunk)
-                console.print(chunk, end="", highlight=False, soft_wrap=True)
+                lowered = stripped.lower()
+                if lowered in {"/quit", "/exit"}:
+                    console.print("[bold yellow]Exiting.[/bold yellow]")
+                    break
 
-            reply = agent.respond(user_text, stream_callback=stream_chunk)
-            console.print("")
-            if buffer:
-                console.print(Markdown("".join(buffer)))
+                if stripped.startswith("/"):
+                    if _handle_command(agent, stripped):
+                        continue
 
-            pending_tool = agent.pop_tool_request()
-            if pending_tool:
-                _process_tool_request(agent, pending_tool)
+                console.print("[bold cyan]atlas:[/bold cyan]")
+                buffer: list[str] = []
+
+                def stream_chunk(chunk: str) -> None:
+                    buffer.append(chunk)
+                    console.print(chunk, end="", highlight=False, soft_wrap=True)
+
+                agent.respond(user_text, stream_callback=stream_chunk)
+                console.print("")  # Final newline after streaming
     finally:
         client.close()
 
@@ -85,14 +89,17 @@ def _handle_command(agent: AtlasAgent, command_line: str) -> bool:
     if cmd == "help":
         _print_help()
         return True
-    if cmd == "journal":
-        _handle_journal(agent, rest)
-        return True
-    if cmd == "tool":
-        _handle_tool(agent, rest)
-        return True
     if cmd == "model":
         _handle_model(agent, rest)
+        return True
+    if cmd == "log":
+        _handle_log(rest)
+        return True
+    if cmd == "thinking":
+        _handle_thinking(agent, rest)
+        return True
+    if cmd == "memory":
+        _handle_memory(agent, rest)
         return True
     console.print(f"Unknown command: {cmd}. Type /help for options.", style="yellow")
     return True
@@ -101,109 +108,176 @@ def _handle_command(agent: AtlasAgent, command_line: str) -> bool:
 def _print_help() -> None:
     table = Table(show_header=False, box=None)
     table.add_row("[bold]Commands:[/bold]")
-    table.add_row("  /journal recent", "show the latest journal reflections")
-    table.add_row("  /journal search <keyword>", "search the journal for a word or phrase")
-    table.add_row("  /tool list", "list available tools")
-    table.add_row("  /tool run <name> [args]", "execute a tool manually")
     table.add_row("  /model <name>", "switch the active Ollama model")
+    table.add_row("  /model list", "list available models")
+    table.add_row("  /thinking <on|off>", "show or hide model thinking content")
+    table.add_row("  /log <off|error|warn|info|debug>", "adjust logging level")
+    table.add_row("  /memory ...", "inspect episodic, semantic, or reflection memory")
     table.add_row("  /quit", "exit the chat")
     console.print(table)
 
 
-def _handle_journal(agent: AtlasAgent, args: list[str]) -> None:
+def _handle_log(args: list[str]) -> None:
     if not args:
-        console.print("Usage: /journal <recent|search>", style="yellow")
+        console.print("Usage: /log <off|error|warn|info|debug>", style="yellow")
         return
-    sub, *rest = args
-    if sub == "recent":
-        entries = agent.journal.recent(5)
-        if not entries:
-            console.print("[dim](journal is empty)[/dim]")
-            return
-        for entry in entries:
-            timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(entry.created_at))
-            console.print(f"[bold]{timestamp}[/] | [cyan]{entry.title}[/]")
-            console.print(textwrap.fill(entry.content, width=72))
-            console.print("")
+    level = args[0].lower()
+    root = logging.getLogger()
+    if level == "off":
+        logging.disable(logging.CRITICAL)
+        console.print("Logging disabled (off)", style="green")
         return
-    if sub == "search":
-        if not rest:
-            console.print("Usage: /journal search <keyword>", style="yellow")
-            return
-        keyword = " ".join(rest)
-        entries = agent.journal.find_by_keyword(keyword)
-        if not entries:
-            console.print("No matching journal entries.", style="yellow")
-            return
-        for entry in entries:
-            timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(entry.created_at))
-            console.print(f"[bold]{timestamp}[/] | [cyan]{entry.title}[/]")
-            console.print(textwrap.fill(entry.content, width=72))
-            console.print("")
+    # Re-enable if previously disabled
+    logging.disable(logging.NOTSET)
+    mapping = {
+        "error": logging.ERROR,
+        "warn": logging.WARNING,
+        "warning": logging.WARNING,
+        "info": logging.INFO,
+        "debug": logging.DEBUG,
+    }
+    selected = mapping.get(level)
+    if selected is None:
+        console.print("Usage: /log <off|error|warn|info|debug>", style="yellow")
         return
-    console.print(f"Unknown journal command: {sub}", style="yellow")
+    root.setLevel(selected)
+    console.print(f"Logging level set to {level.upper()}", style="green")
 
 
-def _process_tool_request(agent: AtlasAgent, request: dict) -> None:
-    name = request.get("name", "?")
-    payload = request.get("payload", "")
-    tool = tool_registry.get_tool(name)
-    console.print("[bold magenta]Tool request detected.[/bold magenta]")
-    if not tool:
-        console.print(f"[yellow]Unknown tool '{name}'. Skipping.[/yellow]")
+def _handle_thinking(agent: AtlasAgent, args: list[str]) -> None:
+    if not args or args[0].lower() not in {"on", "off"}:
+        console.print("Usage: /thinking <on|off>", style="yellow")
         return
-    console.print(f"  Tool: [cyan]{tool.name}[/cyan]")
-    console.print(f"  Description: {tool.description}")
-    if payload:
-        console.print(f"  Payload: {payload}")
-    execute = True
-    if tool.requires_confirmation:
-        answer = console.input("Run this tool? [y/N] ").strip().lower()
-        execute = answer in {"y", "yes"}
-    if not execute:
-        console.print("Tool request skipped.", style="yellow")
-        return
-    result = tool_registry.execute_tool(agent, tool.name, payload)
-    status = "✔" if result.success else "✖"
-    style = "green" if result.success else "red"
-    console.print(f"{status} {result.message}", style=style)
+    agent.show_thinking = (args[0].lower() == "on")
+    state = "ON" if agent.show_thinking else "OFF"
+    console.print(f"Thinking visibility set to {state}", style="green")
 
 
-def _handle_tool(agent: AtlasAgent, args: list[str]) -> None:
+def _handle_memory(agent: AtlasAgent, args: list[str]) -> None:
+    lm = getattr(agent, "layered_memory", None)
+    if lm is None:
+        console.print("Layered memory is disabled in this build.", style="yellow")
+        return
+
     if not args:
-        console.print("Usage: /tool <list|run>", style="yellow")
+        console.print(
+            "Usage: /memory <episodic|semantic|reflections|snapshot|path> [limit] [query]",
+            style="yellow",
+        )
         return
-    sub, *rest = args
-    if sub == "list":
-        tools = tool_registry.list_tools()
-        if not tools:
-            console.print("(no tools registered)", style="dim")
+
+    section = args[0].lower()
+    rest = args[1:]
+    limit = 5
+    if rest and rest[0].isdigit():
+        limit = max(1, int(rest[0]))
+        rest = rest[1:]
+    query = " ".join(rest).strip()
+
+    if section == "path":
+        config = getattr(agent, "layered_memory_config", getattr(lm, "config", None))
+        if not config:
+            console.print("Memory configuration unavailable.", style="yellow")
             return
-        for tool in tools:
-            flag = "(confirm)" if tool.requires_confirmation else "(auto)"
-            console.print(f"- [cyan]{tool.name}[/cyan] {flag}: {tool.description}")
+        console.print("[bold]Memory storage paths[/bold]")
+        console.print(f"Base: {config.base_dir}")
+        console.print(f"Episodic DB: {config.episodic_path}")
+        console.print(f"Semantic JSON: {config.semantic_path}")
+        console.print(f"Reflections JSON: {config.reflections_path}")
         return
-    if sub == "run":
-        if not rest:
-            console.print("Usage: /tool run <name> [payload]", style="yellow")
-            return
-        name = rest[0]
-        payload = " ".join(rest[1:]) if len(rest) > 1 else ""
-        tool = tool_registry.get_tool(name)
-        if not tool:
-            console.print(f"Unknown tool '{name}'. Use /tool list to view options.", style="yellow")
-            return
-        if tool.requires_confirmation:
-            answer = console.input("Run this tool? [y/N] ").strip().lower()
-            if answer not in {"y", "yes"}:
-                console.print("Skipped.", style="yellow")
-                return
-        result = tool_registry.execute_tool(agent, name, payload)
-        status = "✔" if result.success else "✖"
-        style = "green" if result.success else "red"
-        console.print(f"{status} {result.message}", style=style)
+
+    if section == "episodic":
+        _print_episodic_memory(lm, limit=limit, query=query)
         return
-    console.print(f"Unknown tool command: {sub}", style="yellow")
+    if section == "semantic":
+        _print_semantic_memory(lm, limit=limit, query=query)
+        return
+    if section == "reflections":
+        _print_reflections(lm, limit=limit)
+        return
+    if section == "snapshot":
+        if not query:
+            console.print("Usage: /memory snapshot <query>", style="yellow")
+            return
+        assembled = lm.assemble(query)
+        rendered = lm.render(assembled)
+        if rendered:
+            console.print(f"[bold]Snapshot for '{query}':[/bold]", highlight=False)
+            console.print(rendered)
+        else:
+            console.print("(no memory retrieved for that query)", style="yellow")
+        return
+
+    console.print("Unknown memory command. Use episodic, semantic, reflections, snapshot, or path.", style="yellow")
+
+
+def _print_episodic_memory(lm, *, limit: int, query: str) -> None:
+    items = []
+    header = "Recent episodes"
+    if query:
+        hits = lm.episodic.recall(query, top_k=limit)  # type: ignore[attr-defined]
+        if hits:
+            header = f"Episodic recall for '{query}'"
+            for score, rec in hits:
+                text = (rec.get("assistant") or rec.get("user") or "").strip()
+                if text:
+                    items.append(f"{score:.3f} • {text}")
+        if not items:
+            header = f"Recent episodes (no vector hits for '{query}')"
+    if not items:
+        recent = lm.episodic.recent(limit)  # type: ignore[attr-defined]
+        for rec in recent:
+            text = (rec.get("assistant") or rec.get("user") or "").strip()
+            if text:
+                items.append(text)
+    if not items:
+        console.print("(no episodic entries recorded yet)", style="yellow")
+        return
+    console.print(f"[bold]{header}[/bold]", highlight=False)
+    for entry in items:
+        console.print(f"- {entry}", highlight=False)
+
+
+def _print_semantic_memory(lm, *, limit: int, query: str) -> None:
+    items = []
+    header = "Semantic facts"
+    if query:
+        hits = lm.semantic.recall(query, top_k=limit)  # type: ignore[attr-defined]
+        if hits:
+            header = f"Semantic recall for '{query}'"
+            for score, fact in hits:
+                text = str(fact.get("text", "")).strip()
+                if text:
+                    items.append(f"{score:.3f} • {text}")
+        if not items:
+            header = f"Semantic head entries (no vector hits for '{query}')"
+    if not items:
+        head = lm.semantic.head(limit)  # type: ignore[attr-defined]
+        for fact in head:
+            text = str(fact.get("text", "")).strip()
+            if text:
+                items.append(text)
+    if not items:
+        console.print("(semantic memory is empty)", style="yellow")
+        return
+    console.print(f"[bold]{header}[/bold]", highlight=False)
+    for entry in items:
+        console.print(f"- {entry}", highlight=False)
+
+
+def _print_reflections(lm, *, limit: int) -> None:
+    lessons = lm.reflections.recent(limit)  # type: ignore[attr-defined]
+    if not lessons:
+        console.print("(no reflections logged yet)", style="yellow")
+        return
+    console.print("[bold]Recent reflections[/bold]", highlight=False)
+    for item in lessons:
+        text = str(item.get("text", "")).strip()
+        if text:
+            console.print(f"- {text}", highlight=False)
+
+
+# Lite build: no tools, journal, critic, identity, desires, or snapshots.
 
 
 def _handle_model(agent: AtlasAgent, args: list[str]) -> None:
@@ -233,6 +307,9 @@ def _handle_model(agent: AtlasAgent, args: list[str]) -> None:
         return
     agent.set_chat_model(new_model)
     console.print(f"Switched to model [cyan]{new_model}[/cyan].")
+
+
+    # Loop steps feature is not available in the lite build.
 
 
 if __name__ == "__main__":  # pragma: no cover

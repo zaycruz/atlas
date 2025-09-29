@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from typing import Dict, Iterable, Iterator, List, Optional
+from typing import Dict, Iterator, List, Optional
 
 import requests
 
@@ -27,15 +27,17 @@ class OllamaClient:
     # ------------------------------------------------------------------
     # Core HTTP helpers
     # ------------------------------------------------------------------
-    def _post(self, path: str, payload: dict, *, stream: bool = False) -> requests.Response:
+    def _post(self, path: str, payload: dict, *, stream: bool = False, request_timeout: Optional[int] = None) -> requests.Response:
         url = f"{self.base_url}{path}"
-        response = self._session.post(url, json=payload, timeout=self.timeout, stream=stream)
+        timeout = request_timeout if request_timeout is not None else self.timeout
+        response = self._session.post(url, json=payload, timeout=timeout, stream=stream)
         self._raise_for_status(response)
         return response
 
-    def _get(self, path: str) -> requests.Response:
+    def _get(self, path: str, *, request_timeout: Optional[int] = None) -> requests.Response:
         url = f"{self.base_url}{path}"
-        response = self._session.get(url, timeout=self.timeout)
+        timeout = request_timeout if request_timeout is not None else self.timeout
+        response = self._session.get(url, timeout=timeout)
         self._raise_for_status(response)
         return response
 
@@ -61,7 +63,10 @@ class OllamaClient:
         messages: List[Dict[str, str]],
         stream: bool = False,
         options: Optional[Dict] = None,
+        tools: Optional[List[Dict]] = None,
+        context: Optional[List[int]] = None,
         keep_alive: Optional[int] = None,
+        request_timeout: Optional[int] = None,
     ) -> Dict:
         payload = {
             "model": model,
@@ -70,10 +75,14 @@ class OllamaClient:
         }
         if options:
             payload["options"] = options
+        if tools:
+            payload["tools"] = tools
+        if context:
+            payload["context"] = context
         if keep_alive is not None:
             payload["keep_alive"] = keep_alive
 
-        response = self._post("/api/chat", payload, stream=stream)
+        response = self._post("/api/chat", payload, stream=stream, request_timeout=request_timeout)
         if stream:
             return {"stream": self._stream_chat(response)}
         return response.json()
@@ -84,8 +93,11 @@ class OllamaClient:
         model: str,
         messages: List[Dict[str, str]],
         options: Optional[Dict] = None,
+        tools: Optional[List[Dict]] = None,
+        context: Optional[List[int]] = None,
         keep_alive: Optional[int] = None,
-    ) -> Iterator[str]:
+        request_timeout: Optional[int] = None,
+    ) -> Iterator[Dict[str, str]]:
         payload = {
             "model": model,
             "messages": messages,
@@ -93,22 +105,31 @@ class OllamaClient:
         }
         if options:
             payload["options"] = options
+        if tools:
+            payload["tools"] = tools
+        if context:
+            payload["context"] = context
         if keep_alive is not None:
             payload["keep_alive"] = keep_alive
-        response = self._post("/api/chat", payload, stream=True)
+        response = self._post("/api/chat", payload, stream=True, request_timeout=request_timeout)
         yield from self._stream_chat(response)
 
-    def _stream_chat(self, response: requests.Response) -> Iterator[str]:
+    def _stream_chat(self, response: requests.Response) -> Iterator[Dict[str, str]]:
         for line in response.iter_lines():
             if not line:
                 continue
             data = json.loads(line)
+            message = data.get("message") or {}
+            content = message.get("content") or data.get("response") or ""
+            thinking = message.get("thinking") or ""
+            full_content = thinking + content
+            tool_calls = message.get("tool_calls") or []
+            out = {"content": full_content, "tool_calls": tool_calls}
+            if "context" in data:
+                out["context"] = data["context"]
+            yield out
             if data.get("done"):
                 break
-            message = data.get("message") or {}
-            content = message.get("content") or data.get("response")
-            if content:
-                yield content
 
     def embed(self, model: str, text: str) -> Optional[List[float]]:
         payload = {"model": model, "prompt": text}

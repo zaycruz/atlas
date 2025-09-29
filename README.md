@@ -1,89 +1,77 @@
-# Atlas Terminal Chat
+# Atlas Terminal Chat (Ultra‑Lite)
 
-Atlas is a terminal-first personal assistant for local Ollama models. It layers
-three kinds of memory—working, episodic, and semantic—to stay personal across
-sessions while keeping prompts compact.
+Atlas Ultra‑Lite is a terminal-first companion for local Ollama models focused on a simple, reliable chat loop with:
+- Working memory (recent turns)
+- Tool registry with iterative calls (web_search via Crawl4AI)
 
 ## Quick start
 
-1. Install [Python 3.9+](https://www.python.org/downloads/) if you do not already have it.
-2. Clone the repository (replace `YOUR_USERNAME` with your GitHub handle):
-   `git clone https://github.com/YOUR_USERNAME/atlas.git && cd atlas`
-3. Run the convenience launcher (it installs everything the first time):
+1. Install Python 3.9+ and ensure a local Ollama daemon is running at `http://localhost:11434`.
+2. Install dependencies:
+   - With Poetry: `poetry install`
+   - Or with pip (editable): `pip install -e .`
+3. Run the chat:
+   - With Poetry: `poetry run atlas-chat`
+   - Or with Python: `python -m atlas_main.cli`
 
-   - **macOS / Linux**
-     ```bash
-     ./atlas.sh
-     ```
-   - **Windows (PowerShell)**
-     ```powershell
-   .\atlas.ps1
-   ```
-    If PowerShell blocks the script, open PowerShell as Administrator once and run:
-    `Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser`
-
-   The script will install Ollama (if possible), create a local virtual
-   environment, install Python dependencies, pull the default models
-   (`qwen2.5:latest` plus the `mxbai-embed-large` embedder), and then
-   launch the chat.
-
-4. (Optional) Install a global `atlas` command:
-
-   - **macOS / Linux**
-     ```bash
-     ./atlas.sh --install-command
-     ```
-     Then restart your terminal or ensure `~/.local/bin` is on your PATH. After
-     that you can simply run `atlas` from anywhere.
-
-   - **Windows (PowerShell)**
-     ```powershell
-     .\atlas.ps1 -InstallCommand
-     ```
-     Ensure the folder reported by the script (typically
-     `%LOCALAPPDATA%\Microsoft\WindowsApps`) is on your PATH, then open a new
-     terminal and run `atlas`.
-
-Type into the REPL to chat. Press `Ctrl+D` (macOS/Linux) or `Ctrl+Z` then `Enter` (Windows) to exit, or type `/quit`.
-Responses stream token-by-token so you can watch ideas form in real time.
-Atlas can also request internal tools; you'll be prompted for approval when that happens.
-The CLI renders responses as Markdown with color-coded prompts (green for you,
-cyan for Atlas). Use `/model <name>` to switch Ollama models on the fly.
+Type into the REPL to chat. Press `Ctrl+D` to exit, or type `/quit`.
 
 ### Ollama requirements
 
-Atlas expects a local [Ollama](https://ollama.com/) daemon running on the
-default port (`http://localhost:11434`). The launcher scripts automatically
-pull `qwen2.5:latest` for chatting and `mxbai-embed-large` for embeddings.
-To use different models, set `ATLAS_CHAT_MODEL` and `ATLAS_EMBED_MODEL`
-before running the launcher.
+Atlas expects a local Ollama daemon on `http://localhost:11434`. To use different models, set environment variables before launching:
+- `ATLAS_CHAT_MODEL` (chat model, default `qwen3:latest`)
 
-## Memory architecture
+## Memory model
 
-- **Working memory**: the last few turns kept in a sliding buffer so short-term
-  context stays coherent.
-- **Episodic memory**: every interaction is embedded with an Ollama embedding
-  model (`mxbai-embed-large` by default) and stored in a JSON vector store to be
-  recalled when future prompts are similar.
-- **Semantic memory**: after each turn the assistant asks the LLM to extract
-  durable profile facts, preferences, and goals which are persisted separately
-  and summarised at the start of each response.
-- **Reflective journal**: the agent can decide to write a short reflection to
-  `~/.local/share/atlas/journal.json`. Use `/journal recent` or `/journal search`
-  in the CLI to review entries.
-- **Tool registry**: Atlas can request helper actions (e.g. creating journal
-  entries or reviewing recent turns). Use `/tool list` and `/tool run` to manage
-  these manually.
+- Working memory: last few turns are kept in a sliding buffer.
 
-All memory is written to `~/.local/share/atlas/` by default. You can change the
-paths or models with environment variables: `ATLAS_MEMORY_PATH`,
-`ATLAS_SEMANTIC_PATH`, `ATLAS_JOURNAL_PATH`, `ATLAS_CHAT_MODEL`, and
-`ATLAS_EMBED_MODEL`.
+### Abstractive episodic summarization
+
+For a short, high-signal summary of recalled episodes, use the helper in `atlas_main/memory.py`:
+
+- Function: `summarize_memories_abstractive(records, client, model=None, max_items=10, style="bullets"|"paragraph")`
+- Default model: `phi3:latest` (override with `ATLAS_SUMMARY_MODEL`).
+- Typical flow:
+   1. `records = episodic.recall("query", top_k=8)`
+   2. `summary = summarize_memories_abstractive(records, client)`
+
+Try it:
+
+- Run a quick demo script that prints episodes and the generated summary:
+
+```bash
+python scripts/visualize_summarizer.py
+```
+
+## CLI commands
+
+- `/model <name>` / `/model list` — switch or list models
+- `/thinking <on|off>` — show/hide model “thinking” content
+- `/log <off|error|warn|info|debug>` — adjust logging
+- `/quit` — exit the chat
+
+### Tooling
+
+Atlas can request tools while reasoning. The available set is announced in the system prompt and currently includes:
+
+- `web_search`: Uses DuckDuckGo for search results and Crawl4AI for clean content extraction from web pages.
+
+The model triggers a tool with a directive like `<<tool:web_search|{"query": "topic"}>>`. Tool outputs are fed back into the conversation so the model can continue looping until it reaches an answer.
+
+#### Content Extraction with Crawl4AI
+
+Atlas uses [Crawl4AI](https://github.com/unclecode/crawl4ai) for intelligent web content extraction:
+
+- **Clean Content**: Extracts readable text from web pages, removing ads and navigation
+- **LLM-Optimized**: Designed specifically for AI applications
+- **Fast & Reliable**: Handles modern web pages with JavaScript
+- **Automatic Fallback**: Falls back to simple HTTP requests if Crawl4AI fails
+
+No additional setup required — Crawl4AI ships as a dependency.
 
 ## Development notes
 
 - Requires Python 3.9 or newer.
-- Install dependencies with `poetry install` and run tests with
-  `poetry run pytest` (or `poetry run python -m unittest discover -s tests`).
-- The simple episodic store persists JSON; delete the files under the Atlas
-  data directory to reset.
+- Install with `poetry install` and run with `poetry run atlas-chat`.
+
+Legacy design notes that referenced controller/critic, journaling, and broader tool suites remain under `docs/` for reference.

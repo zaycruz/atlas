@@ -1,0 +1,21 @@
+# Atlas Autonomy Policies
+# Defines triggers and thresholds for autonomous behaviors
+
+# Reflection triggers - when Atlas should automatically reflect/journal
+reflection:
+  turns_since_last: 20  # Reflect after N conversation turns
+  new_goal_detected: true  # Reflect when new goals are added/changed
+  contradiction_detected: true  # Reflect when semantic profile contradictions found
+  end_of_day: true  # Reflect at end of day (daily summary)
+
+# Disagreement triggers - when Atlas should challenge user plans
+disagreement:
+  risk_conflict: true  # Disagree if plan conflicts with user's stated risk tolerance
+  repeated_failure: true  # Disagree if plan matches patterns of past failures in memory
+
+# Autonomy levels (future use)
+autonomy:
+  max_daily_reflections: 5  # Limit reflections per day
+  disagreement_cooldown: 10  # Minutes between disagreements
+  tool_confirmation_threshold: "high"  # When to require confirmation for tools
+

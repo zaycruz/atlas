@@ -8,9 +8,16 @@ import uuid
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, List, Optional, Sequence
+from typing import Any, Callable, Iterable, List, Optional, Sequence
 
 import numpy as np
+import os
+
+# Optional: used for abstractive summarization via local LLM
+try:  # Avoid import errors when used standalone in tests
+    from .ollama import OllamaClient
+except Exception:  # pragma: no cover - type hint only
+    OllamaClient = Any  # type: ignore
 
 
 EmbeddingFunction = Callable[[str], Optional[Sequence[float]]]
@@ -48,13 +55,15 @@ class WorkingMemory:
 
     def __init__(self, capacity: int = 12) -> None:
         self.capacity = max(2, capacity)
-        self._buffer: deque[dict[str, str]] = deque(maxlen=self.capacity)
+        self._buffer: deque[dict[str, Any]] = deque(maxlen=self.capacity)
 
-    def add(self, role: str, content: str) -> None:
+    def add(self, role: str, content: str, **extra: Any) -> None:
         content = content.strip()
         if not content:
             return
-        self._buffer.append({"role": role, "content": content})
+        message: dict[str, Any] = {"role": role, "content": content}
+        message.update({k: v for k, v in extra.items() if v is not None})
+        self._buffer.append(message)
 
     def add_user(self, content: str) -> None:
         self.add("user", content)
@@ -62,7 +71,14 @@ class WorkingMemory:
     def add_assistant(self, content: str) -> None:
         self.add("assistant", content)
 
-    def to_messages(self) -> list[dict[str, str]]:
+    def add_tool(self, name: str, content: str) -> None:
+        content = content.strip()
+        if not content:
+            return
+        formatted = f"[tool:{name}]\n{content}" if name else content
+        self.add("assistant", formatted)
+
+    def to_messages(self) -> list[dict[str, Any]]:
         return list(self._buffer)
 
     def clear(self) -> None:
@@ -212,6 +228,77 @@ def render_memory_snippets(records: Iterable[MemoryRecord]) -> str:
         snippet = snippet.replace("\n", " ")
         lines.append(f"- {snippet[:160]}")
     return "\n".join(lines)
+
+
+def summarize_memories_abstractive(
+    records: Iterable[MemoryRecord],
+    client: Any,
+    *,
+    model: Optional[str] = None,
+    max_items: int = 10,
+    max_chars: int = 4000,
+    style: str = "bullets",
+) -> str:
+    """Generate an abstractive summary of episodes using a local LLM (phi3 by default).
+
+    Inputs:
+      - records: iterable of MemoryRecord to summarize (order respected; earlier items may be dropped)
+      - client: OllamaClient instance
+      - model: override model name (default env ATLAS_SUMMARY_MODEL or 'phi3:latest')
+      - max_items: cap number of episodes included
+      - max_chars: cap total characters of concatenated content passed to model
+      - style: 'bullets' or 'paragraph'
+
+    Returns a short textual summary.
+    """
+    chosen_model = (model or os.getenv("ATLAS_SUMMARY_MODEL") or "phi3:latest").strip()
+
+    # Collect up to max_items episodes, prefer assistant text, then user
+    chunks: List[str] = []
+    count = 0
+    for rec in records:
+        if count >= max_items:
+            break
+        text = (rec.assistant or rec.user or "").strip()
+        if not text:
+            continue
+        one = text.replace("\n", " ")
+        chunks.append(one)
+        count += 1
+    if not chunks:
+        return "(no episodes to summarize)"
+
+    # Truncate to max_chars overall
+    doc = "\n".join(chunks)
+    if len(doc) > max_chars:
+        doc = doc[:max_chars]
+
+    summary_instruction = (
+        "You are a concise summarizer. Read the following past episodes from a user-assistant "
+        "conversation and produce a short, high-signal summary capturing goals, tasks, decisions, "
+        "and outcomes. Avoid fluff, keep it concrete."
+    )
+    if style == "bullets":
+        summary_instruction += " Respond with 3-5 bullet points."
+    else:
+        summary_instruction += " Respond with a 2-3 sentence paragraph."
+
+    messages = [
+        {"role": "system", "content": summary_instruction},
+        {"role": "user", "content": f"Episodes to summarize:\n\n{doc}"},
+    ]
+
+    try:
+        resp = client.chat(model=chosen_model, messages=messages, stream=False)
+    except Exception as exc:  # pragma: no cover - network/runtime path
+        return f"(summary failed: {exc})"
+
+    # Extract content from Ollama chat response
+    content = ""
+    if isinstance(resp, dict):
+        msg = resp.get("message") or {}
+        content = msg.get("content") or resp.get("response") or ""
+    return content.strip() or "(empty summary)"
 
 
 # Backwards compatibility export
