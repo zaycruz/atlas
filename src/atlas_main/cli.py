@@ -98,6 +98,9 @@ def _handle_command(agent: AtlasAgent, command_line: str) -> bool:
     if cmd == "thinking":
         _handle_thinking(agent, rest)
         return True
+    if cmd == "memory":
+        _handle_memory(agent, rest)
+        return True
     console.print(f"Unknown command: {cmd}. Type /help for options.", style="yellow")
     return True
 
@@ -109,6 +112,7 @@ def _print_help() -> None:
     table.add_row("  /model list", "list available models")
     table.add_row("  /thinking <on|off>", "show or hide model thinking content")
     table.add_row("  /log <off|error|warn|info|debug>", "adjust logging level")
+    table.add_row("  /memory ...", "inspect episodic, semantic, or reflection memory")
     table.add_row("  /quit", "exit the chat")
     console.print(table)
 
@@ -147,6 +151,130 @@ def _handle_thinking(agent: AtlasAgent, args: list[str]) -> None:
     agent.show_thinking = (args[0].lower() == "on")
     state = "ON" if agent.show_thinking else "OFF"
     console.print(f"Thinking visibility set to {state}", style="green")
+
+
+def _handle_memory(agent: AtlasAgent, args: list[str]) -> None:
+    lm = getattr(agent, "layered_memory", None)
+    if lm is None:
+        console.print("Layered memory is disabled in this build.", style="yellow")
+        return
+
+    if not args:
+        console.print(
+            "Usage: /memory <episodic|semantic|reflections|snapshot|path> [limit] [query]",
+            style="yellow",
+        )
+        return
+
+    section = args[0].lower()
+    rest = args[1:]
+    limit = 5
+    if rest and rest[0].isdigit():
+        limit = max(1, int(rest[0]))
+        rest = rest[1:]
+    query = " ".join(rest).strip()
+
+    if section == "path":
+        config = getattr(agent, "layered_memory_config", getattr(lm, "config", None))
+        if not config:
+            console.print("Memory configuration unavailable.", style="yellow")
+            return
+        console.print("[bold]Memory storage paths[/bold]")
+        console.print(f"Base: {config.base_dir}")
+        console.print(f"Episodic DB: {config.episodic_path}")
+        console.print(f"Semantic JSON: {config.semantic_path}")
+        console.print(f"Reflections JSON: {config.reflections_path}")
+        return
+
+    if section == "episodic":
+        _print_episodic_memory(lm, limit=limit, query=query)
+        return
+    if section == "semantic":
+        _print_semantic_memory(lm, limit=limit, query=query)
+        return
+    if section == "reflections":
+        _print_reflections(lm, limit=limit)
+        return
+    if section == "snapshot":
+        if not query:
+            console.print("Usage: /memory snapshot <query>", style="yellow")
+            return
+        assembled = lm.assemble(query)
+        rendered = lm.render(assembled)
+        if rendered:
+            console.print(f"[bold]Snapshot for '{query}':[/bold]", highlight=False)
+            console.print(rendered)
+        else:
+            console.print("(no memory retrieved for that query)", style="yellow")
+        return
+
+    console.print("Unknown memory command. Use episodic, semantic, reflections, snapshot, or path.", style="yellow")
+
+
+def _print_episodic_memory(lm, *, limit: int, query: str) -> None:
+    items = []
+    header = "Recent episodes"
+    if query:
+        hits = lm.episodic.recall(query, top_k=limit)  # type: ignore[attr-defined]
+        if hits:
+            header = f"Episodic recall for '{query}'"
+            for score, rec in hits:
+                text = (rec.get("assistant") or rec.get("user") or "").strip()
+                if text:
+                    items.append(f"{score:.3f} • {text}")
+        if not items:
+            header = f"Recent episodes (no vector hits for '{query}')"
+    if not items:
+        recent = lm.episodic.recent(limit)  # type: ignore[attr-defined]
+        for rec in recent:
+            text = (rec.get("assistant") or rec.get("user") or "").strip()
+            if text:
+                items.append(text)
+    if not items:
+        console.print("(no episodic entries recorded yet)", style="yellow")
+        return
+    console.print(f"[bold]{header}[/bold]", highlight=False)
+    for entry in items:
+        console.print(f"- {entry}", highlight=False)
+
+
+def _print_semantic_memory(lm, *, limit: int, query: str) -> None:
+    items = []
+    header = "Semantic facts"
+    if query:
+        hits = lm.semantic.recall(query, top_k=limit)  # type: ignore[attr-defined]
+        if hits:
+            header = f"Semantic recall for '{query}'"
+            for score, fact in hits:
+                text = str(fact.get("text", "")).strip()
+                if text:
+                    items.append(f"{score:.3f} • {text}")
+        if not items:
+            header = f"Semantic head entries (no vector hits for '{query}')"
+    if not items:
+        head = lm.semantic.head(limit)  # type: ignore[attr-defined]
+        for fact in head:
+            text = str(fact.get("text", "")).strip()
+            if text:
+                items.append(text)
+    if not items:
+        console.print("(semantic memory is empty)", style="yellow")
+        return
+    console.print(f"[bold]{header}[/bold]", highlight=False)
+    for entry in items:
+        console.print(f"- {entry}", highlight=False)
+
+
+def _print_reflections(lm, *, limit: int) -> None:
+    lessons = lm.reflections.recent(limit)  # type: ignore[attr-defined]
+    if not lessons:
+        console.print("(no reflections logged yet)", style="yellow")
+        return
+    console.print("[bold]Recent reflections[/bold]", highlight=False)
+    for item in lessons:
+        text = str(item.get("text", "")).strip()
+        if text:
+            console.print(f"- {text}", highlight=False)
 
 
 # Lite build: no tools, journal, critic, identity, desires, or snapshots.

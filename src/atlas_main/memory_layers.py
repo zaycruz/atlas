@@ -8,7 +8,8 @@ import json
 import os
 import sqlite3
 import time
-from dataclasses import dataclass
+import logging
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, List, Optional, Sequence, Tuple
 
@@ -16,6 +17,9 @@ import numpy as np
 
 
 EmbedFn = Callable[[str], Optional[Sequence[float]]]
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _cosine(a: np.ndarray, b: np.ndarray) -> float:
@@ -103,6 +107,20 @@ class EpisodicSQLiteMemory:
         scored.sort(key=lambda x: x[0], reverse=True)
         return scored[:top_k]
 
+    def recent(self, top_k: int = 3) -> List[dict]:
+        if top_k <= 0:
+            return []
+        cur = self._conn.cursor()
+        cur.execute(
+            "SELECT ts, user, assistant FROM episodes ORDER BY ts DESC LIMIT ?",
+            (int(top_k),),
+        )
+        rows = cur.fetchall()
+        recent: List[dict] = []
+        for ts, user, assistant in rows:
+            recent.append({"ts": ts, "user": user or "", "assistant": assistant or ""})
+        return recent
+
 
 class SemanticMemory:
     """Durable facts loaded from a JSON file; optional embeddings for recall."""
@@ -149,6 +167,11 @@ class SemanticMemory:
         scored.sort(key=lambda x: x[0], reverse=True)
         return scored[:top_k]
 
+    def head(self, top_k: int = 3) -> List[dict]:
+        if top_k <= 0:
+            return []
+        return self._facts[:top_k]
+
 
 class ReflectionMemory:
     """Lessons learned stored in a JSON lines or list file."""
@@ -178,6 +201,178 @@ class ReflectionMemory:
 
 
 @dataclass
+class LayeredMemoryConfig:
+    base_dir: Path = Path(os.getenv("ATLAS_MEMORY_DIR", "~/.atlas/memory")).expanduser()
+    embed_model: str = os.getenv("ATLAS_EMBED_MODEL", "nomic-embed-text").strip() or "nomic-embed-text"
+    episodic_filename: str = "episodes.sqlite3"
+    semantic_filename: str = "semantic.json"
+    reflections_filename: str = "reflections.json"
+    max_episodic_records: int = 2000
+    k_ep: int = 3
+    k_facts: int = 3
+    k_reflections: int = 3
+    summary_style: str = "bullets"
+
+    episodic_path: Path = field(init=False)
+    semantic_path: Path = field(init=False)
+    reflections_path: Path = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.base_dir = Path(self.base_dir).expanduser()
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+        self.episodic_path = self.base_dir / self.episodic_filename
+        self.semantic_path = self.base_dir / self.semantic_filename
+        self.reflections_path = self.base_dir / self.reflections_filename
+
+
+@dataclass
+class LayeredMemorySnapshot:
+    summary: str
+    rendered: str
+    assembled: AssembledContext
+
+
+class LayeredMemoryManager:
+    """Coordinates layered memory recall, rendering, and logging."""
+
+    def __init__(
+        self,
+        embed_fn: EmbedFn,
+        *,
+        config: Optional[LayeredMemoryConfig] = None,
+    ) -> None:
+        self.config = config or LayeredMemoryConfig()
+        self.embed_fn = embed_fn
+        self._debug_enabled = self._env_truth("ATLAS_MEMORY_DEBUG")
+        self.episodic = EpisodicSQLiteMemory(
+            self.config.episodic_path,
+            embed_fn=embed_fn,
+            max_records=self.config.max_episodic_records,
+        )
+        self.semantic = SemanticMemory(self.config.semantic_path, embed_fn=embed_fn)
+        self.reflections = ReflectionMemory(self.config.reflections_path)
+        self.assembler = ContextAssembler(
+            episodic=self.episodic,
+            semantic=self.semantic,
+            reflections=self.reflections,
+        )
+        self._debug(
+            "LayeredMemoryManager initialized (base_dir=%s, embed_model=%s)",
+            self.config.base_dir,
+            self.config.embed_model,
+        )
+
+    def log_interaction(self, user: str, assistant: str) -> None:
+        try:
+            self.episodic.log(user, assistant)
+            self._debug(
+                "Logged interaction to episodic memory (user='%s...', assistant='%s...')",
+                (user or "").strip()[:40],
+                (assistant or "").strip()[:40],
+            )
+        except Exception:
+            pass
+
+    def assemble(self, query: str) -> AssembledContext:
+        self._debug("Assembling memory context for query='%s'", query.strip()[:60])
+        assembled = self.assembler.assemble(
+            query,
+            k_ep=self.config.k_ep,
+            k_facts=self.config.k_facts,
+            k_lessons=self.config.k_reflections,
+        )
+        meta = self.assembler.last_metadata
+        episodic_meta = meta.get("episodic", [])
+        semantic_meta = meta.get("semantic", [])
+        reflection_meta = meta.get("reflections", [])
+        if episodic_meta:
+            preview = "; ".join(
+                f"{item['score']:.3f}: {item['text']}" for item in episodic_meta
+            )
+            self._debug("Episodic recall hits (%d): %s", len(episodic_meta), preview)
+        else:
+            self._debug("Episodic recall returned no vector matches")
+        if semantic_meta:
+            preview = "; ".join(
+                f"{item['score']:.3f}: {item['text']}" for item in semantic_meta
+            )
+            self._debug("Semantic recall hits (%d): %s", len(semantic_meta), preview)
+        else:
+            self._debug("Semantic recall returned no matches")
+        if reflection_meta:
+            preview = "; ".join(item["text"] for item in reflection_meta)
+            self._debug("Reflections surfaced (%d): %s", len(reflection_meta), preview)
+        else:
+            self._debug("No reflections available")
+
+        if not assembled.episodic:
+            fallback = []
+            for item in self.episodic.recent(self.config.k_ep):
+                text = (item.get("assistant") or item.get("user") or "").strip().replace("\n", " ")
+                if text:
+                    fallback.append(f"- {text[:200]}")
+            if fallback:
+                self._debug(
+                    "Using recency fallback for episodic layer (count=%d)",
+                    len(fallback),
+                )
+                assembled = AssembledContext(episodic=fallback, facts=assembled.facts, reflections=assembled.reflections)
+        if not assembled.facts:
+            facts = []
+            for fact in self.semantic.head(self.config.k_facts):
+                text = str(fact.get("text", "")).strip().replace("\n", " ")
+                if text:
+                    facts.append(f"- {text[:200]}")
+            if facts:
+                self._debug(
+                    "Using head fallback for semantic layer (count=%d)",
+                    len(facts),
+                )
+                assembled = AssembledContext(episodic=assembled.episodic, facts=facts, reflections=assembled.reflections)
+        return assembled
+
+    def render(self, assembled: AssembledContext) -> str:
+        return self.assembler.render(assembled)
+
+    def summarize(self, assembled: AssembledContext, *, client: Any) -> str:
+        if not hasattr(client, "chat"):
+            return ""
+        try:
+            summary = summarize_assembled_context_abstractive(
+                assembled,
+                client,
+                style=self.config.summary_style,
+            )
+            self._debug("Generated memory summary (%d chars)", len(summary))
+            return summary
+        except Exception:
+            self._debug("Summary generation failed", exc_info=True)
+            return ""
+
+    def build_snapshot(self, query: str, *, client: Any) -> LayeredMemorySnapshot:
+        assembled = self.assemble(query)
+        rendered = self.render(assembled)
+        summary = ""
+        if assembled.episodic or assembled.facts or assembled.reflections:
+            summary = self.summarize(assembled, client=client)
+        else:
+            self._debug("No memory content available for snapshot")
+        return LayeredMemorySnapshot(summary=summary.strip(), rendered=rendered.strip(), assembled=assembled)
+
+    def _debug(self, message: str, *args: Any, **kwargs: Any) -> None:
+        if self._debug_enabled:
+            LOGGER.info(message, *args, **kwargs)
+
+    @staticmethod
+    def _env_truth(name: str) -> bool:
+        value = os.getenv(name)
+        if value is None:
+            return False
+        normalized = value.strip().lower()
+        return normalized not in {"", "0", "false", "off"}
+
+
+@dataclass
 class AssembledContext:
     episodic: List[str]
     facts: List[str]
@@ -196,29 +391,49 @@ class ContextAssembler:
         self.episodic = episodic
         self.semantic = semantic
         self.reflections = reflections
+        self._last_metadata: dict[str, Any] = {}
 
     def assemble(self, query: str, *, k_ep: int = 3, k_facts: int = 3, k_lessons: int = 3) -> AssembledContext:
         episodic_snips: List[str] = []
+        episodic_meta: List[dict[str, Any]] = []
         if self.episodic:
             for score, rec in self.episodic.recall(query, top_k=k_ep):
                 text = (rec.get("assistant") or rec.get("user") or "").strip().replace("\n", " ")
                 if text:
                     episodic_snips.append(f"- {text[:200]}")
+                    episodic_meta.append({
+                        "score": float(score),
+                        "text": text[:120],
+                    })
 
         fact_snips: List[str] = []
+        fact_meta: List[dict[str, Any]] = []
         if self.semantic:
             for score, fact in self.semantic.recall(query, top_k=k_facts):
                 text = str(fact.get("text", "")).strip().replace("\n", " ")
                 if text:
                     fact_snips.append(f"- {text[:200]}")
+                    fact_meta.append({
+                        "score": float(score),
+                        "text": text[:120],
+                    })
 
         lesson_snips: List[str] = []
+        lesson_meta: List[dict[str, Any]] = []
         if self.reflections:
             for item in self.reflections.recent(k_lessons):
                 text = str(item.get("text", "")).strip().replace("\n", " ")
                 if text:
                     lesson_snips.append(f"- {text[:200]}")
+                    lesson_meta.append({
+                        "text": text[:120],
+                    })
 
+        self._last_metadata = {
+            "episodic": episodic_meta,
+            "semantic": fact_meta,
+            "reflections": lesson_meta,
+        }
         return AssembledContext(episodic=episodic_snips, facts=fact_snips, reflections=lesson_snips)
 
     def render(self, assembled: AssembledContext) -> str:
@@ -230,3 +445,59 @@ class ContextAssembler:
         if assembled.reflections:
             parts.append("Relevant reflections:\n" + "\n".join(assembled.reflections))
         return "\n\n".join(parts)
+
+    @property
+    def last_metadata(self) -> dict[str, Any]:
+        return self._last_metadata
+
+
+def summarize_assembled_context_abstractive(
+    assembled: AssembledContext,
+    client: Any,
+    *,
+    model: Optional[str] = None,
+    style: str = "bullets",
+) -> str:
+    """Summarize a combined context (episodes, facts, reflections) via local LLM.
+
+    - model defaults to env ATLAS_SUMMARY_MODEL or 'phi3:latest'
+    - style: 'bullets' or 'paragraph'
+    """
+    chosen_model = (model or os.getenv("ATLAS_SUMMARY_MODEL") or "phi3:latest").strip()
+
+    parts: List[str] = []
+    if assembled.episodic:
+        parts.append("Episodes:\n" + "\n".join(assembled.episodic))
+    if assembled.facts:
+        parts.append("Facts:\n" + "\n".join(assembled.facts))
+    if assembled.reflections:
+        parts.append("Reflections:\n" + "\n".join(assembled.reflections))
+
+    if not parts:
+        return "(no context to summarize)"
+    doc = "\n\n".join(parts)
+
+    instruction = (
+        "You are a concise summarizer. Given episodes, facts, and reflections, produce a short, "
+        "high-signal summary that captures goals, tasks, decisions, lessons, and outcomes."
+    )
+    if style == "bullets":
+        instruction += " Respond with 3-6 bullet points."
+    else:
+        instruction += " Respond with a 2-4 sentence paragraph."
+
+    messages = [
+        {"role": "system", "content": instruction},
+        {"role": "user", "content": doc},
+    ]
+
+    try:
+        resp = client.chat(model=chosen_model, messages=messages, stream=False)
+    except Exception as exc:  # pragma: no cover
+        return f"(summary failed: {exc})"
+
+    content = ""
+    if isinstance(resp, dict):
+        msg = resp.get("message") or {}
+        content = msg.get("content") or resp.get("response") or ""
+    return content.strip() or "(empty summary)"

@@ -2,9 +2,16 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
+import os
+import pty
 import re
-import textwrap
+import select
+import subprocess
+import tempfile
 import threading
+import time
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -14,6 +21,7 @@ import requests
 
 USER_AGENT = "AtlasLite/1.0 (+https://github.com)"
 DEFAULT_FILE_CHUNK = 6000
+MAX_SHELL_OUTPUT = 4000
 
 
 class ToolError(RuntimeError):
@@ -110,7 +118,10 @@ class WebSearchTool(Tool):
 
     name = "web_search"
     description = "Search the web and extract clean content from results."
-    args_hint = "query (str, required); max_results (int, optional, default 3)"
+    args_hint = (
+        "query (str, required); max_results (int, optional, default 3); domain (str, optional); "
+        "titles_only (bool, optional); include_meta (bool, optional)"
+    )
 
     def __init__(self, *, session: Optional[requests.Session] = None) -> None:
         self._session = session or requests.Session()
@@ -142,46 +153,94 @@ class WebSearchTool(Tool):
                 self._async_crawler_cls = AsyncWebCrawler
                 self._async_cache_mode = CacheMode
 
-    def run(self, *, agent=None, query: str, max_results: int = 3) -> str:  # type: ignore[override]
+    def run(
+        self,
+        *,
+        agent=None,
+        query: str,
+        max_results: int = 3,
+        domain: Optional[str] = None,
+        titles_only: bool = False,
+        include_meta: bool = False,
+    ) -> str:  # type: ignore[override]
         query = query.strip()
         if not query:
             raise ToolError("web_search requires a non-empty 'query'")
-        
+
         max_results = max(1, min(int(max_results or 3), 5))
-        
+
+        if domain:
+            domain = domain.strip()
+            if domain and f"site:{domain}" not in query:
+                query = f"{query} site:{domain}"
+
         # Get search results from DuckDuckGo
         search_results = self._search_duckduckgo(query)
         if not search_results:
             return f"No results found for '{query}'."
 
-        summaries = []
-        for idx, result in enumerate(search_results[:max_results]):
-            snippet = result.get("snippet") or ""
-            title = result.get("title") or result.get("text") or "Result"
-            url = result.get("url") or result.get("first_url") or ""
-            
-            # Use Crawl4AI to extract clean content
+        sources: List[Dict[str, str]] = []
+        for result in search_results[:max_results]:
+            snippet = (result.get("snippet") or "").strip()
+            title = (result.get("title") or result.get("text") or "Result").strip()
+            url = (result.get("url") or result.get("first_url") or "").strip()
+
             content = ""
+            meta_description = ""
             if url:
                 try:
                     content = self._crawl_content(url)
                 except (ToolError, Exception) as exc:
-                    # Fallback to simple fetch if Crawl4AI fails
                     try:
                         content = self._fetch_content_simple(url)
                     except Exception:
                         content = f"(content unavailable: {type(exc).__name__})"
 
-            section = textwrap.dedent(
-                f"""Result {idx + 1}: {title}
-URL: {url or 'n/a'}
-Snippet: {snippet or 'n/a'}
-Content: {content or 'n/a'}"""
-            ).strip()
-            summaries.append(section)
+            content = (content or "").strip()
+            if content.startswith("(content unavailable") and snippet:
+                content = ""
 
-        header = f"Web search results for: {query}"
-        return header + "\n\n" + "\n\n".join(summaries)
+            if include_meta and url:
+                try:
+                    meta_description = self._fetch_meta_description(url)
+                except Exception:
+                    meta_description = ""
+
+            sources.append(
+                {
+                    "title": title or "Result",
+                    "url": url,
+                    "snippet": snippet,
+                    "content": content,
+                    "meta": meta_description.strip(),
+                }
+            )
+
+        header = f"Search summary for '{query}':"
+        if titles_only:
+            lines = [header]
+            for idx, source in enumerate(sources[:max_results]):
+                title = source.get("title") or "Result"
+                url = source.get("url") or ""
+                meta = source.get("meta") or ""
+                line = f"{idx + 1}. {title}"
+                if url:
+                    line += f" ({url})"
+                if include_meta and meta:
+                    line += f" — {meta}"
+                lines.append(line)
+            return "\n".join(lines)
+
+        summary = self._compose_takeaways(sources)
+        details = self._compose_details(sources)
+
+        parts = [header]
+        if summary:
+            parts.append(summary)
+        if details:
+            parts.append("")
+            parts.append(details)
+        return "\n".join([part for part in parts if part]).strip()
 
     def _crawl_content(self, url: str) -> str:
         """Extract content using Crawl4AI."""
@@ -400,13 +459,113 @@ Content: {content or 'n/a'}"""
         except Exception as e:
             raise ToolError(f"Content fetch failed: {e}")
 
+    def _compose_takeaways(self, sources: List[Dict[str, str]]) -> str:
+        sentences: List[str] = []
+        for source in sources:
+            snippet = source.get("snippet") or ""
+            content = source.get("content") or ""
+            for piece in (snippet, content):
+                if not piece:
+                    continue
+                for sentence in self._extract_sentences(piece, limit=2):
+                    sentences.append(sentence)
+                    if len(sentences) >= 4:
+                        break
+                if len(sentences) >= 4:
+                    break
+            if len(sentences) >= 4:
+                break
+        if not sentences:
+            return "No substantive information was retrieved."
+        combined = " ".join(sentences)
+        return combined[:600]
+
+    def _compose_details(self, sources: List[Dict[str, str]]) -> str:
+        detail_lines: List[str] = []
+        for source in sources:
+            url = source.get("url") or ""
+            title = source.get("title") or "Result"
+            snippet = source.get("snippet") or ""
+            content = source.get("content") or ""
+            meta = source.get("meta") or ""
+            sentences: List[str] = []
+            for piece in (snippet, content):
+                if not piece:
+                    continue
+                remaining = max(0, 2 - len(sentences))
+                if remaining == 0:
+                    break
+                sentences.extend(self._extract_sentences(piece, limit=remaining))
+                if len(sentences) >= 2:
+                    break
+            if not sentences:
+                continue
+            detail = " ".join(sentences)
+            detail = self._ensure_sentence(detail)
+            if url:
+                line = f"From {title} ({url}), {detail}"
+            else:
+                line = f"From {title}, {detail}"
+            if meta:
+                line += f" (meta: {meta})"
+            detail_lines.append(line)
+        return "\n\n".join(detail_lines)
+
+    def _fetch_meta_description(self, url: str) -> str:
+        try:
+            response = self._session.get(url, timeout=4, headers={"User-Agent": USER_AGENT})
+            if response.status_code >= 400:
+                return ""
+            html = response.text
+        except Exception:
+            return ""
+        match = re.search(r'<meta[^>]+name=["\"]description["\"][^>]+content=["\"]([^"\"]+)["\"]', html, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+        match = re.search(r'<meta[^>]+content=["\"]([^"\"]+)["\"][^>]+name=["\"]description["\"]', html, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+        return ""
+
+    @staticmethod
+    def _extract_sentences(text: str, *, limit: int = 2) -> List[str]:
+        if limit <= 0:
+            return []
+        if not text:
+            return []
+        cleaned = text.strip()
+        if not cleaned:
+            return []
+        segments = re.split(r"(?<=[.!?])\s+", cleaned)
+        sentences: List[str] = []
+        for segment in segments:
+            candidate = segment.strip()
+            if not candidate:
+                continue
+            sentences.append(candidate)
+            if len(sentences) >= limit:
+                break
+        return sentences
+
+    @staticmethod
+    def _ensure_sentence(text: str) -> str:
+        trimmed = text.strip()
+        if not trimmed:
+            return ""
+        if trimmed[-1] not in ".!?":
+            return trimmed + "."
+        return trimmed
+
 
 class ReadFileTool(Tool):
     """Read text from files on disk."""
 
     name = "read_file"
-    description = "Read a UTF-8 text file, optionally with offset/length."  # noqa: RUF015
-    args_hint = "path (str, required); offset (int, optional); length (int, optional)"
+    description = "Read a UTF-8 text file with optional offset/length and filtering."  # noqa: RUF015
+    args_hint = (
+        "path (str, required); offset (int, optional); length (int, optional); "
+        "max_lines (int, optional); pattern (str, optional); case_sensitive (bool, optional)"
+    )
 
     def __init__(self, *, max_chars: int = DEFAULT_FILE_CHUNK) -> None:
         self._max_chars = max_chars
@@ -418,6 +577,9 @@ class ReadFileTool(Tool):
         path: str,
         offset: int = 0,
         length: Optional[int] = None,
+        max_lines: Optional[int] = None,
+        pattern: Optional[str] = None,
+        case_sensitive: bool = False,
     ) -> str:  # type: ignore[override]
         resolved = _resolve_user_path(path)
         if not resolved.is_file():
@@ -439,10 +601,37 @@ class ReadFileTool(Tool):
             data = data[: self._max_chars]
             truncated = True
 
-        lines = [f"File: {resolved}", ""]
-        lines.append(data)
+        filtered = data
+
+        if max_lines is not None:
+            safe_lines = max(int(max_lines), 0)
+            if safe_lines and safe_lines < len(filtered.splitlines()):
+                filtered = "\n".join(filtered.splitlines()[:safe_lines])
+                truncated = True
+
+        highlight_note = ""
+        if pattern:
+            try:
+                flags = 0 if case_sensitive else re.IGNORECASE
+                regex = re.compile(pattern, flags)
+            except re.error as exc:
+                raise ToolError(f"invalid regex pattern: {exc}") from exc
+
+            def _repl(match: re.Match[str]) -> str:
+                return f"<<{match.group(0)}>>"
+
+            highlighted = regex.sub(_repl, filtered)
+            if highlighted != filtered:
+                highlight_note = f"(pattern highlighted with <<>> markers: {pattern})"
+            filtered = highlighted
+
+        lines = [f"File: {resolved}"]
+        lines.append("")
+        lines.append(filtered)
+        if highlight_note:
+            lines.append(f"\n{highlight_note}")
         if truncated:
-            lines.append(f"\n(truncated to {self._max_chars} characters)")
+            lines.append(f"\n(truncated output)")
         return "\n".join(lines)
 
 
@@ -453,7 +642,8 @@ class WriteFileTool(Tool):
     description = "Create or update a text file; requires explicit overwrite/append."  # noqa: RUF015
     args_hint = (
         "path (str, required); content (str, required); overwrite (bool, optional); "
-        "append (bool, optional); create_dirs (bool, optional)"
+        "append (bool, optional); create_dirs (bool, optional); atomic (bool, optional); "
+        "preserve_times (bool, optional); show_diff (bool, optional)"
     )
 
     def run(
@@ -465,9 +655,14 @@ class WriteFileTool(Tool):
         overwrite: bool = False,
         append: bool = False,
         create_dirs: bool = False,
+        atomic: bool = False,
+        preserve_times: bool = False,
+        show_diff: bool = False,
     ) -> str:  # type: ignore[override]
         if append and overwrite:
             raise ToolError("set either append or overwrite, not both")
+        if atomic and append:
+            raise ToolError("atomic writes are incompatible with append mode")
 
         resolved = _resolve_user_path(path)
         parent = resolved.parent
@@ -486,15 +681,234 @@ class WriteFileTool(Tool):
         if resolved.exists() and not (overwrite or append):
             raise ToolError("file exists; set overwrite=True or append=True")
 
-        mode = "a" if append else "w"
-        try:
-            with resolved.open(mode, encoding="utf-8") as handle:
-                handle.write(content)
-        except Exception as exc:
-            raise ToolError(f"failed to write {resolved}: {exc}") from exc
+        old_stat = None
+        old_content = ""
+        if resolved.exists():
+            try:
+                old_stat = resolved.stat()
+                old_content = resolved.read_text(encoding="utf-8")
+            except Exception:
+                old_content = ""
+
+        final_content = content
+        if append:
+            final_content = (old_content or "") + content
+            try:
+                with resolved.open("a", encoding="utf-8") as handle:
+                    handle.write(content)
+            except Exception as exc:
+                raise ToolError(f"failed to append {resolved}: {exc}") from exc
+        else:
+            if atomic:
+                tmp_path = None
+                try:
+                    with tempfile.NamedTemporaryFile(
+                        "w",
+                        encoding="utf-8",
+                        delete=False,
+                        dir=str(parent),
+                    ) as tmp:
+                        tmp.write(content)
+                        tmp_path = Path(tmp.name)
+                    if tmp_path is not None:
+                        if old_stat is not None:
+                            try:
+                                tmp_path.chmod(old_stat.st_mode)
+                            except Exception:
+                                pass
+                        else:
+                            try:
+                                tmp_path.chmod(0o644)
+                            except Exception:
+                                pass
+                        os.replace(tmp_path, resolved)
+                except Exception as exc:
+                    if tmp_path and tmp_path.exists():
+                        tmp_path.unlink(missing_ok=True)
+                    raise ToolError(f"failed to write {resolved} atomically: {exc}") from exc
+            else:
+                try:
+                    with resolved.open("w", encoding="utf-8") as handle:
+                        handle.write(content)
+                except Exception as exc:
+                    raise ToolError(f"failed to write {resolved}: {exc}") from exc
+
+        if preserve_times and old_stat and resolved.exists():
+            try:
+                os.utime(resolved, (old_stat.st_atime, old_stat.st_mtime))
+            except Exception:
+                pass
+
+        diff_text = ""
+        if show_diff:
+            before = old_content.splitlines()
+            after = final_content.splitlines()
+            diff_lines = list(
+                difflib.unified_diff(
+                    before,
+                    after,
+                    fromfile="before",
+                    tofile="after",
+                    lineterm="",
+                )
+            )
+            if diff_lines:
+                diff_text = "\n".join(diff_lines)
 
         action = "Appended" if append else "Wrote"
-        return f"{action} {len(content)} characters to {resolved}"
+        result_lines = [f"{action} {len(content)} characters to {resolved}"]
+        if preserve_times and old_stat:
+            result_lines.append("Preserved original timestamps")
+        if diff_text:
+            result_lines.append("\nDiff:\n" + diff_text)
+        return "\n".join(result_lines)
+
+
+class ShellCommandTool(Tool):
+    """Execute shell commands on the local system."""
+
+    name = "shell_command"
+    description = "Run a shell command and return stdout/stderr."  # noqa: RUF015
+    args_hint = (
+        "command (str, required); timeout (int, optional); cwd (str, optional); "
+        "sudo (bool, optional); interactive (bool, optional); retries (int, optional)"
+    )
+
+    def run(
+        self,
+        *,
+        agent=None,
+        command: str,
+        timeout: int = 60,
+        cwd: Optional[str] = None,
+        sudo: bool = False,
+        interactive: bool = False,
+        retries: int = 0,
+    ) -> str:  # type: ignore[override]
+        cmd = (command or "").strip()
+        if not cmd:
+            raise ToolError("shell_command requires a non-empty 'command'")
+
+        resolved_cwd: Optional[str] = None
+        if cwd:
+            path = Path(cwd).expanduser()
+            if not path.exists():
+                raise ToolError(f"cwd does not exist: {path}")
+            if not path.is_dir():
+                raise ToolError(f"cwd is not a directory: {path}")
+            resolved_cwd = str(path)
+
+        safe_timeout = max(1, int(timeout or 0))
+
+        base_cmd: List[str] = ["/bin/bash", "-lc", cmd]
+        if sudo:
+            sudo_path = shutil.which("sudo")
+            if not sudo_path:
+                raise ToolError("sudo requested but not available on PATH")
+            base_cmd = [sudo_path, "-n"] + base_cmd
+
+        attempts = max(1, int(retries) + 1)
+        stdout = ""
+        stderr = ""
+        exit_code = 0
+
+        for attempt in range(attempts):
+            try:
+                if interactive:
+                    exit_code, stdout = self._run_interactive(base_cmd, resolved_cwd, safe_timeout)
+                    stderr = ""
+                else:
+                    completed = subprocess.run(
+                        base_cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=safe_timeout,
+                        cwd=resolved_cwd,
+                    )
+                    exit_code = completed.returncode
+                    stdout = (completed.stdout or "").strip()
+                    stderr = (completed.stderr or "").strip()
+            except subprocess.TimeoutExpired as exc:
+                if attempt < attempts - 1:
+                    continue
+                raise ToolError(f"command timed out after {safe_timeout}s") from exc
+            except FileNotFoundError as exc:
+                raise ToolError("/bin/bash not found on system") from exc
+            except Exception as exc:  # pragma: no cover - defensive
+                if attempt < attempts - 1:
+                    time.sleep(0.1)
+                    continue
+                raise ToolError(f"command failed: {exc}") from exc
+
+            if exit_code == 0 or attempt == attempts - 1:
+                break
+
+        lines = [f"$ {cmd}"]
+        if resolved_cwd:
+            lines.append(f"(cwd: {resolved_cwd})")
+        lines.append(f"attempts: {attempt + 1}")
+        if sudo:
+            lines.append("sudo: enabled")
+        if interactive:
+            lines.append("interactive: captured pseudo-tty session")
+        if stdout:
+            lines.append("\nstdout:\n" + stdout)
+        if stderr:
+            lines.append("\nstderr:\n" + stderr)
+        lines.append(f"\nexit_code: {exit_code}")
+
+        output = "\n".join(lines).strip()
+        if len(output) > MAX_SHELL_OUTPUT:
+            output = output[: MAX_SHELL_OUTPUT - 20] + "\n(truncated)"
+        return output
+
+    def _run_interactive(
+        self,
+        cmd: List[str],
+        cwd: Optional[str],
+        timeout: int,
+    ) -> tuple[int, str]:
+        master, slave = pty.openpty()
+        start = time.monotonic()
+        proc = subprocess.Popen(
+            cmd,
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+            cwd=cwd,
+            text=False,
+            close_fds=True,
+        )
+        os.close(slave)
+        chunks: List[str] = []
+        try:
+            while True:
+                if timeout and (time.monotonic() - start) > timeout:
+                    proc.kill()
+                    raise subprocess.TimeoutExpired(cmd, timeout)
+                r, _, _ = select.select([master], [], [], 0.1)
+                if master in r:
+                    try:
+                        data = os.read(master, 1024)
+                    except OSError:
+                        break
+                    if not data:
+                        break
+                    chunks.append(data.decode(errors="replace"))
+                if proc.poll() is not None and not r:
+                    break
+            while True:
+                try:
+                    data = os.read(master, 1024)
+                except OSError:
+                    break
+                if not data:
+                    break
+                chunks.append(data.decode(errors="replace"))
+        finally:
+            os.close(master)
+        proc.wait()
+        return proc.returncode, "".join(chunks).strip()
 
 
 class ListDirectoryTool(Tool):
@@ -502,7 +916,10 @@ class ListDirectoryTool(Tool):
 
     name = "list_dir"
     description = "List directory contents (non-recursive)."
-    args_hint = "path (str, optional, default '.'); show_hidden (bool, optional); max_entries (int, optional)"
+    args_hint = (
+        "path (str, optional, default '.'); show_hidden (bool, optional); max_entries (int, optional); "
+        "recursive (bool, optional); depth (int, optional); human (bool, optional)"
+    )
 
     def run(
         self,
@@ -511,6 +928,9 @@ class ListDirectoryTool(Tool):
         path: str = ".",
         show_hidden: bool = False,
         max_entries: int = 100,
+        recursive: bool = False,
+        depth: Optional[int] = None,
+        human: bool = False,
     ) -> str:  # type: ignore[override]
         resolved = _resolve_user_path(path)
         if resolved.is_file():
@@ -522,29 +942,59 @@ class ListDirectoryTool(Tool):
 
         limit = max(int(max_entries or 0), 0) or 100
 
-        try:
-            entries = sorted(resolved.iterdir(), key=lambda item: item.name.lower())
-        except Exception as exc:
-            raise ToolError(f"failed to list {resolved}: {exc}") from exc
+        max_depth = None if depth is None else max(0, int(depth))
 
         lines = [f"Directory: {resolved}"]
-        visible: List[Path] = []
-        for entry in entries:
-            if not show_hidden and entry.name.startswith('.'):
-                continue
-            visible.append(entry)
-            if len(visible) >= limit:
-                break
+        collected: List[str] = []
 
-        if not visible:
+        def _human_size(value: int) -> str:
+            units = ["B", "KB", "MB", "GB", "TB"]
+            size = float(value)
+            for unit in units:
+                if size < 1024 or unit == units[-1]:
+                    return f"{size:.1f}{unit}" if unit != "B" else f"{int(size)}B"
+                size /= 1024
+            return f"{value}B"
+
+        def _format_entry(entry: Path) -> str:
+            suffix = "/" if entry.is_dir() else ""
+            if not human:
+                return entry.name + suffix
+            try:
+                size = entry.stat().st_size if entry.is_file() else sum(
+                    child.stat().st_size for child in entry.iterdir() if child.is_file()
+                ) if entry.is_dir() else 0
+            except Exception:
+                size = 0
+            size_text = _human_size(size)
+            return f"{entry.name + suffix} ({size_text})"
+
+        def _walk(current: Path, current_depth: int = 0, prefix: str = "") -> None:
+            nonlocal collected
+            try:
+                entries = sorted(current.iterdir(), key=lambda item: item.name.lower())
+            except Exception as exc:
+                collected.append(prefix + f"<error: {exc}>")
+                return
+            for entry in entries:
+                if not show_hidden and entry.name.startswith('.'):
+                    continue
+                collected.append(prefix + _format_entry(entry))
+                if len(collected) >= limit:
+                    return
+                if recursive and entry.is_dir() and not entry.is_symlink():
+                    if max_depth is None or current_depth < max_depth:
+                        _walk(entry, current_depth + 1, prefix + "  ")
+                        if len(collected) >= limit:
+                            return
+
+        _walk(resolved, 0, "" if not recursive else "")
+
+        if not collected:
             lines.append("(empty)")
             return "\n".join(lines)
 
-        for entry in visible:
-            suffix = "/" if entry.is_dir() else ""
-            lines.append(entry.name + suffix)
-
-        remaining = len([e for e in entries if show_hidden or not e.name.startswith('.')]) - len(visible)
-        if remaining > 0:
-            lines.append(f"... {remaining} more entries hidden")
+        lines.extend(collected)
+        if len(collected) >= limit:
+            lines.append("... limit reached")
         return "\n".join(lines)

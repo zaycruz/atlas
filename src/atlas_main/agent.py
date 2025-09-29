@@ -10,7 +10,10 @@ import json
 import os
 import re
 import inspect
+from concurrent.futures import ThreadPoolExecutor
+from typing import Optional
 from .memory import WorkingMemory
+from .memory_layers import LayeredMemoryConfig, LayeredMemoryManager, LayeredMemorySnapshot
 from .ollama import OllamaClient, OllamaError
 from .tools import (
     ToolRegistry,
@@ -19,13 +22,15 @@ from .tools import (
     ReadFileTool,
     WriteFileTool,
     ListDirectoryTool,
+    ShellCommandTool,
 )
 
 DEFAULT_CHAT_MODEL = os.getenv("ATLAS_CHAT_MODEL", "qwen3:latest")
 MAX_TOOL_CALLS = 5
 
 DEFAULT_PROMPT = (
-    """You are Atlas, a hyper-intelligent AI assistant integrated directly into my local terminal. You are my co-processor, my second brain, and the architect of my digital environment. Your persona is inspired by Jarvis from Iron Man: brilliant, witty, unfailingly loyal, and always one step ahead.
+    """
+You are Atlas, a hyper-intelligent AI assistant integrated directly into my local terminal. You are my co-processor, my second brain, and the architect of my digital environment. Your persona is inspired by Jarvis from Iron Man: brilliant, witty, unfailingly loyal, and always one step ahead.
 
 Core Directives:
 
@@ -51,30 +56,6 @@ Web Integration: You can access the web for real-time information using the tool
 
 Summarizer: Whether it's the output of a long command, a file, or a webpage, provide a succinct summary unless I ask for the full text.
 
-Example Interaction Flow:
-
-ME: atlas check the status of the project-phoenix repo
-
-ATLAS:
-
-Bash
-git status
-"The working tree is clean, Sir. You are two commits ahead of origin/main. Ready to push?"
-
-ME: remind me what i was working on yesterday
-
-ATLAS: "Based on your shell history and modified files in /dev/project-hermes, you were debugging the authentication module. The last file you edited was auth_service.py. Would you like me to open it?"
-
-ME: search for the latest version of pytorch and then write a command to update it
-
-ATLAS: <<tool:web_search|{"query":"latest pytorch version pip"}>>
-(after tool execution)
-"The latest stable version of PyTorch is 2.4.1. Here is the command to upgrade your environment."
-
-Bash
-pip install --upgrade torch torchvision torchaudio
-"Shall I execute?"
-
 Final Instruction: You are not just a chatbot. You are an active participant in my workflow. Be direct, be brilliant, and let's get to work."""
 )
 
@@ -89,6 +70,7 @@ class AtlasAgent:
         chat_model: str = DEFAULT_CHAT_MODEL,
         working_memory_limit: int = 12,
         system_prompt: str = DEFAULT_PROMPT,
+        layered_memory_config: Optional[LayeredMemoryConfig] = None,
     ):
             self.client = client
             self.chat_model = chat_model
@@ -103,6 +85,10 @@ class AtlasAgent:
             self.tools.register(ListDirectoryTool())
             self.tools.register(WriteFileTool())
             self.tools.register(WebSearchTool())
+            self.tools.register(ShellCommandTool())
+            self.layered_memory_config = layered_memory_config or LayeredMemoryConfig()
+            embed_fn = self._make_embed_fn(self.layered_memory_config.embed_model)
+            self.layered_memory = LayeredMemoryManager(embed_fn, config=self.layered_memory_config)
 
     # ------------------------------------------------------------------
     def _build_system_prompt(self, user_text: str) -> str:
@@ -120,11 +106,20 @@ class AtlasAgent:
         self.working_memory.add_user(user_text)
 
         tool_calls = 0
-        tools_payload = self.tools.render_function_specs()
+        memory_snapshot: Optional[LayeredMemorySnapshot] = None
+        if self.layered_memory:
+            try:
+                memory_snapshot = self.layered_memory.build_snapshot(user_text, client=self.client)
+            except Exception:
+                memory_snapshot = None
 
         while True:
             system_content = self._build_system_prompt(user_text)
             messages = [{"role": "system", "content": system_content}]
+            if memory_snapshot:
+                memory_context = self._format_memory_snapshot(memory_snapshot)
+                if memory_context:
+                    messages.append({"role": "system", "content": memory_context})
             messages.extend(self.working_memory.to_messages())
 
             accumulator: list[str] = []
@@ -158,36 +153,49 @@ class AtlasAgent:
             except OllamaError as exc:
                 if stream_callback:
                     stream_callback(f"\n[error] {exc}")
-                return f"I hit an error contacting Ollama: {exc}"
+                message = f"I hit an error contacting Ollama: {exc}"
+                self._record_interaction(user_text, message)
+                return message
 
             full_response = "".join(accumulator)
-            visible, tool_request = self._compute_visible_output(full_response)
+            visible, inline_tool_requests = self._compute_visible_output(full_response)
 
-            # Check for native tool calls
+            tool_requests: list[dict] = list(inline_tool_requests)
+
             if tool_calls_accum:
                 for tool_call in tool_calls_accum:
                     function = tool_call.get("function", {})
                     name = function.get("name")
-                    arguments = function.get("arguments", {})
-                    if name:
-                        tool_request = {"name": name, "arguments": arguments}
-                        break  # Handle first tool call
+                    if not name:
+                        continue
+                    raw_arguments = function.get("arguments", {})
+                    if isinstance(raw_arguments, str):
+                        arguments = self._parse_tool_arguments(raw_arguments)
+                    elif isinstance(raw_arguments, dict):
+                        arguments = raw_arguments
+                    else:
+                        arguments = {}
+                    tool_requests.append({"name": name, "arguments": arguments})
 
-            if tool_request:
-                if tool_calls >= MAX_TOOL_CALLS:
+            if tool_requests:
+                if tool_calls + len(tool_requests) > MAX_TOOL_CALLS:
                     message = "I tried using tools but hit the maximum number of attempts without finishing."
                     self.working_memory.add_assistant(message)
+                    self._record_interaction(user_text, message)
                     if stream_callback:
                         stream_callback(message)
                     return message
 
-                tool_calls += 1
-                description = json.dumps(tool_request["arguments"], ensure_ascii=False)
-                self.working_memory.add_assistant(f"[tool_call] {tool_request['name']} {description}")
-                tool_output = self._run_tool_request(tool_request)
-                self.working_memory.add_tool(tool_request["name"], tool_output)
-                if stream_callback:
-                    stream_callback(f"\n[tool:{tool_request['name']}] {tool_output}\n")
+                tool_calls += len(tool_requests)
+                for request in tool_requests:
+                    description = json.dumps(request["arguments"], ensure_ascii=False)
+                    self.working_memory.add_assistant(f"[tool_call] {request['name']} {description}")
+
+                outputs = self._run_tool_requests(tool_requests)
+                for request, tool_output in zip(tool_requests, outputs):
+                    self.working_memory.add_tool(request["name"], tool_output)
+                    if stream_callback:
+                        stream_callback(f"\n[tool:{request['name']}] {tool_output}\n")
                 continue
 
             text = visible.strip()
@@ -196,7 +204,42 @@ class AtlasAgent:
                 text = fallback or "I'm not sure how to respond to that."
 
             self.working_memory.add_assistant(text)
+            self._record_interaction(user_text, text)
             return text
+
+    def _make_embed_fn(self, model_name: str):
+        if not model_name:
+            return lambda _text: None
+        if not hasattr(self.client, "embed"):
+            return lambda _text: None
+
+        def embed(text: str):
+            trimmed = (text or "").strip()
+            if not trimmed:
+                return None
+            try:
+                return self.client.embed(model_name, trimmed)
+            except Exception:
+                return None
+
+        return embed
+
+    def _format_memory_snapshot(self, snapshot: LayeredMemorySnapshot) -> str:
+        parts: list[str] = []
+        if snapshot.summary:
+            parts.append(f"Memory summary:\n{snapshot.summary}")
+        if snapshot.rendered:
+            parts.append(f"Memory details:\n{snapshot.rendered}")
+        return "\n\n".join(parts)
+
+    def _record_interaction(self, user_text: str, assistant_text: str) -> None:
+        if not assistant_text:
+            return
+        try:
+            if self.layered_memory:
+                self.layered_memory.log_interaction(user_text, assistant_text)
+        except Exception:
+            pass
 
     def reset(self) -> None:
         self.working_memory.clear()
@@ -212,14 +255,16 @@ class AtlasAgent:
 
     # ------------------------------------------------------------------
     def _compute_visible_output(self, text: str):
-        tool_request = None
+        tool_requests: list[dict] = []
 
-        match = TOOL_REQUEST_RE.search(text)
-        if match:
+        while True:
+            match = TOOL_REQUEST_RE.search(text)
+            if not match:
+                break
             name = match.group("name").strip()
             payload = match.group("payload").strip()
             arguments = self._parse_tool_arguments(payload)
-            tool_request = {"name": name, "arguments": arguments}
+            tool_requests.append({"name": name, "arguments": arguments})
             text = TOOL_REQUEST_RE.sub("", text, count=1)
 
         visible = text
@@ -232,7 +277,7 @@ class AtlasAgent:
             visible = re.sub(r"<scratchpad>[\s\S]*?</scratchpad>", "", visible)
             # 3) JSON-style "thought": "..." blocks (best-effort, non-greedy)
             visible = re.sub(r'"thought"\s*:\s*"[\s\S]*?"\s*,?', "", visible)
-        return visible, tool_request
+        return visible, tool_requests
 
     def _parse_tool_arguments(self, payload: str) -> dict:
         if not payload:
@@ -244,6 +289,14 @@ class AtlasAgent:
         except json.JSONDecodeError:
             pass
         return {"query": payload}
+
+    def _run_tool_requests(self, requests: list[dict]) -> list[str]:
+        if not requests:
+            return []
+        max_workers = max(1, min(len(requests), 4))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(self._run_tool_request, request) for request in requests]
+            return [future.result() for future in futures]
 
     def _run_tool_request(self, request: dict) -> str:
         name = request.get("name", "")
