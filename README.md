@@ -48,6 +48,8 @@ python scripts/visualize_summarizer.py
 - `/model <name>` / `/model list` — switch or list models
 - `/thinking <on|off>` — show/hide model “thinking” content
 - `/log <off|error|warn|info|debug>` — adjust logging
+- `/memory stats` — inspect harvest/prune counters for the layered memory stack
+- `/memory prune <semantic|reflections|all> [limit] [--review]` — trim long-term stores, optionally consulting the active model before deletions
 - `/quit` — exit the chat
 
 ### Tooling
@@ -73,5 +75,6 @@ No additional setup required — Crawl4AI ships as a dependency.
 
 - Requires Python 3.9 or newer.
 - Install with `poetry install` and run with `poetry run atlas-chat`.
+- Project context, task status, and roadmap updates live in `docs/PROJECT_TRACKER.md`; keep it current so contributors can resume work quickly.
 
 Legacy design notes that referenced controller/critic, journaling, and broader tool suites remain under `docs/` for reference.

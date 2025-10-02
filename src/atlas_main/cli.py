@@ -161,7 +161,7 @@ def _handle_memory(agent: AtlasAgent, args: list[str]) -> None:
 
     if not args:
         console.print(
-            "Usage: /memory <episodic|semantic|reflections|snapshot|path> [limit] [query]",
+            "Usage: /memory <episodic|semantic|reflections|snapshot|path|prune|stats> [options]",
             style="yellow",
         )
         return
@@ -207,8 +207,17 @@ def _handle_memory(agent: AtlasAgent, args: list[str]) -> None:
         else:
             console.print("(no memory retrieved for that query)", style="yellow")
         return
+    if section == "stats":
+        _print_memory_stats(lm)
+        return
+    if section == "prune":
+        _run_memory_prune(agent, rest)
+        return
 
-    console.print("Unknown memory command. Use episodic, semantic, reflections, snapshot, or path.", style="yellow")
+    console.print(
+        "Unknown memory command. Use episodic, semantic, reflections, snapshot, path, prune, or stats.",
+        style="yellow",
+    )
 
 
 def _print_episodic_memory(lm, *, limit: int, query: str) -> None:
@@ -275,6 +284,59 @@ def _print_reflections(lm, *, limit: int) -> None:
         text = str(item.get("text", "")).strip()
         if text:
             console.print(f"- {text}", highlight=False)
+
+
+def _print_memory_stats(lm) -> None:
+    stats = lm.get_stats()  # type: ignore[attr-defined]
+    harvest = stats.get("harvest", {})
+    prune = stats.get("prune", {})
+    console.print("[bold]Harvest stats[/bold]", highlight=False)
+    if harvest:
+        for key, value in harvest.items():
+            console.print(f"- {key.replace('_', ' ')}: {int(value)}")
+    else:
+        console.print("(no harvest activity yet)", style="yellow")
+    console.print("[bold]Prune stats[/bold]", highlight=False)
+    if prune:
+        for key, value in prune.items():
+            console.print(f"- {key.replace('_', ' ')}: {int(value)}")
+    else:
+        console.print("(no pruning yet)", style="yellow")
+
+
+def _run_memory_prune(agent: AtlasAgent, args: list[str]) -> None:
+    lm = agent.layered_memory
+    if not args:
+        console.print(
+            "Usage: /memory prune <semantic|reflections|all> [limit] [--review]",
+            style="yellow",
+        )
+        return
+    target = args[0].lower()
+    review = "--review" in args
+    numeric_args = [part for part in args[1:] if part.isdigit()]
+    limit = int(numeric_args[0]) if numeric_args else None
+    review_client = agent.client if review else None
+
+    semantic_limit = -1
+    reflections_limit = -1
+    if target in {"semantic", "all"}:
+        semantic_limit = limit if limit is not None else lm.config.prune_semantic_max_items  # type: ignore[attr-defined]
+    if target in {"reflections", "all"}:
+        reflections_limit = limit if limit is not None else lm.config.prune_reflections_max_items  # type: ignore[attr-defined]
+    if semantic_limit == -1 and reflections_limit == -1:
+        console.print("Select semantic, reflections, or all to prune.", style="yellow")
+        return
+
+    result = lm.prune_long_term(  # type: ignore[attr-defined]
+        semantic_limit=semantic_limit,
+        reflections_limit=reflections_limit,
+        review_client=review_client,
+    )
+    console.print(
+        f"Pruned semantic={result['semantic_removed']} reflections={result['reflections_removed']}.",
+        style="green",
+    )
 
 
 # Lite build: no tools, journal, critic, identity, desires, or snapshots.
