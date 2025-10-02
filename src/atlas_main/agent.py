@@ -237,7 +237,7 @@ class AtlasAgent:
             return
         try:
             if self.layered_memory:
-                self.layered_memory.log_interaction(user_text, assistant_text)
+                self.layered_memory.process_turn(user_text, assistant_text, client=self.client)
         except Exception:
             pass
 
