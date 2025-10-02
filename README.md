@@ -74,7 +74,12 @@ No additional setup required — Crawl4AI ships as a dependency.
 ## Development notes
 
 - Requires Python 3.9 or newer.
-- Install with `poetry install` and run with `poetry run atlas-chat`.
+- Install and manage dependencies with [Poetry](https://python-poetry.org/): `poetry install`, then `poetry run atlas-chat`.
+- Copy `.env.example` to `.env` and adjust the model names to match your local Ollama catalogue.
 - Project context, task status, and roadmap updates live in `docs/PROJECT_TRACKER.md`; keep it current so contributors can resume work quickly.
+
+Atlas is released under the [MIT License](LICENSE).
+
+See [CONTRIBUTING](CONTRIBUTING.md) for guidelines on development workflow.
 
 Legacy design notes that referenced controller/critic, journaling, and broader tool suites remain under `docs/` for reference.

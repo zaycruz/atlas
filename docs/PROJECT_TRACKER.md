@@ -14,6 +14,7 @@ This log captures the current state of Atlas memory work so we can resume quickl
 | 2025-10-02 | Confidence-aware harvesting filter | Harvest pipeline normalizes model output, enforces minimum confidence thresholds, and tracks accept/drop counts for diagnostics. |
 | 2025-10-02 | Automated memory pruning loop | Added deterministic auto-prune, `/memory prune` CLI command, and optional LLM review hook for manual clean-up runs. |
 | 2025-10-02 | Harvest/prune instrumentation | Harvest/prune metrics feed `/memory stats`, giving visibility into accepted items, rejections, and pruning activity. |
+| 2025-10-02 | Public release hygiene | Added MIT license, sanitized `.env.example`, and scrubbed personal references in tests/docs. |
 
 ## Active Tasks
 
