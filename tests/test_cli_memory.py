@@ -18,7 +18,7 @@ def test_memory_cli_commands(tmp_path, monkeypatch):
     config = LayeredMemoryConfig(base_dir=tmp_path)
 
     config.semantic_path.write_text(
-        json.dumps({"facts": [{"text": "Zay builds Prometheus Studios."}]}),
+        json.dumps({"facts": [{"text": "Atlas maintains Skyline Labs."}]}),
         encoding="utf-8",
     )
 
@@ -48,7 +48,7 @@ def test_memory_cli_commands(tmp_path, monkeypatch):
     with console.capture() as capture:
         _handle_memory(agent, ["semantic"])
     output = capture.get()
-    assert "Prometheus Studios" in output
+    assert "Skyline Labs" in output
 
     with console.capture() as capture:
         _handle_memory(agent, ["reflections"])
