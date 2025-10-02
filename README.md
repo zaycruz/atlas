@@ -1,8 +1,9 @@
-# Atlas Terminal Chat (Ultra‑Lite)
+# Atlas Terminal Chat
 
-Atlas Ultra‑Lite is a terminal-first companion for local Ollama models focused on a simple, reliable chat loop with:
-- Working memory (recent turns)
-- Tool registry with iterative calls (web_search via Crawl4AI)
+Atlas is a terminal-first companion for local Ollama models, pairing a streaming chat loop with layered memory and a growing tool suite. Key features include:
+- Layered long-term memory (episodic SQLite, semantic facts, reflections) with automatic harvesting and pruning
+- Working memory buffer for recent turns
+- Tool registry with iterative calls (file read/write, shell, web search via Crawl4AI)
 
 ## Quick start
 
@@ -24,20 +25,15 @@ Atlas expects a local Ollama daemon on `http://localhost:11434`. To use differen
 ## Memory model
 
 - Working memory: last few turns are kept in a sliding buffer.
+- Long-term memory: episodic log stored in SQLite with semantic/reflection layers backed by JSON files.
+- Automatic harvesting and pruning: after every turn the agent extracts durable facts/lessons, applies confidence thresholds, and keeps the stores tidy.
 
-### Abstractive episodic summarization
+### Abstractive summarization helpers
 
-For a short, high-signal summary of recalled episodes, use the helper in `atlas_main/memory.py`:
-
-- Function: `summarize_memories_abstractive(records, client, model=None, max_items=10, style="bullets"|"paragraph")`
-- Default model: `phi3:latest` (override with `ATLAS_SUMMARY_MODEL`).
-- Typical flow:
-   1. `records = episodic.recall("query", top_k=8)`
-   2. `summary = summarize_memories_abstractive(records, client)`
+- Episodic summary helper: `summarize_memories_abstractive(records, client, model=None, ...)`
+- Layered snapshot summarizer: `summarize_assembled_context_abstractive(assembled, client, model=None, ...)`
 
 Try it:
-
-- Run a quick demo script that prints episodes and the generated summary:
 
 ```bash
 python scripts/visualize_summarizer.py
