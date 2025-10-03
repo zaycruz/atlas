@@ -9,6 +9,7 @@ import os
 import re
 import sqlite3
 import time
+import uuid
 import logging
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -81,8 +82,14 @@ class EpisodicSQLiteMemory:
                 emb = None
         cur = self._conn.cursor()
         cur.execute(
-            "INSERT OR REPLACE INTO episodes (id, ts, user, assistant, embedding) VALUES (?, ?, ?, ?, ?)",
-            (str(ts), ts, user, assistant, json.dumps(emb) if emb is not None else None),
+            "INSERT INTO episodes (id, ts, user, assistant, embedding) VALUES (?, ?, ?, ?, ?)",
+            (
+                str(uuid.uuid4()),
+                ts,
+                user,
+                assistant,
+                json.dumps(emb) if emb is not None else None,
+            ),
         )
         # Trim table to max_records by deleting oldest
         cur.execute("SELECT COUNT(*) FROM episodes")
@@ -321,7 +328,7 @@ class ReflectionMemory:
         if not self.skills_path.exists():
             self.skills_path.write_text(json.dumps({"lessons": []}, indent=2))
 
-    def add(self, text: str, *, confidence: Optional[float] = None) -> None:
+    def add(self, text: str, *, confidence: Optional[float] = None) -> bool:
         try:
             data = json.loads(self.skills_path.read_text())
             lessons = data.get("lessons", [])
@@ -329,12 +336,12 @@ class ReflectionMemory:
             lessons = []
         normalized = (text or "").strip()
         if not normalized:
-            return
+            return False
         key = normalized.lower()
         for item in lessons:
             existing = str(item.get("text", "")).strip().lower()
             if existing == key:
-                return
+                return False
         lesson: dict[str, Any] = {"ts": time.time(), "text": normalized}
         if confidence is not None:
             try:
@@ -343,6 +350,7 @@ class ReflectionMemory:
                 pass
         lessons.append(lesson)
         self.skills_path.write_text(json.dumps({"lessons": lessons}, indent=2))
+        return True
 
     def recent(self, n: int = 5) -> List[dict]:
         try:
@@ -667,11 +675,14 @@ class LayeredMemoryManager:
             self._stats["harvest"]["accepted_facts"] += added_facts
         added_reflections = 0
         if lesson_items:
-            before = len(lesson_items)
             for lesson in lesson_items:
-                self.reflections.add(lesson["text"], confidence=lesson.get("confidence"))
-            added_reflections = before
-            self._stats["harvest"]["accepted_reflections"] += added_reflections
+                inserted = self.reflections.add(
+                    lesson["text"], confidence=lesson.get("confidence")
+                )
+                if inserted:
+                    added_reflections += 1
+            if added_reflections:
+                self._stats["harvest"]["accepted_reflections"] += added_reflections
 
         if added_facts or added_reflections:
             self._debug(

@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 import time
+import uuid
 
 from atlas_main.cli import _handle_memory, console
 from atlas_main.memory_layers import LayeredMemoryConfig, LayeredMemoryManager
@@ -76,6 +77,26 @@ def test_memory_cli_commands(tmp_path, monkeypatch):
         assert len(manager.reflections.recent(10)) == 1
     finally:
         manager.close()
+
+
+def test_episodic_memory_uses_uuid_ids(tmp_path, monkeypatch):
+    monkeypatch.setenv("ATLAS_MEMORY_DIR", str(tmp_path))
+    config = LayeredMemoryConfig(base_dir=tmp_path)
+    manager = LayeredMemoryManager(embed_fn=lambda _text: None, config=config)
+
+    total = 6
+    for i in range(total):
+        manager.log_interaction(f"user-{i}", "response")
+
+    cur = manager.episodic._conn.cursor()
+    cur.execute("SELECT id FROM episodes ORDER BY ts ASC")
+    rows = cur.fetchall()
+    ids = [row[0] for row in rows]
+
+    assert len(ids) == total
+    assert len(set(ids)) == total
+    for value in ids:
+        assert uuid.UUID(value)
 
 
 class _FakeMemoryClient:
@@ -170,3 +191,57 @@ def test_layered_memory_close_releases_sqlite_lock(tmp_path):
         reopened.log_interaction("Again", "ready")
     finally:
         reopened.close()
+    client = _FakeMemoryClient(
+        {
+            "facts": [
+                {"text": "User loves espresso", "confidence": 0.9},
+                {"text": "Discard this", "confidence": 0.2},
+            ],
+            "reflections": [
+                {"text": "Offer new brew techniques", "confidence": 0.7},
+                {"text": "Low confidence", "confidence": 0.1},
+            ],
+        }
+    )
+
+    manager.process_turn("Any coffee updates?", "Let's log your preferences.", client=client)
+
+    facts = manager.semantic.head(5)
+    assert len(facts) == 1
+    assert "espresso" in facts[0]["text"].lower()
+
+    lessons = manager.reflections.recent(5)
+    assert len(lessons) == 1
+    assert "brew" in lessons[0]["text"].lower()
+
+    stats = manager.get_stats()
+    assert stats["harvest"]["accepted_facts"] == 1
+    assert stats["harvest"]["accepted_reflections"] == 1
+    assert stats["harvest"]["rejected_low_confidence"] >= 2
+
+
+def test_harvest_reflection_deduplication(tmp_path, monkeypatch):
+    monkeypatch.setenv("ATLAS_MEMORY_DIR", str(tmp_path))
+    config = LayeredMemoryConfig(base_dir=tmp_path)
+    manager = LayeredMemoryManager(embed_fn=lambda _text: None, config=config)
+
+    existing_lesson = "Remember to greet warmly."
+    manager.reflections.add(existing_lesson)
+
+    client = _FakeMemoryClient(
+        {
+            "reflections": [
+                {"text": existing_lesson, "confidence": 0.9},
+                {"text": "Offer scheduling reminders when appropriate.", "confidence": 0.8},
+            ]
+        }
+    )
+
+    manager.process_turn("Hello", "Hi there!", client=client)
+
+    lessons = manager.reflections.all()
+    assert len(lessons) == 2
+    assert any("scheduling reminders" in lesson["text"].lower() for lesson in lessons)
+
+    stats = manager.get_stats()
+    assert stats["harvest"]["accepted_reflections"] == 1
