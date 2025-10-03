@@ -83,6 +83,10 @@ def main() -> None:
 
             _run_agent_turn(agent, runtime, user_text)
     finally:
+        try:
+            agent.close()
+        except Exception:
+            pass
         client.close()
 
 

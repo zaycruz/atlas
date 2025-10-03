@@ -26,14 +26,16 @@ class _FakeClientWithContext:
 def test_kv_context_is_propagated_between_turns():
     client = _FakeClientWithContext()
     agent = AtlasAgent(client)
+    try:
+        # First respond should capture context from final chunk
+        out1 = agent.respond("hello")
+        assert "First done" in out1
 
-    # First respond should capture context from final chunk
-    out1 = agent.respond("hello")
-    assert "First done" in out1
+        # Second respond should pass captured context back to client
+        out2 = agent.respond("again")
+        assert "Second done" in out2
 
-    # Second respond should pass captured context back to client
-    out2 = agent.respond("again")
-    assert "Second done" in out2
-
-    # Ensure the client saw the propagated context on the second call
-    assert client.last_received_context == [1, 2, 3]
+        # Ensure the client saw the propagated context on the second call
+        assert client.last_received_context == [1, 2, 3]
+    finally:
+        agent.close()
