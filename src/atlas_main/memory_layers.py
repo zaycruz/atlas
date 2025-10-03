@@ -5,6 +5,7 @@ All components are local and optional. Designed to run without external services
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sqlite3
@@ -30,6 +31,130 @@ def _cosine(a: np.ndarray, b: np.ndarray) -> float:
     if denom == 0:
         return 0.0
     return float(np.dot(a, b) / denom)
+
+
+def _quality_features(text: str) -> tuple[float, dict[str, float]]:
+    """Heuristic quality score inspired by MemGPT/Letta retention gating."""
+
+    normalized = " ".join(text.strip().split())
+    if not normalized:
+        return 0.0, {
+            "length": 0.0,
+            "tokens": 0.0,
+            "diversity": 0.0,
+            "structure": 0.0,
+            "actionability": 0.0,
+        }
+
+    tokens = re.findall(r"[\w'-]+", normalized.lower())
+    token_count = len(tokens)
+    unique_tokens = len(set(tokens))
+    char_count = len(normalized)
+    avg_token_len = (char_count / token_count) if token_count else 0.0
+
+    diversity = (unique_tokens / max(1, token_count))
+    structure = 0.0
+    if re.search(r"[.;:?!]", normalized):
+        structure += 0.6
+    if re.search(r"\b(and|but|because|so|then|while)\b", normalized):
+        structure += 0.4
+    structure = min(structure, 1.0)
+
+    verbs = {
+        "am",
+        "are",
+        "is",
+        "was",
+        "were",
+        "be",
+        "being",
+        "been",
+        "plan",
+        "plans",
+        "planning",
+        "should",
+        "need",
+        "needs",
+        "prefer",
+        "prefers",
+        "remember",
+        "remind",
+        "track",
+        "tracks",
+        "monitor",
+        "monitors",
+        "offer",
+        "offers",
+        "recommend",
+        "recommends",
+        "suggest",
+        "suggests",
+        "ensure",
+        "ensures",
+        "consider",
+        "considers",
+        "prioritize",
+        "prioritizes",
+        "maintain",
+        "maintains",
+        "focus",
+        "focusing",
+        "improve",
+        "improves",
+        "learn",
+        "learns",
+        "learned",
+        "avoid",
+        "avoids",
+        "want",
+        "wants",
+        "use",
+        "uses",
+        "update",
+        "updates",
+    }
+    has_verb = any(token in verbs for token in tokens)
+    has_subject = bool(re.search(r"\b(i|we|user|assistant|project|system|task|goal|plan)\b", normalized.lower()))
+    has_numbers = bool(re.search(r"\d", normalized))
+    imperative = bool(
+        re.match(
+            r"\b(remember|ensure|offer|recommend|suggest|consider|prioritize|avoid|focus|track|monitor|document|confirm|ask|review|summarize|plan|schedule|double-check)\b",
+            normalized.lower(),
+        )
+    )
+
+    length_score = min(1.0, char_count / 120.0)
+    token_score = min(1.0, token_count / 18.0)
+    diversity_score = min(1.0, diversity * 1.3)
+    structure_score = structure
+    actionability = 0.0
+    if has_verb:
+        actionability += 0.6
+    if has_subject:
+        actionability += 0.25
+    if has_numbers:
+        actionability += 0.15
+    if imperative:
+        actionability = max(actionability, 0.55)
+    actionability = min(1.0, actionability)
+
+    score = (
+        0.25 * length_score
+        + 0.2 * token_score
+        + 0.15 * diversity_score
+        + 0.15 * structure_score
+        + 0.25 * actionability
+    )
+    score = max(0.0, min(1.0, score + max(0.0, min(avg_token_len / 8.0, 0.1))))
+
+    features = {
+        "length": length_score,
+        "tokens": token_score,
+        "diversity": diversity_score,
+        "structure": structure_score,
+        "actionability": actionability,
+    }
+    return score, features
 
 
 class EpisodicSQLiteMemory:
@@ -182,6 +307,23 @@ class SemanticMemory:
                     entry["confidence"] = float(confidence)
                 except (TypeError, ValueError):
                     pass
+            uses = fact.get("uses")
+            try:
+                entry["uses"] = max(0, int(uses))
+            except (TypeError, ValueError):
+                entry["uses"] = 0
+            try:
+                entry["last_access_ts"] = float(fact.get("last_access_ts", entry["ts"]))
+            except (TypeError, ValueError):
+                entry["last_access_ts"] = entry["ts"]
+            quality = fact.get("quality")
+            if quality is not None:
+                try:
+                    entry["quality"] = float(quality)
+                except (TypeError, ValueError):
+                    entry["quality"] = _quality_features(text)[0]
+            else:
+                entry["quality"] = _quality_features(text)[0]
             clean_facts.append(entry)
         self._facts = clean_facts
         self._embeddings = [None] * len(self._facts)
@@ -191,12 +333,26 @@ class SemanticMemory:
         payload = {"facts": self._facts}
         self.json_path.write_text(json.dumps(payload, indent=2))
 
+    def _find_similar_fact(self, vector: np.ndarray, *, threshold: float = 0.9) -> Optional[int]:
+        if vector.size == 0:
+            return None
+        for idx, existing in enumerate(self._embeddings):
+            if existing is None:
+                continue
+            if existing.shape != vector.shape:
+                continue
+            score = _cosine(existing, vector)
+            if score >= threshold:
+                return idx
+        return None
+
     def add_fact(
         self,
         text: str,
         *,
         source: Optional[str] = None,
         confidence: Optional[float] = None,
+        quality: Optional[float] = None,
     ) -> Optional[dict]:
         normalized = (text or "").strip()
         if not normalized:
@@ -204,8 +360,23 @@ class SemanticMemory:
         key = normalized.lower()
         for fact in self._facts:
             if str(fact.get("text", "")).strip().lower() == key:
+                now = time.time()
+                fact["ts"] = now
+                if confidence is not None:
+                    try:
+                        fact["confidence"] = float(confidence)
+                    except (TypeError, ValueError):
+                        pass
+                if quality is not None:
+                    try:
+                        fact["quality"] = max(float(quality), fact.get("quality", 0.0))
+                    except (TypeError, ValueError):
+                        pass
+                fact["uses"] = int(fact.get("uses", 0))
+                fact["last_access_ts"] = now
+                self._persist()
                 return fact
-        entry: dict[str, Any] = {"text": normalized, "ts": time.time()}
+        entry: dict[str, Any] = {"text": normalized, "ts": time.time(), "uses": 0}
         if source:
             entry["source"] = source
         if confidence is not None:
@@ -213,13 +384,46 @@ class SemanticMemory:
                 entry["confidence"] = float(confidence)
             except (TypeError, ValueError):
                 pass
+        quality_score = None
+        if quality is not None:
+            try:
+                quality_score = float(quality)
+            except (TypeError, ValueError):
+                quality_score = None
+        if quality_score is None:
+            quality_score = _quality_features(normalized)[0]
+        entry["quality"] = quality_score
+        entry["last_access_ts"] = entry["ts"]
         self._facts.append(entry)
         self._embeddings.append(None)
         try:
             if self.embed_fn is not None:
                 vec = self.embed_fn(normalized)
                 if vec:
-                    self._embeddings[-1] = np.asarray(vec, dtype=float)
+                    new_vec = np.asarray(vec, dtype=float)
+                    # Deduplicate against existing vectors if highly similar
+                    duplicate_idx = self._find_similar_fact(new_vec, threshold=0.92)
+                    if duplicate_idx is not None:
+                        existing = self._facts[duplicate_idx]
+                        existing["ts"] = time.time()
+                        existing["quality"] = max(existing.get("quality", 0.0), quality_score)
+                        if "confidence" in entry and entry["confidence"] is not None:
+                            try:
+                                existing_conf = float(existing.get("confidence", 0.0))
+                            except (TypeError, ValueError):
+                                existing_conf = 0.0
+                            try:
+                                new_conf = float(entry["confidence"])
+                            except (TypeError, ValueError):
+                                new_conf = existing_conf
+                            existing["confidence"] = max(existing_conf, new_conf)
+                        existing["uses"] = int(existing.get("uses", 0))
+                        existing["last_access_ts"] = time.time()
+                        self._facts.pop()
+                        self._embeddings.pop()
+                        self._persist()
+                        return existing
+                    self._embeddings[-1] = new_vec
         except Exception:
             self._embeddings[-1] = None
         self._persist()
@@ -236,7 +440,12 @@ class SemanticMemory:
             if isinstance(item, dict):
                 text = str(item.get("text", ""))
                 confidence = item.get("confidence")
-                inserted = self.add_fact(text, source=item.get("source") or source, confidence=confidence)
+                inserted = self.add_fact(
+                    text,
+                    source=item.get("source") or source,
+                    confidence=confidence,
+                    quality=item.get("quality"),
+                )
             else:
                 inserted = self.add_fact(str(item), source=source)
             if inserted:
@@ -250,7 +459,7 @@ class SemanticMemory:
         if not qvec:
             return []
         q = np.asarray(qvec, dtype=float)
-        scored: List[Tuple[float, dict]] = []
+        scored: List[Tuple[float, dict, int]] = []
         for i, fact in enumerate(self._facts):
             if self._embeddings[i] is None:
                 try:
@@ -261,14 +470,46 @@ class SemanticMemory:
             v = self._embeddings[i]
             if v is None or v.shape != q.shape:
                 continue
-            scored.append((_cosine(q, v), fact))
+            scored.append((_cosine(q, v), fact, i))
         scored.sort(key=lambda x: x[0], reverse=True)
-        return scored[:top_k]
+        chosen = scored[:top_k]
+        if not chosen:
+            return []
+        now = time.time()
+        dirty = False
+        for _, _fact, idx in chosen:
+            try:
+                self._facts[idx]["uses"] = int(self._facts[idx].get("uses", 0)) + 1
+            except (TypeError, ValueError):
+                self._facts[idx]["uses"] = 1
+            self._facts[idx]["last_access_ts"] = now
+            dirty = True
+        if dirty:
+            self._persist()
+        return [(score, dict(fact)) for score, fact, _ in chosen]
 
     def head(self, top_k: int = 3) -> List[dict]:
         if top_k <= 0:
             return []
-        return self._facts[:top_k]
+        if not self._facts:
+            return []
+        now = time.time()
+        indices = list(range(len(self._facts)))
+        indices.sort(key=lambda idx: self._fact_priority(self._facts[idx], now), reverse=True)
+        selected: List[dict] = []
+        dirty = False
+        for idx in indices[:top_k]:
+            fact = self._facts[idx]
+            try:
+                self._facts[idx]["uses"] = int(self._facts[idx].get("uses", 0)) + 1
+            except (TypeError, ValueError):
+                self._facts[idx]["uses"] = 1
+            self._facts[idx]["last_access_ts"] = now
+            dirty = True
+            selected.append(dict(fact))
+        if dirty:
+            self._persist()
+        return selected
 
     def prune(self, max_items: int, *, keep_indices: Optional[set[int]] = None) -> int:
         """Trim stored facts to `max_items`, prioritizing confidence then recency.
@@ -286,19 +527,11 @@ class SemanticMemory:
             return 0
 
         if keep_indices is None:
-            def _sort_key(item: dict[str, Any]) -> tuple[float, float]:
-                try:
-                    confidence = float(item.get("confidence", 0.0))
-                except (TypeError, ValueError):
-                    confidence = 0.0
-                try:
-                    ts = float(item.get("ts", 0.0))
-                except (TypeError, ValueError):
-                    ts = 0.0
-                return (confidence, ts)
-
             indexed = list(enumerate(self._facts))
-            indexed.sort(key=lambda pair: _sort_key(pair[1]), reverse=True)
+            indexed.sort(
+                key=lambda pair: self._fact_priority(pair[1]),
+                reverse=True,
+            )
             keep_indices = {idx for idx, _ in indexed[:max_items]}
         else:
             keep_indices = set(keep_indices)
@@ -318,6 +551,42 @@ class SemanticMemory:
             self._persist()
         return removed
 
+    def _fact_priority(self, fact: dict[str, Any], now: Optional[float] = None) -> float:
+        now = now or time.time()
+        try:
+            quality = float(fact.get("quality", 0.0))
+        except (TypeError, ValueError):
+            quality = 0.0
+        try:
+            confidence = float(fact.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        try:
+            created_ts = float(fact.get("ts", 0.0))
+        except (TypeError, ValueError):
+            created_ts = 0.0
+        try:
+            last_access = float(fact.get("last_access_ts", created_ts))
+        except (TypeError, ValueError):
+            last_access = created_ts
+        try:
+            uses = float(fact.get("uses", 0.0))
+        except (TypeError, ValueError):
+            uses = 0.0
+
+        age_hours = max(0.0, (now - created_ts) / 3600.0)
+        recency_hours = max(0.0, (now - last_access) / 3600.0)
+        age_decay = math.exp(-age_hours / 168.0)  # one-week scale
+        recency_decay = math.exp(-recency_hours / 72.0)  # ~3 day scale
+        usage_bonus = math.log1p(uses) / 4.0
+        return (
+            0.45 * quality
+            + 0.2 * confidence
+            + 0.2 * age_decay
+            + 0.1 * recency_decay
+            + usage_bonus
+        )
+
 
 class ReflectionMemory:
     """Lessons learned stored in a JSON lines or list file."""
@@ -328,71 +597,198 @@ class ReflectionMemory:
         if not self.skills_path.exists():
             self.skills_path.write_text(json.dumps({"lessons": []}, indent=2))
 
-    def add(self, text: str, *, confidence: Optional[float] = None) -> bool:
+    def _read_lessons(self) -> List[dict[str, Any]]:
         try:
             data = json.loads(self.skills_path.read_text())
-            lessons = data.get("lessons", [])
+            raw = data.get("lessons", [])
         except Exception:
-            lessons = []
+            raw = []
+        lessons: List[dict[str, Any]] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("text", "")).strip()
+            if not text:
+                continue
+            entry: dict[str, Any] = {"text": text}
+            try:
+                entry["ts"] = float(item.get("ts", time.time()))
+            except (TypeError, ValueError):
+                entry["ts"] = time.time()
+            confidence = item.get("confidence")
+            if confidence is not None:
+                try:
+                    entry["confidence"] = float(confidence)
+                except (TypeError, ValueError):
+                    pass
+            uses = item.get("uses")
+            try:
+                entry["uses"] = max(0, int(uses))
+            except (TypeError, ValueError):
+                entry["uses"] = 0
+            try:
+                entry["last_access_ts"] = float(item.get("last_access_ts", entry["ts"]))
+            except (TypeError, ValueError):
+                entry["last_access_ts"] = entry["ts"]
+            quality = item.get("quality")
+            if quality is not None:
+                try:
+                    entry["quality"] = float(quality)
+                except (TypeError, ValueError):
+                    entry["quality"] = _quality_features(text)[0]
+            else:
+                entry["quality"] = _quality_features(text)[0]
+            lessons.append(entry)
+        return lessons
+
+    def _write_lessons(self, lessons: Iterable[dict[str, Any]]) -> None:
+        payload = {"lessons": list(lessons)}
+        self.skills_path.write_text(json.dumps(payload, indent=2))
+
+    def add(
+        self,
+        text: str,
+        *,
+        confidence: Optional[float] = None,
+        quality: Optional[float] = None,
+    ) -> bool:
         normalized = (text or "").strip()
         if not normalized:
             return False
+        lessons = self._read_lessons()
         key = normalized.lower()
-        for item in lessons:
-            existing = str(item.get("text", "")).strip().lower()
+        for lesson in lessons:
+            existing = str(lesson.get("text", "")).strip().lower()
             if existing == key:
+                now = time.time()
+                lesson["ts"] = now
+                lesson["last_access_ts"] = now
+                lesson["uses"] = int(lesson.get("uses", 0))
+                if confidence is not None:
+                    try:
+                        lesson["confidence"] = float(confidence)
+                    except (TypeError, ValueError):
+                        pass
+                if quality is not None:
+                    try:
+                        lesson["quality"] = max(float(quality), lesson.get("quality", 0.0))
+                    except (TypeError, ValueError):
+                        pass
+                self._write_lessons(lessons)
                 return False
-        lesson: dict[str, Any] = {"ts": time.time(), "text": normalized}
+        entry: dict[str, Any] = {
+            "ts": time.time(),
+            "text": normalized,
+            "uses": 0,
+        }
         if confidence is not None:
             try:
-                lesson["confidence"] = float(confidence)
+                entry["confidence"] = float(confidence)
             except (TypeError, ValueError):
                 pass
-        lessons.append(lesson)
-        self.skills_path.write_text(json.dumps({"lessons": lessons}, indent=2))
+        if quality is not None:
+            try:
+                entry["quality"] = float(quality)
+            except (TypeError, ValueError):
+                entry["quality"] = _quality_features(normalized)[0]
+        else:
+            entry["quality"] = _quality_features(normalized)[0]
+        entry["last_access_ts"] = entry["ts"]
+        lessons.append(entry)
+        self._write_lessons(lessons)
         return True
 
     def recent(self, n: int = 5) -> List[dict]:
-        try:
-            data = json.loads(self.skills_path.read_text())
-            lessons = data.get("lessons", [])
-        except Exception:
-            lessons = []
-        return lessons[-n:]
+        if n <= 0:
+            return []
+        lessons = self._read_lessons()
+        if not lessons:
+            return []
+        now = time.time()
+        indexed = list(enumerate(lessons))
+        indexed.sort(key=lambda pair: self._lesson_priority(pair[1], now), reverse=True)
+        chosen = indexed[:n]
+        dirty = False
+        for idx, lesson in chosen:
+            try:
+                lessons[idx]["uses"] = int(lessons[idx].get("uses", 0)) + 1
+            except (TypeError, ValueError):
+                lessons[idx]["uses"] = 1
+            lessons[idx]["last_access_ts"] = now
+            dirty = True
+        if dirty:
+            self._write_lessons(lessons)
+        return [dict(lesson) for _, lesson in chosen]
 
     def all(self) -> List[dict]:
-        try:
-            data = json.loads(self.skills_path.read_text())
-            lessons = data.get("lessons", [])
-        except Exception:
-            lessons = []
-        return lessons
+        return [dict(lesson) for lesson in self._read_lessons()]
 
     def prune(self, max_items: int, *, keep_tail: Optional[int] = None) -> int:
+        lessons = self._read_lessons()
         if max_items <= 0:
-            total = 0
-            try:
-                data = json.loads(self.skills_path.read_text())
-                lessons = data.get("lessons", [])
-                total = len(lessons)
-            except Exception:
-                lessons = []
-            self.skills_path.write_text(json.dumps({"lessons": []}, indent=2))
-            return total
-        try:
-            data = json.loads(self.skills_path.read_text())
-            lessons = data.get("lessons", [])
-        except Exception:
-            lessons = []
-        if keep_tail is not None:
-            max_items = max(max_items, keep_tail)
-        if len(lessons) <= max_items:
+            removed = len(lessons)
+            self._write_lessons([])
+            return removed
+        if not lessons or len(lessons) <= max_items:
             return 0
-        lessons.sort(key=lambda item: float(item.get("ts", 0.0)))
-        removed = len(lessons) - max_items
-        retained = lessons[-max_items:]
-        self.skills_path.write_text(json.dumps({"lessons": retained}, indent=2))
+        tail_indices: set[int] = set()
+        if keep_tail is not None and keep_tail > 0:
+            ordered_by_ts = sorted(
+                list(enumerate(lessons)),
+                key=lambda pair: float(pair[1].get("ts", 0.0)),
+            )
+            tail_indices = {idx for idx, _ in ordered_by_ts[-keep_tail:]}
+        indexed = list(enumerate(lessons))
+        indexed.sort(key=lambda pair: self._lesson_priority(pair[1]), reverse=True)
+        keep_indices = {idx for idx, _ in indexed[:max_items]}
+        keep_indices.update(tail_indices)
+        if len(keep_indices) > max_items:
+            prioritized = sorted(
+                list(keep_indices),
+                key=lambda idx: self._lesson_priority(lessons[idx]),
+                reverse=True,
+            )
+            keep_indices = set(prioritized[:max_items])
+        retained = [lessons[idx] for idx in sorted(keep_indices, key=lambda i: float(lessons[i].get("ts", 0.0)))]
+        removed = len(lessons) - len(retained)
+        self._write_lessons(retained)
         return removed
+
+    def _lesson_priority(self, lesson: dict[str, Any], now: Optional[float] = None) -> float:
+        now = now or time.time()
+        try:
+            quality = float(lesson.get("quality", 0.0))
+        except (TypeError, ValueError):
+            quality = 0.0
+        try:
+            confidence = float(lesson.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        try:
+            created_ts = float(lesson.get("ts", 0.0))
+        except (TypeError, ValueError):
+            created_ts = 0.0
+        try:
+            last_access = float(lesson.get("last_access_ts", created_ts))
+        except (TypeError, ValueError):
+            last_access = created_ts
+        try:
+            uses = float(lesson.get("uses", 0.0))
+        except (TypeError, ValueError):
+            uses = 0.0
+
+        age_hours = max(0.0, (now - created_ts) / 3600.0)
+        recency_hours = max(0.0, (now - last_access) / 3600.0)
+        age_decay = math.exp(-age_hours / 96.0)  # ~4 day scale
+        recency_decay = math.exp(-recency_hours / 48.0)
+        usage_bonus = math.log1p(uses) / 4.0
+        return (
+            0.5 * quality
+            + 0.1 * confidence
+            + 0.25 * age_decay
+            + 0.15 * recency_decay
+            + usage_bonus
+        )
 
 
 @dataclass
@@ -406,6 +802,8 @@ class LayeredMemoryConfig:
     memory_model: Optional[str] = None
     min_fact_confidence: Optional[float] = None
     min_reflection_confidence: Optional[float] = None
+    min_fact_quality: Optional[float] = None
+    min_reflection_quality: Optional[float] = None
     prune_semantic_max_items: int = 400
     prune_reflections_max_items: int = 200
     max_episodic_records: int = 2000
@@ -439,6 +837,10 @@ class LayeredMemoryConfig:
             self.min_fact_confidence = self._float_env("ATLAS_MEMORY_MIN_FACT_CONF", default=0.6)
         if self.min_reflection_confidence is None:
             self.min_reflection_confidence = self._float_env("ATLAS_MEMORY_MIN_REFL_CONF", default=0.5)
+        if self.min_fact_quality is None:
+            self.min_fact_quality = self._float_env("ATLAS_MEMORY_MIN_FACT_QUALITY", default=0.3)
+        if self.min_reflection_quality is None:
+            self.min_reflection_quality = self._float_env("ATLAS_MEMORY_MIN_REFL_QUALITY", default=0.35)
 
     @staticmethod
     def _float_env(name: str, *, default: float) -> float:
@@ -489,6 +891,7 @@ class LayeredMemoryManager:
                 "accepted_facts": 0,
                 "accepted_reflections": 0,
                 "rejected_low_confidence": 0,
+                "rejected_low_quality": 0,
             },
             "prune": {
                 "runs": 0,
@@ -677,7 +1080,9 @@ class LayeredMemoryManager:
         if lesson_items:
             for lesson in lesson_items:
                 inserted = self.reflections.add(
-                    lesson["text"], confidence=lesson.get("confidence")
+                    lesson["text"],
+                    confidence=lesson.get("confidence"),
+                    quality=lesson.get("quality"),
                 )
                 if inserted:
                     added_reflections += 1
@@ -860,15 +1265,23 @@ class LayeredMemoryManager:
     ) -> List[dict[str, Any]]:
         normalized: List[dict[str, Any]] = []
         minimum = max(0.0, float(min_confidence))
+        min_quality = (
+            self.config.min_reflection_quality
+            if kind == "reflection"
+            else self.config.min_fact_quality
+        )
+        min_quality = float(min_quality or 0.0)
         for item in raw_items:
             if isinstance(item, dict):
                 text = str(item.get("text", "")).strip()
                 confidence = item.get("confidence")
                 source = item.get("source")
+                quality_override = item.get("quality")
             else:
                 text = str(item).strip()
                 confidence = None
                 source = None
+                quality_override = None
             if not text:
                 continue
             conf_val = None
@@ -882,7 +1295,22 @@ class LayeredMemoryManager:
             if conf_val < minimum:
                 self._stats["harvest"]["rejected_low_confidence"] += 1
                 continue
-            entry: dict[str, Any] = {"text": text, "confidence": conf_val}
+            quality_score = None
+            if isinstance(quality_override, (int, float)):
+                try:
+                    quality_score = float(quality_override)
+                except (TypeError, ValueError):
+                    quality_score = None
+            if quality_score is None:
+                quality_score, _ = _quality_features(text)
+            if quality_score < min_quality:
+                self._stats["harvest"]["rejected_low_quality"] += 1
+                continue
+            entry: dict[str, Any] = {
+                "text": text,
+                "confidence": conf_val,
+                "quality": quality_score,
+            }
             if source:
                 entry["source"] = str(source)
             normalized.append(entry)
