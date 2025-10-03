@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 
 from atlas_main.cli import _handle_memory, console
 from atlas_main.memory_layers import LayeredMemoryConfig, LayeredMemoryManager
@@ -71,6 +72,26 @@ def test_memory_cli_commands(tmp_path, monkeypatch):
     output = capture.get()
     assert "reflections=" in output
     assert len(manager.reflections.recent(10)) == 1
+
+
+def test_episodic_memory_uses_uuid_ids(tmp_path, monkeypatch):
+    monkeypatch.setenv("ATLAS_MEMORY_DIR", str(tmp_path))
+    config = LayeredMemoryConfig(base_dir=tmp_path)
+    manager = LayeredMemoryManager(embed_fn=lambda _text: None, config=config)
+
+    total = 6
+    for i in range(total):
+        manager.log_interaction(f"user-{i}", "response")
+
+    cur = manager.episodic._conn.cursor()
+    cur.execute("SELECT id FROM episodes ORDER BY ts ASC")
+    rows = cur.fetchall()
+    ids = [row[0] for row in rows]
+
+    assert len(ids) == total
+    assert len(set(ids)) == total
+    for value in ids:
+        assert uuid.UUID(value)
 
 
 class _FakeMemoryClient:
