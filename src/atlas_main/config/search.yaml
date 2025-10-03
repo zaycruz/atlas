@@ -1,0 +1,18 @@
+# Default configuration for Atlas federated search.
+sources:
+  - ddg
+  - bing
+open_topk: 3
+topn: 8
+budgets:
+  max_tokens: 8000
+re_rank:
+  embed_model: "${ATLAS_EMBED_MODEL:-}"
+  weights:
+    lexical: 0.5
+    embed: 0.4
+    recency: 0.1
+cache:
+  dir: "${ATLAS_SEARCH_CACHE_DIR:-~/.atlas/search_cache}"
+  serp_ttl_s: 86400
+  page_ttl_s: 604800

@@ -11,7 +11,8 @@ import os
 import re
 import inspect
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
+from datetime import datetime
+from typing import List, Optional
 from .memory import WorkingMemory
 from .memory_layers import LayeredMemoryConfig, LayeredMemoryManager, LayeredMemorySnapshot
 from .ollama import OllamaClient, OllamaError
@@ -23,11 +24,15 @@ from .tools import (
     WriteFileTool,
     ListDirectoryTool,
     ShellCommandTool,
+    BrowserSearchTool,
+    BrowserOpenTool,
+    BrowserFindTool,
 )
+from .tools_browser import BrowserSession
 
-DEFAULT_CHAT_MODEL = os.getenv("ATLAS_CHAT_MODEL", "qwen3:latest")
-MAX_TOOL_CALLS = 5
-
+DEFAULT_CHAT_MODEL = os.getenv("ATLAS_CHAT_MODEL", "gpt-oss:latest")
+DEFAULT_MAX_TOOL_CALLS = 5
+DEFAULT_GPT_OSS_TOOL_LIMIT = 10
 DEFAULT_PROMPT = (
     """
 You are Atlas, a hyper-intelligent AI assistant integrated directly into my local terminal. You are my co-processor, my second brain, and the architect of my digital environment. Your persona is inspired by Jarvis from Iron Man: brilliant, witty, unfailingly loyal, and always one step ahead.
@@ -55,6 +60,8 @@ File System Navigator: You can read, write, and manage files on my system. When 
 Web Integration: You can access the web for real-time information using the tool <<tool:web_search|{\"query\":\"...\"}>>. Synthesize information, don't just dump links.
 
 Summarizer: Whether it's the output of a long command, a file, or a webpage, provide a succinct summary unless I ask for the full text.
+
+Reasoning Protocol: Keep your internal reasoning silent by enclosing it in <think>...</think> tags. Provide the user-facing answer after those tags, separated by a blank line. Never include <think> content in the final spoken or printed reply.
 
 Final Instruction: You are not just a chatbot. You are an active participant in my workflow. Be direct, be brilliant, and let's get to work."""
 )
@@ -84,11 +91,20 @@ class AtlasAgent:
             self.tools.register(ReadFileTool())
             self.tools.register(ListDirectoryTool())
             self.tools.register(WriteFileTool())
-            self.tools.register(WebSearchTool())
             self.tools.register(ShellCommandTool())
             self.layered_memory_config = layered_memory_config or LayeredMemoryConfig()
             embed_fn = self._make_embed_fn(self.layered_memory_config.embed_model)
+            self._embed_fn = embed_fn
             self.layered_memory = LayeredMemoryManager(embed_fn, config=self.layered_memory_config)
+            self._browser_session: Optional[BrowserSession] = None
+            if os.getenv("ATLAS_SEARCH2", "0") != "0":
+                resolver = self._get_browser_session
+                self.tools.register(BrowserSearchTool(resolver))
+                self.tools.register(BrowserOpenTool(resolver))
+                self.tools.register(BrowserFindTool(resolver))
+            else:
+                self.tools.register(WebSearchTool())
+            self._debug_log_path = os.getenv("ATLAS_AGENT_LOG")
 
     # ------------------------------------------------------------------
     def _build_system_prompt(self, user_text: str) -> str:
@@ -97,6 +113,69 @@ class AtlasAgent:
             f"{self.system_prompt}\n\n"
             f"Available tools:\n{tools_desc}\n\n"
         )
+
+    def _get_browser_session(self, _agent=None) -> BrowserSession:
+        if self._browser_session is None:
+            self._browser_session = BrowserSession(embed_fn=self._embed_fn, logger=self._browser_log)
+        return self._browser_session
+
+    def _browser_log(self, event: str, data: dict) -> None:
+        self._debug_log(event, data)
+
+    def _is_gpt_oss_model(self) -> bool:
+        return "gpt-oss" in (self.chat_model or "").lower()
+
+    def _max_tool_calls(self) -> int:
+        if self._is_gpt_oss_model():
+            override = os.getenv("ATLAS_GPT_OSS_TOOL_LIMIT")
+            if override:
+                try:
+                    return max(1, int(override))
+                except ValueError:
+                    return DEFAULT_GPT_OSS_TOOL_LIMIT
+            return DEFAULT_GPT_OSS_TOOL_LIMIT
+        return DEFAULT_MAX_TOOL_CALLS
+
+    def _normalize_tool_calls(self, requests: List[dict]) -> List[dict]:
+        normalized: List[dict] = []
+        for idx, request in enumerate(requests):
+            name = request.get("name")
+            if not name:
+                continue
+            call_id = request.get("call_id") or f"call_{idx}"
+            call_type = request.get("type") or "function"
+            arguments = request.get("arguments")
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except json.JSONDecodeError:
+                    arguments = {}
+            if not isinstance(arguments, dict):
+                arguments = {}
+            normalized.append(
+                {
+                    "id": call_id,
+                    "type": call_type,
+                    "function": {"name": name, "arguments": arguments},
+                }
+            )
+        return normalized
+
+    def _debug_log(self, message: str, payload: Optional[dict] = None) -> None:
+        if not self._debug_log_path:
+            return
+        record = {
+            "ts": datetime.utcnow().isoformat() + "Z",
+            "message": message,
+        }
+        if payload is not None:
+            record["data"] = payload
+        try:
+            with open(self._debug_log_path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception:
+            # Swallow logging errors so agent behavior remains unchanged
+            pass
 
     def respond(self, user_text: str, *, stream_callback=None) -> str:
         user_text = user_text.strip()
@@ -124,6 +203,7 @@ class AtlasAgent:
 
             accumulator: list[str] = []
             tool_calls_accum: list[dict] = []
+            supports_think = False
             try:
                 # Build kwargs for chat_stream, adding 'context' only if supported
                 stream_kwargs = {
@@ -134,11 +214,38 @@ class AtlasAgent:
                 }
                 try:
                     sig = inspect.signature(self.client.chat_stream)
-                    if "context" in sig.parameters and self._kv_context is not None:
+                    params = sig.parameters
+                    if "context" in params and self._kv_context is not None:
                         stream_kwargs["context"] = self._kv_context or []
+                    if self._is_gpt_oss_model():
+                        supports_think = "think" in params or any(
+                            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+                        )
+                        if supports_think:
+                            stream_kwargs["think"] = True
                 except (ValueError, TypeError):
-                    # Fallback: if we can't introspect, don't pass optional args
-                    pass
+                    if self._is_gpt_oss_model():
+                        stream_kwargs["think"] = True
+                if self._is_gpt_oss_model() and supports_think and "think" not in stream_kwargs:
+                    stream_kwargs["think"] = True
+
+                self._debug_log(
+                    "chat_stream.request",
+                    {
+                        "model": self.chat_model,
+                        "think": stream_kwargs.get("think"),
+                        "tool_specs": len(stream_kwargs.get("tools") or []),
+                        "context_tokens": len(stream_kwargs.get("context", [])) if stream_kwargs.get("context") else 0,
+                        "messages_preview": [
+                            {
+                                "role": msg.get("role"),
+                                "has_tool_calls": bool(msg.get("tool_calls")),
+                                "content": (msg.get("content") or "")[:160],
+                            }
+                            for msg in messages[-3:]
+                        ],
+                    },
+                )
 
                 for chunk in self.client.chat_stream(**stream_kwargs):
                     content = chunk["content"]
@@ -151,6 +258,7 @@ class AtlasAgent:
                     if stream_callback:
                         stream_callback(content)
             except OllamaError as exc:
+                self._debug_log("chat_stream.error", {"error": str(exc)})
                 if stream_callback:
                     stream_callback(f"\n[error] {exc}")
                 message = f"I hit an error contacting Ollama: {exc}"
@@ -160,9 +268,24 @@ class AtlasAgent:
             full_response = "".join(accumulator)
             visible, inline_tool_requests = self._compute_visible_output(full_response)
 
-            tool_requests: list[dict] = list(inline_tool_requests)
+            tool_requests: list[dict] = []
+            for inline_request in inline_tool_requests:
+                name = inline_request.get("name")
+                if not name:
+                    continue
+                arguments = inline_request.get("arguments") or {}
+                tool_requests.append(
+                    {
+                        "name": name,
+                        "arguments": arguments,
+                        "call_id": None,
+                        "source": "inline",
+                        "type": "function",
+                    }
+                )
 
             if tool_calls_accum:
+                stream_index = 0
                 for tool_call in tool_calls_accum:
                     function = tool_call.get("function", {})
                     name = function.get("name")
@@ -175,10 +298,21 @@ class AtlasAgent:
                         arguments = raw_arguments
                     else:
                         arguments = {}
-                    tool_requests.append({"name": name, "arguments": arguments})
+                    call_id = tool_call.get("id") or f"call_{stream_index}"
+                    stream_index += 1
+                    tool_requests.append(
+                        {
+                            "name": name,
+                            "arguments": arguments,
+                            "call_id": call_id,
+                            "source": "stream",
+                            "type": tool_call.get("type") or "function",
+                        }
+                    )
 
             if tool_requests:
-                if tool_calls + len(tool_requests) > MAX_TOOL_CALLS:
+                max_tool_calls = self._max_tool_calls()
+                if tool_calls + len(tool_requests) > max_tool_calls:
                     message = "I tried using tools but hit the maximum number of attempts without finishing."
                     self.working_memory.add_assistant(message)
                     self._record_interaction(user_text, message)
@@ -187,13 +321,47 @@ class AtlasAgent:
                     return message
 
                 tool_calls += len(tool_requests)
-                for request in tool_requests:
-                    description = json.dumps(request["arguments"], ensure_ascii=False)
-                    self.working_memory.add_assistant(f"[tool_call] {request['name']} {description}")
+                is_gpt_oss = self._is_gpt_oss_model()
+                if is_gpt_oss:
+                    stream_requests = [req for req in tool_requests if req.get("source") == "stream"]
+                    inline_requests = [req for req in tool_requests if req.get("source") != "stream"]
+                    if stream_requests:
+                        normalized_calls = self._normalize_tool_calls(stream_requests)
+                        self.working_memory.add_assistant(visible.strip(), tool_calls=normalized_calls)
+                        self._debug_log(
+                            "gpt_oss.tool_calls",
+                            {
+                                "count": len(normalized_calls),
+                                "call_ids": [call.get("id") for call in normalized_calls],
+                            },
+                        )
+                    for request in inline_requests:
+                        description = json.dumps(request["arguments"], ensure_ascii=False)
+                        self.working_memory.add_assistant(f"[tool_call] {request['name']} {description}")
+                else:
+                    for request in tool_requests:
+                        description = json.dumps(request["arguments"], ensure_ascii=False)
+                        self.working_memory.add_assistant(f"[tool_call] {request['name']} {description}")
 
                 outputs = self._run_tool_requests(tool_requests)
                 for request, tool_output in zip(tool_requests, outputs):
-                    self.working_memory.add_tool(request["name"], tool_output)
+                    role = "tool" if is_gpt_oss and request.get("source") == "stream" else "assistant"
+                    tool_call_id = request.get("call_id") if role == "tool" else None
+                    self.working_memory.add_tool(
+                        request["name"],
+                        tool_output,
+                        role=role,
+                        tool_call_id=tool_call_id,
+                    )
+                    if role == "tool":
+                        self._debug_log(
+                            "gpt_oss.tool_result",
+                            {
+                                "tool": request["name"],
+                                "call_id": tool_call_id,
+                                "excerpt": tool_output[:200],
+                            },
+                        )
                     if stream_callback:
                         stream_callback(f"\n[tool:{request['name']}] {tool_output}\n")
                 continue
@@ -245,6 +413,8 @@ class AtlasAgent:
         self.working_memory.clear()
         if self._kv_context is not None:
             self._kv_context = []
+        if self._browser_session is not None:
+            self._browser_session = None
 
     def set_chat_model(self, model: str) -> None:
         self.chat_model = model.strip() or self.chat_model

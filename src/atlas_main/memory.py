@@ -58,21 +58,28 @@ class WorkingMemory:
         self._buffer: deque[dict[str, Any]] = deque(maxlen=self.capacity)
 
     def add(self, role: str, content: str, **extra: Any) -> None:
-        content = content.strip()
-        if not content:
+        content = (content or "")
+        stripped = content.strip()
+        if not stripped and not extra:
             return
-        message: dict[str, Any] = {"role": role, "content": content}
+        message: dict[str, Any] = {"role": role, "content": stripped}
         message.update({k: v for k, v in extra.items() if v is not None})
         self._buffer.append(message)
 
-    def add_user(self, content: str) -> None:
-        self.add("user", content)
+    def add_user(self, content: str, **extra: Any) -> None:
+        self.add("user", content, **extra)
 
-    def add_assistant(self, content: str) -> None:
-        self.add("assistant", content)
+    def add_assistant(self, content: str, **extra: Any) -> None:
+        self.add("assistant", content, **extra)
 
-    def add_tool(self, name: str, content: str) -> None:
-        content = content.strip()
+    def add_tool(self, name: str, content: str, *, role: str = "assistant", tool_call_id: Optional[str] = None) -> None:
+        content = (content or "").strip()
+        if role == "tool":
+            message: dict[str, Any] = {"role": "tool", "tool_name": name or "", "content": content}
+            if tool_call_id:
+                message["tool_call_id"] = tool_call_id
+            self._buffer.append(message)
+            return
         if not content:
             return
         formatted = f"[tool:{name}]\n{content}" if name else content

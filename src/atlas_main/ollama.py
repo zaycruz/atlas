@@ -66,6 +66,7 @@ class OllamaClient:
         tools: Optional[List[Dict]] = None,
         context: Optional[List[int]] = None,
         keep_alive: Optional[int] = None,
+        think: Optional[bool] = None,
         request_timeout: Optional[int] = None,
     ) -> Dict:
         payload = {
@@ -81,6 +82,8 @@ class OllamaClient:
             payload["context"] = context
         if keep_alive is not None:
             payload["keep_alive"] = keep_alive
+        if think is not None:
+            payload["think"] = think
 
         response = self._post("/api/chat", payload, stream=stream, request_timeout=request_timeout)
         if stream:
@@ -96,6 +99,7 @@ class OllamaClient:
         tools: Optional[List[Dict]] = None,
         context: Optional[List[int]] = None,
         keep_alive: Optional[int] = None,
+        think: Optional[bool] = None,
         request_timeout: Optional[int] = None,
     ) -> Iterator[Dict[str, str]]:
         payload = {
@@ -111,6 +115,8 @@ class OllamaClient:
             payload["context"] = context
         if keep_alive is not None:
             payload["keep_alive"] = keep_alive
+        if think is not None:
+            payload["think"] = think
         response = self._post("/api/chat", payload, stream=True, request_timeout=request_timeout)
         yield from self._stream_chat(response)
 
