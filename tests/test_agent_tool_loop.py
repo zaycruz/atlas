@@ -69,16 +69,18 @@ def test_agent_handles_multiple_tool_calls(tmp_path: Path):
     client = _FakeClient()
     os.environ["ATLAS_MEMORY_DIR"] = str(tmp_path)
     agent = AtlasAgent(client)
+    try:
+        # Monkeypatch web_search tool to avoid network
+        web = agent.tools._tools.get("web_search")
+        assert web is not None
+        web.run = lambda *, agent=None, query, max_results=3: "Search results: OK"  # type: ignore
 
-    # Monkeypatch web_search tool to avoid network
-    web = agent.tools._tools.get("web_search")
-    assert web is not None
-    web.run = lambda *, agent=None, query, max_results=3: "Search results: OK"  # type: ignore
+        out = agent.respond("Test multi-tool")
 
-    out = agent.respond("Test multi-tool")
-
-    # Final answer should be returned
-    assert "All done" in out
+        # Final answer should be returned
+        assert "All done" in out
+    finally:
+        agent.close()
 
 
 class _FakeConcurrentClient:
@@ -160,13 +162,15 @@ def test_agent_runs_tool_calls_concurrently(tmp_path: Path):
     client = _FakeConcurrentClient()
     os.environ["ATLAS_MEMORY_DIR"] = str(tmp_path)
     agent = AtlasAgent(client)
+    try:
+        agent.tools.register(_BarrierToolA(barrier))
+        agent.tools.register(_BarrierToolB(barrier))
 
-    agent.tools.register(_BarrierToolA(barrier))
-    agent.tools.register(_BarrierToolB(barrier))
+        out = agent.respond("Trigger concurrent tools")
 
-    out = agent.respond("Trigger concurrent tools")
-
-    assert "All done" in out
+        assert "All done" in out
+    finally:
+        agent.close()
 
 
 class _GPTOSSClient:
@@ -230,25 +234,27 @@ def test_gpt_oss_uses_think_and_tool_role(tmp_path: Path):
     client = _GPTOSSClient()
     os.environ["ATLAS_MEMORY_DIR"] = str(tmp_path)
     agent = AtlasAgent(client, chat_model="gpt-oss:20b")
+    try:
+        web = agent.tools._tools.get("web_search")
+        assert web is not None
+        web.run = lambda *, agent=None, query, max_results=3: "Search results: OK"  # type: ignore
 
-    web = agent.tools._tools.get("web_search")
-    assert web is not None
-    web.run = lambda *, agent=None, query, max_results=3: "Search results: OK"  # type: ignore
+        out = agent.respond("Trigger gpt-oss tool")
 
-    out = agent.respond("Trigger gpt-oss tool")
+        assert "Done." in out
+        assert any(flag is True for flag in client.seen_think)
 
-    assert "Done." in out
-    assert any(flag is True for flag in client.seen_think)
+        messages = agent.working_memory.to_messages()
+        tool_messages = [msg for msg in messages if msg.get("role") == "tool"]
+        assert tool_messages
+        assert tool_messages[-1].get("tool_name") == "web_search"
 
-    messages = agent.working_memory.to_messages()
-    tool_messages = [msg for msg in messages if msg.get("role") == "tool"]
-    assert tool_messages
-    assert tool_messages[-1].get("tool_name") == "web_search"
-
-    assistant_with_calls = [msg for msg in messages if msg.get("role") == "assistant" and msg.get("tool_calls")]
-    assert assistant_with_calls
-    assert assistant_with_calls[-1]["tool_calls"][0]["function"]["name"] == "web_search"
-    assert isinstance(assistant_with_calls[-1]["tool_calls"][0]["function"].get("arguments"), dict)
+        assistant_with_calls = [msg for msg in messages if msg.get("role") == "assistant" and msg.get("tool_calls")]
+        assert assistant_with_calls
+        assert assistant_with_calls[-1]["tool_calls"][0]["function"]["name"] == "web_search"
+        assert isinstance(assistant_with_calls[-1]["tool_calls"][0]["function"].get("arguments"), dict)
+    finally:
+        agent.close()
 
 
 def test_debug_logging_when_enabled(tmp_path: Path):
@@ -259,13 +265,16 @@ def test_debug_logging_when_enabled(tmp_path: Path):
 
     try:
         agent = AtlasAgent(client)
-        web = agent.tools._tools.get("web_search")
-        assert web is not None
-        web.run = lambda *, agent=None, query, max_results=3: "Search results: OK"  # type: ignore
+        try:
+            web = agent.tools._tools.get("web_search")
+            assert web is not None
+            web.run = lambda *, agent=None, query, max_results=3: "Search results: OK"  # type: ignore
 
-        agent.respond("Test logging")
+            agent.respond("Test logging")
 
-        assert log_path.exists()
-        assert log_path.read_text().strip()
+            assert log_path.exists()
+            assert log_path.read_text().strip()
+        finally:
+            agent.close()
     finally:
         os.environ.pop("ATLAS_AGENT_LOG", None)

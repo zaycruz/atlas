@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
+import time
 import uuid
 
 from atlas_main.cli import _handle_memory, console
@@ -24,54 +26,57 @@ def test_memory_cli_commands(tmp_path, monkeypatch):
     )
 
     manager = LayeredMemoryManager(embed_fn=lambda _text: None, config=config)
-    manager.log_interaction("What did I say?", "You discussed balcony gardens.")
-    manager.reflections.add("Mention hardware specifics when discussing garden automations.")
-    manager.reflections.add("Track moisture sensors for balcony beds.")
-    manager.semantic.extend_facts(
-        [
-            "Atlas monitors irrigation schedules.",
-            "Atlas records sunshine totals for balcony beds.",
-        ]
-    )
+    try:
+        manager.log_interaction("What did I say?", "You discussed balcony gardens.")
+        manager.reflections.add("Mention hardware specifics when discussing garden automations.")
+        manager.reflections.add("Track moisture sensors for balcony beds.")
+        manager.semantic.extend_facts(
+            [
+                "Atlas monitors irrigation schedules.",
+                "Atlas records sunshine totals for balcony beds.",
+            ]
+        )
 
-    agent = _StubAgent(manager, config)
+        agent = _StubAgent(manager, config)
 
-    with console.capture() as capture:
-        _handle_memory(agent, ["path"])
-    output = capture.get()
-    assert "episodes.sqlite3" in output
+        with console.capture() as capture:
+            _handle_memory(agent, ["path"])
+        output = capture.get()
+        assert "episodes.sqlite3" in output
 
-    with console.capture() as capture:
-        _handle_memory(agent, ["episodic", "3"])
-    output = capture.get()
-    assert "balcony gardens" in output
+        with console.capture() as capture:
+            _handle_memory(agent, ["episodic", "3"])
+        output = capture.get()
+        assert "balcony gardens" in output
 
-    with console.capture() as capture:
-        _handle_memory(agent, ["semantic"])
-    output = capture.get()
-    assert "Skyline Labs" in output
+        with console.capture() as capture:
+            _handle_memory(agent, ["semantic"])
+        output = capture.get()
+        assert "Skyline Labs" in output
 
-    with console.capture() as capture:
-        _handle_memory(agent, ["reflections"])
-    output = capture.get()
-    assert "hardware specifics" in output
+        with console.capture() as capture:
+            _handle_memory(agent, ["reflections"])
+        output = capture.get()
+        assert "hardware specifics" in output
 
-    with console.capture() as capture:
-        _handle_memory(agent, ["stats"])
-    output = capture.get()
-    assert "Harvest stats" in output
+        with console.capture() as capture:
+            _handle_memory(agent, ["stats"])
+        output = capture.get()
+        assert "Harvest stats" in output
 
-    with console.capture() as capture:
-        _handle_memory(agent, ["prune", "semantic", "1"])
-    output = capture.get()
-    assert "Pruned semantic=" in output
-    assert len(manager.semantic.head(10)) == 1
+        with console.capture() as capture:
+            _handle_memory(agent, ["prune", "semantic", "1"])
+        output = capture.get()
+        assert "Pruned semantic=" in output
+        assert len(manager.semantic.head(10)) == 1
 
-    with console.capture() as capture:
-        _handle_memory(agent, ["prune", "reflections", "1"])
-    output = capture.get()
-    assert "reflections=" in output
-    assert len(manager.reflections.recent(10)) == 1
+        with console.capture() as capture:
+            _handle_memory(agent, ["prune", "reflections", "1"])
+        output = capture.get()
+        assert "reflections=" in output
+        assert len(manager.reflections.recent(10)) == 1
+    finally:
+        manager.close()
 
 
 def test_episodic_memory_uses_uuid_ids(tmp_path, monkeypatch):
@@ -107,20 +112,23 @@ def test_layered_memory_process_turn_updates_long_term(tmp_path, monkeypatch):
     monkeypatch.setenv("ATLAS_MEMORY_MODEL", "fake-model")
     config = LayeredMemoryConfig(base_dir=tmp_path)
     manager = LayeredMemoryManager(embed_fn=lambda _text: None, config=config)
-    client = _FakeMemoryClient(
-        {
-            "facts": ["User enjoys coffee brewing."],
-            "reflections": ["Remember to suggest coffee equipment."],
-        }
-    )
+    try:
+        client = _FakeMemoryClient(
+            {
+                "facts": ["User enjoys coffee brewing."],
+                "reflections": ["Remember to suggest coffee equipment."],
+            }
+        )
 
-    manager.process_turn("I love experimenting with coffee", "I'll keep that in mind.", client=client)
+        manager.process_turn("I love experimenting with coffee", "I'll keep that in mind.", client=client)
 
-    facts = manager.semantic.head(1)
-    assert facts and "coffee" in facts[0]["text"].lower()
+        facts = manager.semantic.head(1)
+        assert facts and "coffee" in facts[0]["text"].lower()
 
-    reflections = manager.reflections.recent(1)
-    assert reflections and "coffee" in reflections[0]["text"].lower()
+        reflections = manager.reflections.recent(1)
+        assert reflections and "coffee" in reflections[0]["text"].lower()
+    finally:
+        manager.close()
 
 
 def test_harvest_confidence_filtering(tmp_path, monkeypatch):
@@ -131,6 +139,58 @@ def test_harvest_confidence_filtering(tmp_path, monkeypatch):
         min_reflection_confidence=0.6,
     )
     manager = LayeredMemoryManager(embed_fn=lambda _text: None, config=config)
+    try:
+        client = _FakeMemoryClient(
+            {
+                "facts": [
+                    {"text": "User loves espresso", "confidence": 0.9},
+                    {"text": "Discard this", "confidence": 0.2},
+                ],
+                "reflections": [
+                    {"text": "Offer new brew techniques", "confidence": 0.7},
+                    {"text": "Low confidence", "confidence": 0.1},
+                ],
+            }
+        )
+
+        manager.process_turn("Any coffee updates?", "Let's log your preferences.", client=client)
+
+        facts = manager.semantic.head(5)
+        assert len(facts) == 1
+        assert "espresso" in facts[0]["text"].lower()
+
+        lessons = manager.reflections.recent(5)
+        assert len(lessons) == 1
+        assert "brew" in lessons[0]["text"].lower()
+
+        stats = manager.get_stats()
+        assert stats["harvest"]["accepted_facts"] == 1
+        assert stats["harvest"]["accepted_reflections"] == 1
+        assert stats["harvest"]["rejected_low_confidence"] >= 2
+    finally:
+        manager.close()
+
+
+def test_layered_memory_close_releases_sqlite_lock(tmp_path):
+    config = LayeredMemoryConfig(base_dir=tmp_path)
+    manager = LayeredMemoryManager(embed_fn=lambda _text: None, config=config)
+    try:
+        manager.log_interaction("Hello", "world")
+    finally:
+        manager.close()
+
+    with sqlite3.connect(str(config.episodic_path)) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO episodes (id, ts, user, assistant, embedding) VALUES (?, ?, ?, ?, ?)",
+            (f"manual-{time.time():.6f}", time.time(), "direct", "write", None),
+        )
+        conn.commit()
+
+    reopened = LayeredMemoryManager(embed_fn=lambda _text: None, config=config)
+    try:
+        reopened.log_interaction("Again", "ready")
+    finally:
+        reopened.close()
     client = _FakeMemoryClient(
         {
             "facts": [

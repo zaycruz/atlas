@@ -43,6 +43,17 @@ class EpisodicSQLiteMemory:
         self._conn = sqlite3.connect(str(self.db_path))
         self._init_schema()
 
+    def close(self) -> None:
+        conn = getattr(self, "_conn", None)
+        if conn is None:
+            return
+        try:
+            conn.close()
+        except Exception:
+            LOGGER.debug("Failed to close episodic SQLite connection", exc_info=True)
+        finally:
+            self._conn = None
+
     def _init_schema(self) -> None:
         cur = self._conn.cursor()
         cur.execute(
@@ -494,6 +505,15 @@ class LayeredMemoryManager:
             self.config.base_dir,
             self.config.embed_model,
         )
+
+    def close(self) -> None:
+        episodic = getattr(self, "episodic", None)
+        if episodic is None:
+            return
+        try:
+            episodic.close()
+        except Exception:
+            pass
 
     def log_interaction(self, user: str, assistant: str) -> None:
         try:

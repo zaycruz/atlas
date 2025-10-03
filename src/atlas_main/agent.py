@@ -79,32 +79,41 @@ class AtlasAgent:
         system_prompt: str = DEFAULT_PROMPT,
         layered_memory_config: Optional[LayeredMemoryConfig] = None,
     ):
-            self.client = client
-            self.chat_model = chat_model
-            self.system_prompt = system_prompt
-            self.working_memory = WorkingMemory(capacity=working_memory_limit)
-            self.show_thinking = True
-            # KV context buffer reused across turns (opt-in via ATLAS_KV_CACHE != "0")
-            self._kv_context = [] if os.getenv("ATLAS_KV_CACHE", "1") != "0" else None
-            # Tools available to the agent
-            self.tools = ToolRegistry()
-            self.tools.register(ReadFileTool())
-            self.tools.register(ListDirectoryTool())
-            self.tools.register(WriteFileTool())
-            self.tools.register(ShellCommandTool())
-            self.layered_memory_config = layered_memory_config or LayeredMemoryConfig()
-            embed_fn = self._make_embed_fn(self.layered_memory_config.embed_model)
-            self._embed_fn = embed_fn
-            self.layered_memory = LayeredMemoryManager(embed_fn, config=self.layered_memory_config)
-            self._browser_session: Optional[BrowserSession] = None
-            if os.getenv("ATLAS_SEARCH2", "0") != "0":
-                resolver = self._get_browser_session
-                self.tools.register(BrowserSearchTool(resolver))
-                self.tools.register(BrowserOpenTool(resolver))
-                self.tools.register(BrowserFindTool(resolver))
-            else:
-                self.tools.register(WebSearchTool())
-            self._debug_log_path = os.getenv("ATLAS_AGENT_LOG")
+        self.client = client
+        self.chat_model = chat_model
+        self.system_prompt = system_prompt
+        self.working_memory = WorkingMemory(capacity=working_memory_limit)
+        self.show_thinking = True
+        # KV context buffer reused across turns (opt-in via ATLAS_KV_CACHE != "0")
+        self._kv_context = [] if os.getenv("ATLAS_KV_CACHE", "1") != "0" else None
+        # Tools available to the agent
+        self.tools = ToolRegistry()
+        self.tools.register(ReadFileTool())
+        self.tools.register(ListDirectoryTool())
+        self.tools.register(WriteFileTool())
+        self.tools.register(ShellCommandTool())
+        self.layered_memory_config = layered_memory_config or LayeredMemoryConfig()
+        embed_fn = self._make_embed_fn(self.layered_memory_config.embed_model)
+        self._embed_fn = embed_fn
+        self.layered_memory = LayeredMemoryManager(embed_fn, config=self.layered_memory_config)
+        self._browser_session: Optional[BrowserSession] = None
+        if os.getenv("ATLAS_SEARCH2", "0") != "0":
+            resolver = self._get_browser_session
+            self.tools.register(BrowserSearchTool(resolver))
+            self.tools.register(BrowserOpenTool(resolver))
+            self.tools.register(BrowserFindTool(resolver))
+        else:
+            self.tools.register(WebSearchTool())
+        self._debug_log_path = os.getenv("ATLAS_AGENT_LOG")
+
+    def close(self) -> None:
+        memory = getattr(self, "layered_memory", None)
+        if memory is None:
+            return
+        try:
+            memory.close()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     def _build_system_prompt(self, user_text: str) -> str:
