@@ -191,6 +191,12 @@ class AtlasAgent:
         if not user_text:
             return ""
 
+        self._current_turn_tags: set[str] = set()
+        self._current_turn_tools: set[str] = set()
+        self._current_objective = self._extract_objective(user_text)
+        if self._current_objective:
+            self._register_turn_tag(f"objective:{self._slug_tag(self._current_objective)}")
+
         self.working_memory.add_user(user_text)
 
         tool_calls = 0
@@ -283,6 +289,7 @@ class AtlasAgent:
                 if not name:
                     continue
                 arguments = inline_request.get("arguments") or {}
+                self._register_turn_tool(name)
                 tool_requests.append(
                     {
                         "name": name,
@@ -309,6 +316,7 @@ class AtlasAgent:
                         arguments = {}
                     call_id = tool_call.get("id") or f"call_{stream_index}"
                     stream_index += 1
+                    self._register_turn_tool(name)
                     tool_requests.append(
                         {
                             "name": name,
@@ -414,7 +422,20 @@ class AtlasAgent:
             return
         try:
             if self.layered_memory:
-                self.layered_memory.process_turn(user_text, assistant_text, client=self.client)
+                metadata = {
+                    "tags": sorted(self._current_turn_tags) if hasattr(self, "_current_turn_tags") else [],
+                    "objective": getattr(self, "_current_objective", None),
+                    "tools": sorted(self._current_turn_tools)
+                    if hasattr(self, "_current_turn_tools")
+                    else [],
+                }
+                metadata = {k: v for k, v in metadata.items() if v}
+                self.layered_memory.process_turn(
+                    user_text,
+                    assistant_text,
+                    client=self.client,
+                    metadata=metadata or None,
+                )
         except Exception:
             pass
 
@@ -489,3 +510,36 @@ class AtlasAgent:
         if len(result) > 2000:
             result = result[:2000] + "..."
         return result or "(tool returned no content)"
+
+    def _register_turn_tag(self, tag: str) -> None:
+        cleaned = (tag or "").strip().lower()
+        if not cleaned:
+            return
+        if not hasattr(self, "_current_turn_tags"):
+            self._current_turn_tags = set()
+        self._current_turn_tags.add(cleaned)
+
+    def _register_turn_tool(self, name: str) -> None:
+        cleaned = (name or "").strip()
+        if not cleaned:
+            return
+        if not hasattr(self, "_current_turn_tools"):
+            self._current_turn_tools = set()
+        slug = self._slug_tag(cleaned)
+        self._current_turn_tools.add(slug)
+        self._register_turn_tag(f"tool:{slug}")
+
+    def _extract_objective(self, text: str) -> str:
+        snippet = (text or "").strip()
+        if not snippet:
+            return ""
+        parts = re.split(r"[.!?\n]", snippet, maxsplit=1)
+        objective = parts[0].strip()
+        words = objective.split()
+        return " ".join(words[:12])
+
+    def _slug_tag(self, text: str) -> str:
+        tokens = re.findall(r"[A-Za-z0-9]+", text.lower())
+        if not tokens:
+            return "general"
+        return "-".join(tokens[:5])[:40]
