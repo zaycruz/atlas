@@ -9,6 +9,7 @@ import os
 import re
 import sqlite3
 import time
+import uuid
 import logging
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -70,8 +71,14 @@ class EpisodicSQLiteMemory:
                 emb = None
         cur = self._conn.cursor()
         cur.execute(
-            "INSERT OR REPLACE INTO episodes (id, ts, user, assistant, embedding) VALUES (?, ?, ?, ?, ?)",
-            (str(ts), ts, user, assistant, json.dumps(emb) if emb is not None else None),
+            "INSERT INTO episodes (id, ts, user, assistant, embedding) VALUES (?, ?, ?, ?, ?)",
+            (
+                str(uuid.uuid4()),
+                ts,
+                user,
+                assistant,
+                json.dumps(emb) if emb is not None else None,
+            ),
         )
         # Trim table to max_records by deleting oldest
         cur.execute("SELECT COUNT(*) FROM episodes")
