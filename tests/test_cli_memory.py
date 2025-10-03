@@ -158,3 +158,30 @@ def test_harvest_confidence_filtering(tmp_path, monkeypatch):
     assert stats["harvest"]["accepted_facts"] == 1
     assert stats["harvest"]["accepted_reflections"] == 1
     assert stats["harvest"]["rejected_low_confidence"] >= 2
+
+
+def test_harvest_reflection_deduplication(tmp_path, monkeypatch):
+    monkeypatch.setenv("ATLAS_MEMORY_DIR", str(tmp_path))
+    config = LayeredMemoryConfig(base_dir=tmp_path)
+    manager = LayeredMemoryManager(embed_fn=lambda _text: None, config=config)
+
+    existing_lesson = "Remember to greet warmly."
+    manager.reflections.add(existing_lesson)
+
+    client = _FakeMemoryClient(
+        {
+            "reflections": [
+                {"text": existing_lesson, "confidence": 0.9},
+                {"text": "Offer scheduling reminders when appropriate.", "confidence": 0.8},
+            ]
+        }
+    )
+
+    manager.process_turn("Hello", "Hi there!", client=client)
+
+    lessons = manager.reflections.all()
+    assert len(lessons) == 2
+    assert any("scheduling reminders" in lesson["text"].lower() for lesson in lessons)
+
+    stats = manager.get_stats()
+    assert stats["harvest"]["accepted_reflections"] == 1
