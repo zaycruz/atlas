@@ -119,7 +119,11 @@ class HybridWorkingMemory:
         """Evict oldest non-important message."""
         for i, message in enumerate(self._buffer):
             if not self._is_important_message(message):
-                return self._buffer.popleft() if i == 0 else None
+                if i == 0:
+                    return self._buffer.popleft()
+                removed = message
+                del self._buffer[i]
+                return removed
         return None
 
     def _evict_oldest(self) -> Optional[dict[str, Any]]:
@@ -206,9 +210,16 @@ class HybridWorkingMemory:
 class WorkingMemory:
     """A rolling buffer that captures the latest conversation turns."""
 
-    def __init__(self, capacity: int = 12) -> None:
+    def __init__(self, capacity: int = 12, *, max_tokens: int | None = None) -> None:
+        """Initialize working memory.
+
+        ``max_tokens`` is accepted for backward compatibility with legacy tests but
+        is ignored now that HybridWorkingMemory handles token budgeting.
+        """
         self.capacity = max(2, capacity)
         self._buffer: deque[dict[str, Any]] = deque(maxlen=self.capacity)
+        self._legacy_max_tokens = max_tokens
+        self._legacy_token_estimator = _estimate_tokens if max_tokens else None
 
     def add(self, role: str, content: str, **extra: Any) -> None:
         content = (content or "")
@@ -218,6 +229,12 @@ class WorkingMemory:
         message: dict[str, Any] = {"role": role, "content": stripped}
         message.update({k: v for k, v in extra.items() if v is not None})
         self._buffer.append(message)
+        if self._legacy_max_tokens and self._legacy_token_estimator:
+            while True:
+                total = sum(self._legacy_token_estimator(m.get("content", "")) for m in self._buffer)
+                if total <= self._legacy_max_tokens or len(self._buffer) <= 1:
+                    break
+                self._buffer.popleft()
 
     def add_user(self, content: str, **extra: Any) -> None:
         self.add("user", content, **extra)

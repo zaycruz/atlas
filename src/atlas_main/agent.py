@@ -147,6 +147,16 @@ class AtlasAgent:
     def last_objective(self) -> Optional[str]:
         return self._last_objective
 
+    def set_manual_objective(self, objective: Optional[str]) -> None:
+        """Manually set the current objective, overriding automatic extraction."""
+        self._current_objective = objective
+        self._last_objective = objective
+
+    def clear_objective(self) -> None:
+        """Clear any stored objective state."""
+        self._current_objective = None
+        self._last_objective = None
+
     @property
     def last_tags(self) -> set[str]:
         return set(self._last_tags)
@@ -235,19 +245,30 @@ class AtlasAgent:
 
         self._current_turn_tags: set[str] = set()
         self._current_turn_tools: set[str] = set()
-        self._current_objective = self._extract_objective(user_text)
-        if self._current_objective:
-            self._register_turn_tag(f"objective:{self._slug_tag(self._current_objective)}")
+
+        if not user_text.startswith("/"):
+            new_objective, should_update = self._extract_objective_with_llm(user_text, self._last_objective)
+            if should_update:
+                self._current_objective = new_objective
+                if self._current_objective:
+                    self._register_turn_tag(f"objective:{self._slug_tag(self._current_objective)}")
+            else:
+                self._current_objective = self._last_objective
+        else:
+            self._current_objective = self._last_objective
 
         # Add user message and handle any evicted messages
         evicted = self.working_memory.add_user(user_text)
-        if evicted and event_callback:
-            # Emit event for evicted messages
-            event_callback({
-                "type": "working_memory_eviction",
-                "evicted_count": len(evicted),
-                "reason": "capacity_limit"
-            })
+        if evicted:
+            self._emit_event(
+                event_callback,
+                "working_memory_eviction",
+                {
+                    "evicted_count": len(evicted),
+                    "reason": "capacity_limit",
+                    "objective": self._current_objective,
+                },
+            )
             
         self._emit_event(
             event_callback,
@@ -739,6 +760,88 @@ class AtlasAgent:
         slug = self._slug_tag(cleaned)
         self._current_turn_tools.add(slug)
         self._register_turn_tag(f"tool:{slug}")
+
+    def _extract_objective_with_llm(self, user_text: str, current_objective: Optional[str] = None) -> tuple[Optional[str], bool]:
+        """Use the chat model to infer objectives; returns (objective, should_update)."""
+        stripped = (user_text or "").strip()
+        if not stripped or stripped.startswith("/"):
+            return current_objective, False
+
+        prompt = f"""Analyze this user message and determine if there's a clear objective or goal.
+
+Current objective: {current_objective or "None"}
+User message: "{user_text}"
+
+Rules:
+1. Extract a concise objective (5-10 words) if the user is asking for help with a specific task
+2. Return "KEEP" if the message continues the current objective
+3. Return "NONE" if it's just a greeting, acknowledgment, or casual conversation
+4. Only update if there's a genuinely new, different objective
+
+Examples:
+- "Can you help me debug this authentication issue?" → "debug authentication issue"
+- "How do I set up a database connection?" → "set up database connection"
+- "Thanks, that worked!" → "KEEP"
+- "Hi there" → "NONE"
+- "Yes, continue with that approach" → "KEEP"
+
+Respond with just the objective, "KEEP", or "NONE"."""
+
+        try:
+            response = self.client.chat(
+                messages=[{"role": "user", "content": prompt}],
+                model=self.chat_model,
+                stream=False,
+                options={"max_tokens": 50, "temperature": 0.1},
+            )
+
+            content = ""
+            if isinstance(response, dict):
+                message = response.get("message")
+                if isinstance(message, dict):
+                    raw = message.get("content", "")
+                else:
+                    raw = response.get("response", "")
+                if isinstance(raw, str):
+                    content = raw.strip()
+                elif raw:
+                    content = str(raw).strip()
+
+            if not content:
+                fallback = self._extract_objective_fallback(user_text)
+                if fallback:
+                    return fallback, True
+                return current_objective, False
+
+            result = content.lower()
+            if result == "keep":
+                return current_objective, False
+            if result == "none":
+                return None, True
+
+            objective = result.replace('"', "").strip()
+            if objective and objective != current_objective:
+                return objective, True
+            return current_objective, False
+
+        except Exception as exc:
+            self._debug_log(f"LLM objective extraction failed: {exc}")
+            fallback = self._extract_objective_fallback(user_text)
+            if fallback:
+                return fallback, True
+            return current_objective, False
+
+    def _extract_objective_fallback(self, text: str) -> Optional[str]:
+        """Fallback extraction when the LLM path fails."""
+        snippet = (text or "").strip()
+        if not snippet or snippet.startswith("/") or len(snippet.split()) < 3:
+            return None
+
+        lowered = snippet.lower()
+        if any(phrase in lowered for phrase in ["help me", "how do", "can you", "need to", "want to"]):
+            words = snippet.split()[:8]
+            return " ".join(words)
+        return None
 
     def _extract_objective(self, text: str) -> str:
         snippet = (text or "").strip()

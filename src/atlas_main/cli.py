@@ -3,26 +3,9 @@
 Supports:
  - chatting with streaming output
  - switching/listing models
- - toggling thinking visibilit        if args[0].isdigit():
-            turn_id = int(args[0])
-            turn = ui.get_turn(turn_id)
-            if turn:
-                console.print(f"Re-running turn {turn_id}", style="cyan")
-                _run_agent_turn(agent, runtime, turn.user_text)
-            else:
-                console.print(f"No turn #{turn_id} recorded yet.", style="yellow")
-        else:
-            console.print("Usage: /rerun <turn_id>", style="yellow")
-        return True
-    if cmd == "memory_demo":
-        # Demo function to show memory events working
-        if ui:
-            ui.add_memory_event("semantic_add", "User prefers concise explanations", {"confidence": 0.85})
-            ui.add_memory_event("reflection_add", "User is working on Atlas project improvements", {"quality": 0.92})
-            ui.add_memory_event("episodic_store", f"Turn {len(ui.turns)} stored with context", {})
-            console.print("Added demo memory events", style="green")
-        return True
-    if cmd == "kill":ng log level
+ - toggling thinking visibility
+ - adjusting log level
+ - managing objectives, memory, and tools
 """
 from __future__ import annotations
 import json

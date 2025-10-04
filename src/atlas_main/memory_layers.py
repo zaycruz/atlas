@@ -1254,9 +1254,9 @@ class LayeredMemoryConfig:
         if self.min_reflection_confidence is None:
             self.min_reflection_confidence = self._float_env("ATLAS_MEMORY_MIN_REFL_CONF", default=0.6)  # Research-backed increase
         if self.min_fact_quality is None:
-            self.min_fact_quality = self._float_env("ATLAS_MEMORY_MIN_FACT_QUALITY", default=0.5)  # Research-backed increase
+            self.min_fact_quality = self._float_env("ATLAS_MEMORY_MIN_FACT_QUALITY", default=0.35)
         if self.min_reflection_quality is None:
-            self.min_reflection_quality = self._float_env("ATLAS_MEMORY_MIN_REFL_QUALITY", default=0.6)  # Research-backed increase
+            self.min_reflection_quality = self._float_env("ATLAS_MEMORY_MIN_REFL_QUALITY", default=0.45)
         self.audit_interval_turns = max(0, int(os.getenv("ATLAS_MEMORY_AUDIT_INTERVAL", self.audit_interval_turns)))
         self.audit_window = max(1, int(os.getenv("ATLAS_MEMORY_AUDIT_WINDOW", self.audit_window)))
         self.audit_sample_size = max(1, int(os.getenv("ATLAS_MEMORY_AUDIT_SAMPLE", self.audit_sample_size)))
