@@ -7,6 +7,7 @@ Supports:
  - adjusting log level
 """
 from __future__ import annotations
+import json
 import textwrap
 import time
 import logging
@@ -16,11 +17,13 @@ import os
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
-from typing import Any, Dict, Optional, List
+from rich.live import Live
+from typing import Any, Dict, Optional, List, Set
 
 from .agent import AtlasAgent
 from .ollama import OllamaClient
 from .stt import Microphone, VadSegmenter, WhisperTranscriber
+from .ui import ConversationShell
 
 ASCII_ATLAS = r"""
     █████╗ ████████╗██╗      █████╗ ███████╗
@@ -37,16 +40,17 @@ console = Console()
 def main() -> None:
     # Set up logging
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-    
+
     console.print(Panel.fit(ASCII_ATLAS, style="cyan"))
     console.print("[bold cyan]Make of this what you will.[/bold cyan]")
     console.print(textwrap.fill("Atlas ready. Type your prompt and press Enter. Use Ctrl+D or /quit to exit.", width=72))
     console.print(textwrap.fill("use /model <model> to switch the active model.", width=72))
     console.print(textwrap.fill("use /model list to view available models.", width=72))
     console.print(textwrap.fill("Atlas may call tools automatically (e.g. web_search) when extra information is needed.", width=72))
-    
+
     client = OllamaClient()
     agent = AtlasAgent(client)
+    ui = ConversationShell(console)
     runtime: Dict[str, Any] = {
         "voice_mode": "off",
         "voice_thread": None,
@@ -55,33 +59,39 @@ def main() -> None:
         "vad": None,
         "transcriber": None,
         "agent_lock": threading.Lock(),
+        "favorites": set(),
+        "ui": ui,
+        "active_turn": None,
     }
 
     try:
-        while True:
-            try:
-                user_text = console.input("[bold green]you: [/bold green]")
-            except EOFError:
-                console.print("\n[bold yellow]Goodbye.[/bold yellow]")
-                break
-            except KeyboardInterrupt:
-                console.print("\n[bold yellow](Interrupted. Type /quit to exit.)[/bold yellow]")
-                continue
-
-            stripped = user_text.strip()
-            if not stripped:
-                continue
-
-            lowered = stripped.lower()
-            if lowered in {"/quit", "/exit"}:
-                console.print("[bold yellow]Exiting.[/bold yellow]")
-                break
-
-            if stripped.startswith("/"):
-                if _handle_command(agent, stripped, runtime):
+        with Live(ui.render(), refresh_per_second=8, console=console) as live:
+            ui.register_live(live)
+            runtime["live"] = live
+            while True:
+                try:
+                    user_text = live.console.input("[bold green]you: [/bold green]")
+                except EOFError:
+                    live.console.print("\n[bold yellow]Goodbye.[/bold yellow]")
+                    break
+                except KeyboardInterrupt:
+                    live.console.print("\n[bold yellow](Interrupted. Type /quit to exit.)[/bold yellow]")
                     continue
 
-            _run_agent_turn(agent, runtime, user_text)
+                stripped = user_text.strip()
+                if not stripped:
+                    continue
+
+                lowered = stripped.lower()
+                if lowered in {"/quit", "/exit"}:
+                    live.console.print("[bold yellow]Exiting.[/bold yellow]")
+                    break
+
+                if stripped.startswith("/"):
+                    if _handle_command(agent, stripped, runtime):
+                        continue
+
+                _run_agent_turn(agent, runtime, user_text)
     finally:
         try:
             agent.close()
@@ -95,6 +105,7 @@ def _handle_command(agent: AtlasAgent, command_line: str, runtime: Dict[str, Any
     if not parts:
         return True
     cmd, *rest = parts
+    ui: ConversationShell = runtime.get("ui")
     if cmd == "help":
         _print_help()
         return True
@@ -113,6 +124,53 @@ def _handle_command(agent: AtlasAgent, command_line: str, runtime: Dict[str, Any
     if cmd == "voice":
         _handle_voice(agent, rest, runtime)
         return True
+    if cmd == "expand":
+        _handle_expand(ui, rest, True)
+        return True
+    if cmd == "collapse":
+        _handle_expand(ui, rest, False)
+        return True
+    if cmd == "pin":
+        _handle_pin(ui, rest, pin=True)
+        return True
+    if cmd == "unpin":
+        _handle_pin(ui, rest, pin=False)
+        return True
+    if cmd == "pins":
+        pinned = ui.pinned_turns if ui else []
+        if not pinned:
+            console.print("(no pinned turns yet)", style="yellow")
+        else:
+            console.print(f"Pinned turns: {', '.join(str(t) for t in pinned)}", style="cyan")
+        return True
+    if cmd == "focus":
+        _handle_focus(agent, ui, rest)
+        return True
+    if cmd == "rerun":
+        if ui and rest and rest[0].isdigit():
+            turn_id = int(rest[0])
+            turn = ui.get_turn(turn_id)
+            if turn:
+                console.print(f"Re-running turn {turn_id}", style="cyan")
+                _run_agent_turn(agent, runtime, turn.user_text)
+            else:
+                console.print(f"No turn #{turn_id} recorded yet.", style="yellow")
+        else:
+            console.print("Usage: /rerun <turn_id>", style="yellow")
+        return True
+    if cmd == "kill":
+        agent.cancel_current()
+        console.print("Kill switch engaged. Attempting to cancel current turn...", style="yellow")
+        return True
+    if cmd == "tool":
+        _handle_tool_command(agent, rest, runtime)
+        return True
+    if cmd == "feedback":
+        _handle_feedback(ui, rest)
+        return True
+    if cmd == "adjust":
+        _handle_adjust(agent, ui, rest)
+        return True
     console.print(f"Unknown command: {cmd}. Type /help for options.", style="yellow")
     return True
 
@@ -126,6 +184,13 @@ def _print_help() -> None:
     table.add_row("  /log <off|error|warn|info|debug>", "adjust logging level")
     table.add_row("  /voice <on|off|ptt>", "control voice input (always-on or push-to-talk)")
     table.add_row("  /memory ...", "inspect episodic, semantic, or reflection memory")
+    table.add_row("  /expand <id> / /collapse <id>", "toggle detail trays for a turn")
+    table.add_row("  /pin <id> / /unpin <id>", "manage pinned turns")
+    table.add_row("  /focus <mode>", "switch between focus and autopilot tool usage")
+    table.add_row("  /tool ...", "sandbox, run, or favorite tools")
+    table.add_row("  /rerun <id>", "replay a previous prompt")
+    table.add_row("  /feedback <works|issue>", "quick thumbs-up/down feedback")
+    table.add_row("  /adjust <style>", "request quick tweak of the next reply tone")
     table.add_row("  /quit", "exit the chat")
     console.print(table)
 
@@ -180,6 +245,164 @@ def _handle_voice(agent: AtlasAgent, args: list[str], runtime: Dict[str, Any]) -
     else:
         console.print("Usage: /voice <on|off|ptt>", style="yellow")
 
+
+def _handle_expand(ui: Optional[ConversationShell], args: list[str], expanded: bool) -> None:
+    if not ui:
+        console.print("UI not initialized yet.", style="yellow")
+        return
+    if not args or not args[0].isdigit():
+        console.print("Usage: /expand <turn_id>" if expanded else "Usage: /collapse <turn_id>", style="yellow")
+        return
+    turn_id = int(args[0])
+    if not ui.toggle_expand(turn_id, expanded=expanded):
+        console.print(f"No turn #{turn_id} found.", style="yellow")
+
+
+def _handle_pin(ui: Optional[ConversationShell], args: list[str], *, pin: bool) -> None:
+    if not ui:
+        console.print("UI not initialized yet.", style="yellow")
+        return
+    if not args or not args[0].isdigit():
+        console.print("Usage: /pin <turn_id>" if pin else "Usage: /unpin <turn_id>", style="yellow")
+        return
+    turn_id = int(args[0])
+    action = ui.pin_turn if pin else ui.unpin_turn
+    if not action(turn_id):
+        console.print(f"No turn #{turn_id} found.", style="yellow")
+    else:
+        console.print(("Pinned" if pin else "Unpinned") + f" turn {turn_id}.", style="green")
+
+
+def _handle_focus(agent: AtlasAgent, ui: Optional[ConversationShell], args: list[str]) -> None:
+    if not args or args[0].lower() not in {"autopilot", "focus"}:
+        console.print("Usage: /focus <autopilot|focus>", style="yellow")
+        return
+    mode = args[0].lower()
+    try:
+        agent.set_focus_mode(mode)
+    except ValueError as exc:
+        console.print(str(exc), style="red")
+        return
+    if ui:
+        ui.set_focus_mode(mode)
+    console.print(f"Focus mode set to {mode}.", style="green")
+
+
+def _handle_tool_command(agent: AtlasAgent, args: list[str], runtime: Dict[str, Any]) -> None:
+    if not args:
+        console.print("Usage: /tool <sandbox|run|list|favorite|unfavorite>", style="yellow")
+        return
+    action = args[0].lower()
+    ui: Optional[ConversationShell] = runtime.get("ui")
+    favorites: Set[str] = runtime.setdefault("favorites", set())
+    if action == "list":
+        names = list(agent.tools.list_names())
+        if not names:
+            console.print("No tools registered.", style="yellow")
+        else:
+            console.print("Tools: " + ", ".join(sorted(names)), style="cyan")
+        return
+    if action == "sandbox":
+        _tool_sandbox(agent, runtime)
+        return
+    if action == "favorite" and len(args) >= 2:
+        favorites.add(args[1])
+        if ui:
+            ui.add_quick_action(f"/tool run {args[1]}")
+        console.print(f"Favorited tool '{args[1]}'.", style="green")
+        return
+    if action == "unfavorite" and len(args) >= 2:
+        favorites.discard(args[1])
+        console.print(f"Removed favorite '{args[1]}'.", style="green")
+        return
+    if action == "run" and len(args) >= 2:
+        name = args[1]
+        payload = " ".join(args[2:])
+        arguments: Dict[str, Any] = {}
+        if payload:
+            try:
+                arguments = json.loads(payload)
+            except json.JSONDecodeError as exc:
+                console.print(f"Invalid JSON payload: {exc}", style="red")
+                return
+        try:
+            output = agent.tools.run(name, agent=agent, arguments=arguments)
+        except Exception as exc:
+            console.print(f"Tool '{name}' failed: {exc}", style="red")
+            return
+        console.print(f"[tool:{name}] {output}")
+        if ui:
+            ui.record_tool_card(name=name, output=output, arguments=arguments)
+            ui.add_quick_action(f"/tool run {name}")
+        return
+    console.print("Usage: /tool <sandbox|run|list|favorite|unfavorite>", style="yellow")
+
+
+def _handle_feedback(ui: Optional[ConversationShell], args: list[str]) -> None:
+    if not args:
+        console.print("Usage: /feedback <works|issue>", style="yellow")
+        return
+    rating = args[0].lower()
+    if rating not in {"works", "issue"}:
+        console.print("Usage: /feedback <works|issue>", style="yellow")
+        return
+    message = "Thanks for the feedback!" if rating == "works" else "Logged that you need adjustments."
+    console.print(message, style="green")
+    if ui:
+        ui.set_status(message)
+
+
+def _handle_adjust(agent: AtlasAgent, ui: Optional[ConversationShell], args: list[str]) -> None:
+    if not args:
+        console.print("Usage: /adjust <shorter|longer|formal|casual>", style="yellow")
+        return
+    choice = args[0].lower()
+    tweaks = {
+        "shorter": "Make it more concise.",
+        "longer": "Add more detail.",
+        "formal": "Adopt a more formal tone.",
+        "casual": "Relax the tone.",
+    }
+    directive = tweaks.get(choice)
+    if not directive:
+        console.print("Usage: /adjust <shorter|longer|formal|casual>", style="yellow")
+        return
+    console.print(f"Adjustment noted: {directive}", style="green")
+    if ui:
+        ui.set_status(f"Adjustment queued: {choice}")
+
+
+def _tool_sandbox(agent: AtlasAgent, runtime: Dict[str, Any]) -> None:
+    ui: Optional[ConversationShell] = runtime.get("ui")
+    favorites: Set[str] = runtime.setdefault("favorites", set())
+    console.print("[bold cyan]Tool sandbox[/bold cyan]")
+    instructions = agent.tools.render_instructions()
+    console.print(instructions or "(no tools registered)")
+    name = console.input("Tool to run (blank to cancel): ").strip()
+    if not name:
+        console.print("Sandbox cancelled.", style="yellow")
+        return
+    payload_text = console.input("Arguments JSON (blank for {}): ").strip()
+    arguments: Dict[str, Any] = {}
+    if payload_text:
+        try:
+            arguments = json.loads(payload_text)
+        except json.JSONDecodeError as exc:
+            console.print(f"Invalid JSON payload: {exc}", style="red")
+            return
+    try:
+        output = agent.tools.run(name, agent=agent, arguments=arguments)
+    except Exception as exc:
+        console.print(f"Tool '{name}' failed: {exc}", style="red")
+        return
+    console.print(f"[tool:{name}] {output}")
+    if ui:
+        ui.record_tool_card(name=name, output=output, arguments=arguments)
+        ui.add_quick_action(f"/tool run {name}")
+    mark_favorite = console.input("Mark as favorite? (y/N): ").strip().lower()
+    if mark_favorite == "y":
+        favorites.add(name)
+        console.print(f"Added '{name}' to favorites.", style="green")
 
 def _ensure_transcriber(runtime: Dict[str, Any]) -> WhisperTranscriber:
     if runtime.get("transcriber") is None:
@@ -308,16 +531,97 @@ def _process_voice_segment(agent: AtlasAgent, runtime: Dict[str, Any], segment: 
     console.print(f"[bold green]you (voice):[/bold green] {text}")
     _run_agent_turn(agent, runtime, text)
 def _run_agent_turn(agent: AtlasAgent, runtime: Dict[str, Any], prompt: str) -> None:
-    console.print("[bold cyan]atlas:[/bold cyan]")
-    buffer: List[str] = []
+    ui: Optional[ConversationShell] = runtime.get("ui")
+    if not ui:
+        console.print("[bold cyan]atlas:[/bold cyan]")
+        buffer: List[str] = []
+
+        def stream_chunk(chunk: str) -> None:
+            buffer.append(chunk)
+            console.print(chunk, end="", highlight=False, soft_wrap=True)
+
+        with runtime["agent_lock"]:
+            final_text = agent.respond(prompt, stream_callback=stream_chunk)
+        console.print("")
+        return
+
+    turn = ui.add_turn(prompt)
+    ui.start_thinking()
+    runtime["active_turn"] = turn
+    cancelled = False
 
     def stream_chunk(chunk: str) -> None:
-        buffer.append(chunk)
-        console.print(chunk, end="", highlight=False, soft_wrap=True)
+        ui.append_stream(turn, chunk)
 
-    with runtime["agent_lock"]:
-        final_text = agent.respond(prompt, stream_callback=stream_chunk)
-    console.print("")
+    def handle_event(event: str, payload: Dict[str, Any]) -> None:
+        nonlocal cancelled
+        if event == "turn_start":
+            ui.set_objective(payload.get("objective"), payload.get("tags", []))
+            ui.set_context_usage(payload.get("context_usage", {}))
+            ui.set_turn_tags(turn, payload.get("tags", []))
+        elif event == "status":
+            message = payload.get("message") or "Processing..."
+            ui.set_status(message)
+        elif event == "stream":
+            tool_calls = [name for name in payload.get("tool_calls") or [] if name]
+            if tool_calls:
+                ui.set_tool_chip("Awaiting tool: " + ", ".join(tool_calls))
+        elif event == "tool_start":
+            names = [tool.get("name") for tool in payload.get("tools", []) if tool.get("name")]
+            if names:
+                ui.set_tool_chip("Running tool: " + ", ".join(names))
+        elif event == "tool_result":
+            ui.add_tool_detail(
+                turn,
+                name=payload.get("name", "tool"),
+                arguments=payload.get("arguments", {}),
+                output=payload.get("output", ""),
+                call_id=payload.get("call_id"),
+                source=payload.get("source"),
+            )
+            call_id = payload.get("call_id")
+            if call_id:
+                ui.add_cached_ids(turn, [str(call_id)])
+            ui.set_tool_chip(None)
+        elif event == "tool_deferred":
+            tools = payload.get("tools", [])
+            if tools:
+                ui.set_status("Focus mode deferred: " + ", ".join(tools))
+        elif event == "tool_limit":
+            attempted = payload.get("attempted", 0)
+            max_calls = payload.get("max")
+            ui.set_status(f"Tool limit reached ({attempted}/{max_calls}).")
+        elif event == "turn_complete":
+            ui.set_objective(payload.get("objective"), payload.get("tags", []))
+            ui.set_context_usage(payload.get("context_usage", {}))
+            ui.set_turn_tags(turn, payload.get("tags", []))
+            ui.set_tool_chip(None)
+        elif event == "cancelled":
+            cancelled = True
+            ui.set_status(payload.get("message", "Turn cancelled."))
+
+    final_text = ""
+    try:
+        with runtime["agent_lock"]:
+            final_text = agent.respond(
+                prompt,
+                stream_callback=stream_chunk,
+                event_callback=handle_event,
+            )
+    except KeyboardInterrupt:
+        agent.cancel_current()
+        cancelled = True
+    except Exception as exc:
+        console.print(f"Error during turn: {exc}", style="red")
+        ui.set_status(f"Error: {exc}")
+        cancelled = True
+    finally:
+        runtime["active_turn"] = None
+
+    if final_text and not turn.assistant_text.strip():
+        ui.append_stream(turn, final_text)
+
+    ui.mark_turn_complete(turn, cancelled=cancelled)
 
 
 def _handle_memory(agent: AtlasAgent, args: list[str]) -> None:
