@@ -12,7 +12,8 @@ import re
 import inspect
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Callable, Dict, Any
+import threading
 from .memory import WorkingMemory
 from .memory_layers import LayeredMemoryConfig, LayeredMemoryManager, LayeredMemorySnapshot
 from .ollama import OllamaClient, OllamaError
@@ -69,6 +70,10 @@ Final Instruction: You are not just a chatbot. You are an active participant in 
 TOOL_REQUEST_RE = re.compile(r"<<tool:(?P<name>[a-zA-Z0-9_\-]+)\|(?P<payload>[\s\S]+?)>>")
 
 
+class InteractionCancelled(Exception):
+    """Raised when a turn is cancelled via the kill switch."""
+
+
 class AtlasAgent:
     def __init__(
         self,
@@ -105,6 +110,10 @@ class AtlasAgent:
         else:
             self.tools.register(WebSearchTool())
         self._debug_log_path = os.getenv("ATLAS_AGENT_LOG")
+        self._cancel_event = threading.Event()
+        self.focus_mode: str = "autopilot"
+        self._last_objective: Optional[str] = None
+        self._last_tags: set[str] = set()
 
     def close(self) -> None:
         memory = getattr(self, "layered_memory", None)
@@ -114,6 +123,23 @@ class AtlasAgent:
             memory.close()
         except Exception:
             pass
+
+    def cancel_current(self) -> None:
+        """Signal that the active turn should be cancelled."""
+        self._cancel_event.set()
+
+    def set_focus_mode(self, mode: str) -> None:
+        if mode not in {"autopilot", "focus"}:
+            raise ValueError("Focus mode must be 'autopilot' or 'focus'")
+        self.focus_mode = mode
+
+    @property
+    def last_objective(self) -> Optional[str]:
+        return self._last_objective
+
+    @property
+    def last_tags(self) -> set[str]:
+        return set(self._last_tags)
 
     # ------------------------------------------------------------------
     def _build_system_prompt(self, user_text: str) -> str:
@@ -186,7 +212,13 @@ class AtlasAgent:
             # Swallow logging errors so agent behavior remains unchanged
             pass
 
-    def respond(self, user_text: str, *, stream_callback=None) -> str:
+    def respond(
+        self,
+        user_text: str,
+        *,
+        stream_callback=None,
+        event_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    ) -> str:
         user_text = user_text.strip()
         if not user_text:
             return ""
@@ -198,16 +230,29 @@ class AtlasAgent:
             self._register_turn_tag(f"objective:{self._slug_tag(self._current_objective)}")
 
         self.working_memory.add_user(user_text)
+        self._emit_event(
+            event_callback,
+            "turn_start",
+            {
+                "user_text": user_text,
+                "objective": self._current_objective,
+                "tags": list(self._current_turn_tags),
+                "context_usage": self._context_usage_snapshot(),
+            },
+        )
+        self._cancel_event.clear()
 
         tool_calls = 0
         memory_snapshot: Optional[LayeredMemorySnapshot] = None
         if self.layered_memory:
             try:
+                self._emit_event(event_callback, "status", {"message": "Harvesting memory layers"})
                 memory_snapshot = self.layered_memory.build_snapshot(user_text, client=self.client)
             except Exception:
                 memory_snapshot = None
 
         while True:
+            self._check_cancel()
             system_content = self._build_system_prompt(user_text)
             messages = [{"role": "system", "content": system_content}]
             if memory_snapshot:
@@ -263,6 +308,7 @@ class AtlasAgent:
                 )
 
                 for chunk in self.client.chat_stream(**stream_kwargs):
+                    self._check_cancel()
                     content = chunk["content"]
                     accumulator.append(content)
                     tool_calls_accum.extend(chunk["tool_calls"])
@@ -272,12 +318,26 @@ class AtlasAgent:
                         self._kv_context = list(ctx)
                     if stream_callback:
                         stream_callback(content)
+                    self._emit_event(
+                        event_callback,
+                        "stream",
+                        {
+                            "chunk": content,
+                            "tool_calls": [call.get("function", {}).get("name") for call in chunk["tool_calls"]],
+                        },
+                    )
             except OllamaError as exc:
                 self._debug_log("chat_stream.error", {"error": str(exc)})
                 if stream_callback:
                     stream_callback(f"\n[error] {exc}")
                 message = f"I hit an error contacting Ollama: {exc}"
                 self._record_interaction(user_text, message)
+                return message
+            except InteractionCancelled:
+                message = "(interaction cancelled)"
+                self._record_interaction(user_text, message)
+                self.working_memory.add_assistant(message)
+                self._emit_event(event_callback, "cancelled", {"message": message})
                 return message
 
             full_response = "".join(accumulator)
@@ -335,10 +395,26 @@ class AtlasAgent:
                     self._record_interaction(user_text, message)
                     if stream_callback:
                         stream_callback(message)
+                    self._emit_event(
+                        event_callback,
+                        "tool_limit",
+                        {"attempted": len(tool_requests), "max": max_tool_calls},
+                    )
                     return message
 
                 tool_calls += len(tool_requests)
                 is_gpt_oss = self._is_gpt_oss_model()
+                if self.focus_mode == "focus":
+                    self._emit_event(
+                        event_callback,
+                        "tool_deferred",
+                        {"tools": [req.get("name") for req in tool_requests]},
+                    )
+                    self.working_memory.add_assistant(
+                        "Focus mode is active, so I deferred tool usage and continued with reasoning only."
+                    )
+                    visible = visible or full_response
+                    break
                 if is_gpt_oss:
                     stream_requests = [req for req in tool_requests if req.get("source") == "stream"]
                     inline_requests = [req for req in tool_requests if req.get("source") != "stream"]
@@ -360,8 +436,24 @@ class AtlasAgent:
                         description = json.dumps(request["arguments"], ensure_ascii=False)
                         self.working_memory.add_assistant(f"[tool_call] {request['name']} {description}")
 
+                self._emit_event(
+                    event_callback,
+                    "tool_start",
+                    {
+                        "tools": [
+                            {
+                                "name": req["name"],
+                                "arguments": req.get("arguments", {}),
+                                "call_id": req.get("call_id"),
+                                "source": req.get("source"),
+                            }
+                            for req in tool_requests
+                        ]
+                    },
+                )
                 outputs = self._run_tool_requests(tool_requests)
                 for request, tool_output in zip(tool_requests, outputs):
+                    self._check_cancel()
                     role = "tool" if is_gpt_oss and request.get("source") == "stream" else "assistant"
                     tool_call_id = request.get("call_id") if role == "tool" else None
                     self.working_memory.add_tool(
@@ -381,6 +473,17 @@ class AtlasAgent:
                         )
                     if stream_callback:
                         stream_callback(f"\n[tool:{request['name']}] {tool_output}\n")
+                    self._emit_event(
+                        event_callback,
+                        "tool_result",
+                        {
+                            "name": request["name"],
+                            "arguments": request.get("arguments", {}),
+                            "output": tool_output,
+                            "call_id": tool_call_id,
+                            "source": request.get("source"),
+                        },
+                    )
                 continue
 
             text = visible.strip()
@@ -390,7 +493,48 @@ class AtlasAgent:
 
             self.working_memory.add_assistant(text)
             self._record_interaction(user_text, text)
+            self._last_objective = self._current_objective
+            self._last_tags = set(self._current_turn_tags)
+            self._emit_event(
+                event_callback,
+                "turn_complete",
+                {
+                    "text": text,
+                    "objective": self._current_objective,
+                    "tags": list(self._current_turn_tags),
+                    "tools": list(self._current_turn_tools),
+                    "context_usage": self._context_usage_snapshot(),
+                },
+            )
             return text
+
+    # ------------------------------------------------------------------
+    def _emit_event(
+        self,
+        callback: Optional[Callable[[str, Dict[str, Any]], None]],
+        event: str,
+        payload: Dict[str, Any],
+    ) -> None:
+        if not callback:
+            return
+        try:
+            callback(event, payload)
+        except Exception:
+            # UI callbacks should never break the agent loop
+            pass
+
+    def _check_cancel(self) -> None:
+        if self._cancel_event.is_set():
+            raise InteractionCancelled()
+
+    def _context_usage_snapshot(self) -> Dict[str, Any]:
+        usage = {
+            "turns": len(self.working_memory.to_messages()),
+            "capacity": self.working_memory.capacity,
+        }
+        if self._kv_context is not None:
+            usage["kv_chunks"] = len(self._kv_context)
+        return usage
 
     def _make_embed_fn(self, model_name: str):
         if not model_name:
