@@ -12,6 +12,8 @@ numpy = "^1.26"
 requests = "^2.32"
 rich = "^13.7"
 crawl4ai = "^0.4.0"
+fastapi = "^0.115.0"
+uvicorn = {version = "^0.30.0", extras = ["standard"]}
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3"
