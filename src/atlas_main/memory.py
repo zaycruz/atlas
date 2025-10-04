@@ -56,6 +56,7 @@ class WorkingMemory:
     def __init__(self, capacity: int = 12) -> None:
         self.capacity = max(2, capacity)
         self._buffer: deque[dict[str, Any]] = deque(maxlen=self.capacity)
+        self._pins: list[dict[str, Any]] = []
 
     def add(self, role: str, content: str, **extra: Any) -> None:
         content = (content or "")
@@ -86,10 +87,36 @@ class WorkingMemory:
         self.add("assistant", formatted)
 
     def to_messages(self) -> list[dict[str, Any]]:
-        return list(self._buffer)
+        return [msg.copy() for msg in self._pins] + list(self._buffer)
 
     def clear(self) -> None:
         self._buffer.clear()
+        self._pins.clear()
+
+    # ------------------------------------------------------------------
+    # Pin helpers keep high-signal turns available to the agent even when
+    # the rolling buffer would ordinarily evict them. Pins are managed by
+    # the CLI and injected ahead of the recent conversation state.
+    # ------------------------------------------------------------------
+    def set_pins(self, messages: list[dict[str, Any]]) -> None:
+        cleaned: list[dict[str, Any]] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = (message.get("role") or "").strip()
+            content = (message.get("content") or "").strip()
+            if not role or not content:
+                continue
+            record = {"role": role, "content": content, "pinned": True}
+            if message.get("tool_calls"):
+                record["tool_calls"] = message["tool_calls"]
+            if message.get("tool_call_id"):
+                record["tool_call_id"] = message["tool_call_id"]
+            cleaned.append(record)
+        self._pins = cleaned
+
+    def get_pins(self) -> list[dict[str, Any]]:
+        return [msg.copy() for msg in self._pins]
 
 
 class MemoryBackend:

@@ -10,7 +10,8 @@ import json
 import os
 import re
 import inspect
-from concurrent.futures import ThreadPoolExecutor
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
 from typing import List, Optional
 from .memory import WorkingMemory
@@ -84,6 +85,7 @@ class AtlasAgent:
         self.system_prompt = system_prompt
         self.working_memory = WorkingMemory(capacity=working_memory_limit)
         self.show_thinking = True
+        self.focus_mode = False
         # KV context buffer reused across turns (opt-in via ATLAS_KV_CACHE != "0")
         self._kv_context = [] if os.getenv("ATLAS_KV_CACHE", "1") != "0" else None
         # Tools available to the agent
@@ -186,7 +188,14 @@ class AtlasAgent:
             # Swallow logging errors so agent behavior remains unchanged
             pass
 
-    def respond(self, user_text: str, *, stream_callback=None) -> str:
+    def respond(
+        self,
+        user_text: str,
+        *,
+        stream_callback=None,
+        event_callback=None,
+        abort_event: Optional[threading.Event] = None,
+    ) -> str:
         user_text = user_text.strip()
         if not user_text:
             return ""
@@ -198,6 +207,8 @@ class AtlasAgent:
             self._register_turn_tag(f"objective:{self._slug_tag(self._current_objective)}")
 
         self.working_memory.add_user(user_text)
+        if hasattr(self, "last_turn_report"):
+            self.last_turn_report = None
 
         tool_calls = 0
         memory_snapshot: Optional[LayeredMemorySnapshot] = None
@@ -219,6 +230,7 @@ class AtlasAgent:
             accumulator: list[str] = []
             tool_calls_accum: list[dict] = []
             supports_think = False
+            executed_tools: list[dict] = []
             try:
                 # Build kwargs for chat_stream, adding 'context' only if supported
                 stream_kwargs = {
@@ -261,6 +273,9 @@ class AtlasAgent:
                         ],
                     },
                 )
+
+                if event_callback:
+                    event_callback({"type": "thinking_start", "messages": len(messages)})
 
                 for chunk in self.client.chat_stream(**stream_kwargs):
                     content = chunk["content"]
@@ -327,6 +342,11 @@ class AtlasAgent:
                         }
                     )
 
+            if tool_requests and getattr(self, "focus_mode", False):
+                if event_callback:
+                    event_callback({"type": "tool_skipped", "requests": tool_requests})
+                tool_requests = []
+
             if tool_requests:
                 max_tool_calls = self._max_tool_calls()
                 if tool_calls + len(tool_requests) > max_tool_calls:
@@ -335,6 +355,14 @@ class AtlasAgent:
                     self._record_interaction(user_text, message)
                     if stream_callback:
                         stream_callback(message)
+                    if event_callback:
+                        event_callback(
+                            {
+                                "type": "tool_limit",
+                                "count": tool_calls + len(tool_requests),
+                                "limit": max_tool_calls,
+                            }
+                        )
                     return message
 
                 tool_calls += len(tool_requests)
@@ -360,7 +388,14 @@ class AtlasAgent:
                         description = json.dumps(request["arguments"], ensure_ascii=False)
                         self.working_memory.add_assistant(f"[tool_call] {request['name']} {description}")
 
-                outputs = self._run_tool_requests(tool_requests)
+                if abort_event and abort_event.is_set():
+                    return "(operation cancelled by user)"
+
+                outputs = self._run_tool_requests(
+                    tool_requests,
+                    event_callback=event_callback,
+                    abort_event=abort_event,
+                )
                 for request, tool_output in zip(tool_requests, outputs):
                     role = "tool" if is_gpt_oss and request.get("source") == "stream" else "assistant"
                     tool_call_id = request.get("call_id") if role == "tool" else None
@@ -381,6 +416,15 @@ class AtlasAgent:
                         )
                     if stream_callback:
                         stream_callback(f"\n[tool:{request['name']}] {tool_output}\n")
+                    executed_tools.append(
+                        {
+                            "name": request.get("name"),
+                            "arguments": request.get("arguments", {}),
+                            "call_id": request.get("call_id"),
+                            "source": request.get("source"),
+                            "output": tool_output,
+                        }
+                    )
                 continue
 
             text = visible.strip()
@@ -390,6 +434,32 @@ class AtlasAgent:
 
             self.working_memory.add_assistant(text)
             self._record_interaction(user_text, text)
+            self.last_turn_report = {
+                "prompt": user_text,
+                "raw_response": full_response,
+                "visible_response": text,
+                "tool_requests": tool_requests,
+                "executed_tools": executed_tools,
+                "tags": sorted(self._current_turn_tags),
+                "tools": sorted(self._current_turn_tools),
+                "objective": self._current_objective,
+                "kv_context": len(self._kv_context or []) if self._kv_context is not None else 0,
+                "working_memory_size": len(self.working_memory.to_messages()),
+                "memory_snapshot": {
+                    "summary": getattr(memory_snapshot, "summary", None) if memory_snapshot else None,
+                    "rendered": getattr(memory_snapshot, "rendered", None) if memory_snapshot else None,
+                },
+            }
+            if event_callback:
+                event_callback(
+                    {
+                        "type": "turn_complete",
+                        "response": text,
+                        "tools": executed_tools,
+                        "tags": sorted(self._current_turn_tags),
+                        "objective": self._current_objective,
+                    }
+                )
             return text
 
     def _make_embed_fn(self, model_name: str):
@@ -490,13 +560,48 @@ class AtlasAgent:
             pass
         return {"query": payload}
 
-    def _run_tool_requests(self, requests: list[dict]) -> list[str]:
+    def _run_tool_requests(
+        self,
+        requests: list[dict],
+        *,
+        event_callback=None,
+        abort_event: Optional[threading.Event] = None,
+    ) -> list[str]:
         if not requests:
             return []
         max_workers = max(1, min(len(requests), 4))
+        results: list[Optional[str]] = [None] * len(requests)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(self._run_tool_request, request) for request in requests]
-            return [future.result() for future in futures]
+            futures: list[tuple[int, Future[str]]] = []
+            for idx, request in enumerate(requests):
+                if abort_event and abort_event.is_set():
+                    break
+                if event_callback:
+                    event_callback({"type": "tool_start", "request": request})
+                futures.append((idx, executor.submit(self._run_tool_request, request)))
+            for idx, future in futures:
+                if abort_event and abort_event.is_set():
+                    future.cancel()
+                    results[idx] = "(cancelled)"
+                    if event_callback:
+                        event_callback(
+                            {
+                                "type": "tool_cancelled",
+                                "request": requests[idx],
+                            }
+                        )
+                    continue
+                output = future.result()
+                results[idx] = output
+                if event_callback:
+                    event_callback(
+                        {
+                            "type": "tool_result",
+                            "request": requests[idx],
+                            "output": output,
+                        }
+                    )
+        return [res if res is not None else "(cancelled)" for res in results]
 
     def _run_tool_request(self, request: dict) -> str:
         name = request.get("name", "")
