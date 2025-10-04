@@ -3,8 +3,26 @@
 Supports:
  - chatting with streaming output
  - switching/listing models
- - toggling thinking visibility
- - adjusting log level
+ - toggling thinking visibilit        if args[0].isdigit():
+            turn_id = int(args[0])
+            turn = ui.get_turn(turn_id)
+            if turn:
+                console.print(f"Re-running turn {turn_id}", style="cyan")
+                _run_agent_turn(agent, runtime, turn.user_text)
+            else:
+                console.print(f"No turn #{turn_id} recorded yet.", style="yellow")
+        else:
+            console.print("Usage: /rerun <turn_id>", style="yellow")
+        return True
+    if cmd == "memory_demo":
+        # Demo function to show memory events working
+        if ui:
+            ui.add_memory_event("semantic_add", "User prefers concise explanations", {"confidence": 0.85})
+            ui.add_memory_event("reflection_add", "User is working on Atlas project improvements", {"quality": 0.92})
+            ui.add_memory_event("episodic_store", f"Turn {len(ui.turns)} stored with context", {})
+            console.print("Added demo memory events", style="green")
+        return True
+    if cmd == "kill":ng log level
 """
 from __future__ import annotations
 import json
@@ -65,16 +83,21 @@ def main() -> None:
     }
 
     try:
-        with Live(ui.render(), refresh_per_second=8, console=console) as live:
+        with Live(ui.render(), refresh_per_second=2, console=console) as live:
             ui.register_live(live)
             runtime["live"] = live
             while True:
                 try:
-                    user_text = live.console.input("[bold green]you: [/bold green]")
+                    # Pause live updates during input to improve visibility
+                    live.stop()
+                    user_text = console.input("[dim]> [/dim]")
+                    live.start()
                 except EOFError:
+                    live.start()  # Ensure live is restarted
                     live.console.print("\n[bold yellow]Goodbye.[/bold yellow]")
                     break
                 except KeyboardInterrupt:
+                    live.start()  # Ensure live is restarted
                     live.console.print("\n[bold yellow](Interrupted. Type /quit to exit.)[/bold yellow]")
                     continue
 
@@ -123,6 +146,24 @@ def _handle_command(agent: AtlasAgent, command_line: str, runtime: Dict[str, Any
         return True
     if cmd == "voice":
         _handle_voice(agent, rest, runtime)
+        return True
+    if cmd == "scroll":
+        _handle_scroll(ui, rest)
+        return True
+    if cmd == "up":
+        _handle_scroll(ui, ["up"])
+        return True
+    if cmd == "down":
+        _handle_scroll(ui, ["down"])
+        return True
+    if cmd == "top":
+        _handle_scroll(ui, ["top"])
+        return True
+    if cmd == "bottom":
+        _handle_scroll(ui, ["bottom"])
+        return True
+    if cmd == "test":
+        _handle_test_mode(agent, rest, runtime)
         return True
     if cmd == "expand":
         _handle_expand(ui, rest, True)
@@ -184,11 +225,15 @@ def _print_help() -> None:
     table.add_row("  /log <off|error|warn|info|debug>", "adjust logging level")
     table.add_row("  /voice <on|off|ptt>", "control voice input (always-on or push-to-talk)")
     table.add_row("  /memory ...", "inspect episodic, semantic, or reflection memory")
+    table.add_row("  /test <on|off>", "toggle test mode (disables memory logging)")
+    table.add_row("  /scroll <up|down|top|bottom|#>", "navigate conversation history")
+    table.add_row("  /up / /down / /top / /bottom", "scroll conversation shortcuts")
     table.add_row("  /expand <id> / /collapse <id>", "toggle detail trays for a turn")
     table.add_row("  /pin <id> / /unpin <id>", "manage pinned turns")
     table.add_row("  /focus <mode>", "switch between focus and autopilot tool usage")
     table.add_row("  /tool ...", "sandbox, run, or favorite tools")
     table.add_row("  /rerun <id>", "replay a previous prompt")
+    table.add_row("  /memory_demo", "add demo memory events (testing)")
     table.add_row("  /feedback <works|issue>", "quick thumbs-up/down feedback")
     table.add_row("  /adjust <style>", "request quick tweak of the next reply tone")
     table.add_row("  /quit", "exit the chat")
@@ -244,6 +289,106 @@ def _handle_voice(agent: AtlasAgent, args: list[str], runtime: Dict[str, Any]) -
         _push_to_talk(agent, runtime)
     else:
         console.print("Usage: /voice <on|off|ptt>", style="yellow")
+
+
+def _handle_scroll(ui: Optional[ConversationShell], args: list[str]) -> None:
+    """Handle conversation scrolling commands."""
+    if not ui:
+        console.print("UI not initialized yet.", style="yellow")
+        return
+    
+    if not args:
+        console.print("Usage: /scroll <up|down|top|bottom|#>", style="yellow")
+        return
+    
+    action = args[0].lower()
+    total_turns = len(ui.turns)
+    
+    if total_turns <= ui.max_visible_turns:
+        console.print("All conversation turns are visible.", style="dim")
+        return
+    
+    if action == "up":
+        # Scroll up (show older messages)
+        max_offset = total_turns - ui.max_visible_turns
+        ui.scroll_offset = min(ui.scroll_offset + 3, max_offset)
+        ui.auto_scroll = False
+        console.print(f"Scrolled up (offset: {ui.scroll_offset})", style="cyan")
+        
+    elif action == "down":
+        # Scroll down (show newer messages)
+        ui.scroll_offset = max(ui.scroll_offset - 3, 0)
+        if ui.scroll_offset == 0:
+            ui.auto_scroll = True
+        console.print(f"Scrolled down (offset: {ui.scroll_offset})", style="cyan")
+        
+    elif action == "top":
+        # Jump to oldest messages
+        ui.scroll_offset = total_turns - ui.max_visible_turns
+        ui.auto_scroll = False
+        console.print("Jumped to oldest conversation turns", style="cyan")
+        
+    elif action == "bottom":
+        # Jump to latest messages
+        ui.scroll_offset = 0
+        ui.auto_scroll = True
+        console.print("Jumped to latest conversation turns", style="cyan")
+        
+    elif action.isdigit():
+        # Jump to specific turn number
+        turn_num = int(action)
+        if turn_num < 1 or turn_num > total_turns:
+            console.print(f"Turn {turn_num} doesn't exist (1-{total_turns})", style="yellow")
+            return
+        
+        # Calculate offset to show the requested turn
+        target_offset = max(0, total_turns - turn_num - ui.max_visible_turns // 2)
+        ui.scroll_offset = min(target_offset, total_turns - ui.max_visible_turns)
+        ui.auto_scroll = False
+        console.print(f"Jumped to turn {turn_num}", style="cyan")
+        
+    else:
+        console.print("Usage: /scroll <up|down|top|bottom|#>", style="yellow")
+
+
+def _handle_test_mode(agent: AtlasAgent, args: list[str], runtime: Dict[str, Any]) -> None:
+    """Handle test mode toggle - disables memory logging."""
+    ui = runtime.get("ui")
+    
+    if not args:
+        # Show current state
+        mode = "ON" if agent.test_mode else "OFF"
+        style = "yellow" if agent.test_mode else "green"
+        console.print(f"Test mode: {mode}", style=style)
+        if agent.test_mode:
+            console.print("Memory logging is DISABLED - no memories will be saved", style="yellow")
+        else:
+            console.print("Memory logging is ENABLED - memories will be saved normally", style="green")
+        console.print("Usage: /test <on|off>", style="dim")
+        return
+    
+    action = args[0].lower()
+    
+    if action == "on":
+        agent.test_mode = True
+        if ui:
+            ui.set_test_mode(True)
+        console.print("✅ Test mode ENABLED", style="yellow")
+        console.print("   Memory logging is now DISABLED", style="dim yellow")
+        console.print("   Conversations will not be saved to episodic, semantic, or reflection memory", style="dim")
+        
+    elif action == "off":
+        agent.test_mode = False
+        if ui:
+            ui.set_test_mode(False)
+        console.print("✅ Test mode DISABLED", style="green")
+        console.print("   Memory logging is now ENABLED", style="dim green")
+        console.print("   Conversations will be saved to memory normally", style="dim")
+        
+    else:
+        console.print("Usage: /test <on|off>", style="yellow")
+        console.print("  /test on  - Enable test mode (disable memory logging)", style="dim")
+        console.print("  /test off - Disable test mode (enable memory logging)", style="dim")
 
 
 def _handle_expand(ui: Optional[ConversationShell], args: list[str], expanded: bool) -> None:
@@ -559,6 +704,10 @@ def _run_agent_turn(agent: AtlasAgent, runtime: Dict[str, Any], prompt: str) -> 
             ui.set_objective(payload.get("objective"), payload.get("tags", []))
             ui.set_context_usage(payload.get("context_usage", {}))
             ui.set_turn_tags(turn, payload.get("tags", []))
+            # Update memory stats if available
+            memory_stats = payload.get("memory_stats")
+            if memory_stats:
+                ui.update_memory_stats(memory_stats)
         elif event == "status":
             message = payload.get("message") or "Processing..."
             ui.set_status(message)
@@ -595,6 +744,10 @@ def _run_agent_turn(agent: AtlasAgent, runtime: Dict[str, Any], prompt: str) -> 
             ui.set_objective(payload.get("objective"), payload.get("tags", []))
             ui.set_context_usage(payload.get("context_usage", {}))
             ui.set_turn_tags(turn, payload.get("tags", []))
+            # Update memory stats if available
+            memory_stats = payload.get("memory_stats")
+            if memory_stats:
+                ui.update_memory_stats(memory_stats)
             ui.set_tool_chip(None)
         elif event == "cancelled":
             cancelled = True
@@ -622,6 +775,41 @@ def _run_agent_turn(agent: AtlasAgent, runtime: Dict[str, Any], prompt: str) -> 
         ui.append_stream(turn, final_text)
 
     ui.mark_turn_complete(turn, cancelled=cancelled)
+    
+    # Update memory stats after turn completion
+    try:
+        memory_stats = {}
+        
+        # Working memory stats (hybrid)
+        if hasattr(agent, 'working_memory') and agent.working_memory:
+            wm_stats = agent.working_memory.get_stats()
+            memory_stats["working_memory"] = wm_stats
+        
+        # Layered memory stats
+        if hasattr(agent, 'layered_memory') and agent.layered_memory:
+            stats = agent.layered_memory.get_statistics()
+            memory_stats.update({
+                "episodic_count": len(agent.layered_memory.episodic._records) if hasattr(agent.layered_memory.episodic, '_records') else 0,
+                "semantic_count": len(agent.layered_memory.semantic._facts) if hasattr(agent.layered_memory.semantic, '_facts') else 0,
+                "reflections_count": len(agent.layered_memory.reflections._items) if hasattr(agent.layered_memory.reflections, '_items') else 0,
+            })
+            
+            # Quality gate statistics
+            harvest_stats = stats.get("harvest", {})
+            memory_stats["quality_gates"] = {
+                "facts_accepted": harvest_stats.get("accepted_facts", 0),
+                "reflections_accepted": harvest_stats.get("accepted_reflections", 0),
+            }
+            
+            # Add memory event if this was a harvest turn (every few turns)
+            if harvest_stats.get("attempts", 0) > 0:
+                ui.add_memory_event("harvest", f"Processed turn {turn.turn_id}", harvest_stats)
+        
+        # Update UI with all memory stats
+        ui.update_memory_stats(memory_stats)
+            
+    except Exception:
+        pass  # Don't let memory stats break the UI
 
 
 def _handle_memory(agent: AtlasAgent, args: list[str]) -> None:

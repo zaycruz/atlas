@@ -1,0 +1,82 @@
+# Atlas Memory Configuration
+# Optimized for 128K context models (Qwen2.5, Qwen3, GPT-OSS)
+
+# Working Memory (Hybrid Token-Aware System)
+working_memory:
+  max_turns: 20                    # Primary limit (conversation flow)
+  token_budget: 96000              # 128K context - 32K buffer = 96K for working memory
+  max_token_budget: 120000         # Near full 128K context utilization
+  enable_token_awareness: true     # Hybrid mode enabled
+  preserve_important: true         # Keep pinned/expanded turns
+  eviction_strategy: "oldest_first"
+
+# Memory Layers (Research-backed increases)
+memory_layers:
+  episodic:
+    max_records: 5000              # Conversation history (+150% from 2000)
+    chunk_size: 100                # Batch processing
+    retrieval_k: 5                 # Retrieved items (+67% from 3)
+  
+  semantic:
+    max_items: 800                 # Facts/knowledge (+100% from 400)
+    dedup_threshold: 0.9           # Similarity cutoff
+    retrieval_k: 5                 # Retrieved facts (+67% from 3)
+    min_confidence: 0.7            # Quality gate (research-backed)
+  
+  reflections:
+    max_items: 400                 # Insights/lessons (+100% from 200)
+    decay_factor: 0.95             # Temporal decay
+    retrieval_k: 4                 # Retrieved insights (+33% from 3)
+    min_quality: 0.6               # Quality gate (research-backed)
+
+# Quality Gates (MemGPT/Letta inspired)
+quality_gates:
+  enable_quality_filtering: true   # Filter low-quality items
+  min_fact_confidence: 0.7         # Confidence threshold for facts
+  min_reflection_quality: 0.6      # Quality threshold for reflections
+  enable_critic: true              # LLM critic validation
+  adaptive_thresholds: true        # Learn optimal cutoffs
+
+# Performance Tuning
+performance:
+  batch_size: 50                   # Processing batch size
+  cache_size: 100                  # LRU cache size
+  index_rebuild_threshold: 1000    # Search index rebuild
+  enable_token_estimation: true    # 4 chars ≈ 1 token
+
+# UI & Monitoring
+monitoring:
+  enable_memory_panel: true        # Memory panel in UI
+  event_history_size: 100          # Memory event tracking
+  stats_update_interval: 2.0      # UI refresh rate (seconds)
+  show_capacity_warnings: true     # Warn at 90% capacity
+
+# Environment-specific Overrides
+profiles:
+  development:
+    working_memory:
+      max_turns: 15                # Smaller for development
+      token_budget: 64000          # 64K for development (still generous)
+    memory_layers:
+      episodic:
+        max_records: 3000
+  
+  production:
+    working_memory:
+      max_turns: 30                # Larger for production
+      token_budget: 110000         # Near full 128K utilization
+    memory_layers:
+      episodic:
+        max_records: 10000         # More history in production
+  
+  high_memory:
+    working_memory:
+      max_turns: 50                # Very aggressive settings for 128K models
+      token_budget: 120000         # Almost full context
+    memory_layers:
+      episodic:
+        max_records: 20000
+      semantic:
+        max_items: 2000
+      reflections:
+        max_items: 1000

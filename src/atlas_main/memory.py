@@ -8,7 +8,7 @@ import uuid
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, List, Optional, Sequence
+from typing import Any, Callable, Iterable, List, Optional, Sequence, Dict
 
 import numpy as np
 import os
@@ -21,6 +21,22 @@ except Exception:  # pragma: no cover - type hint only
 
 
 EmbeddingFunction = Callable[[str], Optional[Sequence[float]]]
+
+
+@dataclass
+class WorkingMemoryConfig:
+    """Configuration for hybrid token-aware working memory"""
+    max_turns: int = 20                    # Primary limit (conversation flow)
+    token_budget: int = 96000              # 128K context - 32K buffer = 96K for working memory
+    max_token_budget: int = 120000         # Near full 128K context utilization
+    enable_token_awareness: bool = True    # Hybrid mode toggle
+    preserve_important: bool = True        # Keep pinned/expanded turns
+    eviction_strategy: str = "oldest_first"  # "oldest_first" | "least_important"
+
+
+def _estimate_tokens(text: str) -> int:
+    """Estimate token count using 4 chars ≈ 1 token (85-90% accuracy)"""
+    return int(len(text) / 4)
 
 
 @dataclass
@@ -48,6 +64,143 @@ class MemoryRecord:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+class HybridWorkingMemory:
+    """Hybrid token-aware working memory with turn and token limits."""
+
+    def __init__(self, config: Optional[WorkingMemoryConfig] = None) -> None:
+        self.config = config or WorkingMemoryConfig()
+        self._buffer: deque[dict[str, Any]] = deque()
+        self._token_cache: Dict[str, int] = {}
+
+    def _calculate_message_tokens(self, message: dict[str, Any]) -> int:
+        """Calculate tokens for a single message."""
+        content = str(message.get("content", ""))
+        # Cache token calculations for performance
+        if content in self._token_cache:
+            return self._token_cache[content]
+        
+        tokens = _estimate_tokens(content)
+        self._token_cache[content] = tokens
+        return tokens
+
+    def _calculate_total_tokens(self) -> int:
+        """Calculate total tokens in working memory."""
+        return sum(self._calculate_message_tokens(msg) for msg in self._buffer)
+
+    def _is_important_message(self, message: dict[str, Any]) -> bool:
+        """Check if message should be preserved during eviction."""
+        if not self.config.preserve_important:
+            return False
+        
+        # Check for important markers
+        return bool(
+            message.get("pinned") or 
+            message.get("expanded") or 
+            message.get("tool_call_id") or
+            message.get("tool_name")
+        )
+
+    def should_evict(self) -> bool:
+        """Check if eviction needed based on hybrid limits."""
+        # Primary check: turn count
+        if len(self._buffer) > self.config.max_turns:
+            return True
+        
+        # Secondary check: token budget (if enabled)
+        if self.config.enable_token_awareness:
+            total_tokens = self._calculate_total_tokens()
+            return total_tokens > self.config.token_budget
+        
+        return False
+
+    def _evict_oldest_unimportant(self) -> Optional[dict[str, Any]]:
+        """Evict oldest non-important message."""
+        for i, message in enumerate(self._buffer):
+            if not self._is_important_message(message):
+                return self._buffer.popleft() if i == 0 else None
+        return None
+
+    def _evict_oldest(self) -> Optional[dict[str, Any]]:
+        """Evict oldest message regardless of importance."""
+        return self._buffer.popleft() if self._buffer else None
+
+    def evict_if_needed(self) -> List[dict[str, Any]]:
+        """Evict messages if limits exceeded."""
+        evicted = []
+        
+        while self.should_evict() and self._buffer:
+            # Try to evict unimportant messages first
+            if self.config.preserve_important:
+                evicted_msg = self._evict_oldest_unimportant()
+                if evicted_msg:
+                    evicted.append(evicted_msg)
+                    continue
+            
+            # If no unimportant messages or preservation disabled, evict oldest
+            evicted_msg = self._evict_oldest()
+            if evicted_msg:
+                evicted.append(evicted_msg)
+            else:
+                break
+        
+        return evicted
+
+    def add(self, role: str, content: str, **extra: Any) -> List[dict[str, Any]]:
+        """Add message and return any evicted messages."""
+        content = (content or "").strip()
+        if not content and not extra:
+            return []
+        
+        message: dict[str, Any] = {"role": role, "content": content}
+        message.update({k: v for k, v in extra.items() if v is not None})
+        
+        self._buffer.append(message)
+        return self.evict_if_needed()
+
+    def add_user(self, content: str, **extra: Any) -> List[dict[str, Any]]:
+        """Add user message and return any evicted messages."""
+        return self.add("user", content, **extra)
+
+    def add_assistant(self, content: str, **extra: Any) -> List[dict[str, Any]]:
+        """Add assistant message and return any evicted messages."""
+        return self.add("assistant", content, **extra)
+
+    def add_tool(self, name: str, content: str, *, role: str = "assistant", tool_call_id: Optional[str] = None) -> List[dict[str, Any]]:
+        """Add tool message and return any evicted messages."""
+        content = (content or "").strip()
+        if role == "tool":
+            message: dict[str, Any] = {"role": "tool", "tool_name": name or "", "content": content}
+            if tool_call_id:
+                message["tool_call_id"] = tool_call_id
+            self._buffer.append(message)
+            return self.evict_if_needed()
+        
+        if not content:
+            return []
+        
+        formatted = f"[tool:{name}]\n{content}" if name else content
+        return self.add("assistant", formatted, tool_name=name)
+
+    def to_messages(self) -> list[dict[str, Any]]:
+        """Get all messages as a list."""
+        return list(self._buffer)
+
+    def clear(self) -> None:
+        """Clear all messages and cache."""
+        self._buffer.clear()
+        self._token_cache.clear()
+
+    def get_stats(self) -> dict[str, Any]:
+        """Get memory statistics."""
+        return {
+            "turns": len(self._buffer),
+            "tokens": self._calculate_total_tokens(),
+            "capacity_pct": (len(self._buffer) / self.config.max_turns) * 100,
+            "token_pct": (self._calculate_total_tokens() / self.config.token_budget) * 100 if self.config.enable_token_awareness else 0,
+            "important_messages": sum(1 for msg in self._buffer if self._is_important_message(msg))
+        }
 
 
 class WorkingMemory:

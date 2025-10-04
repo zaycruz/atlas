@@ -1204,12 +1204,17 @@ class LayeredMemoryConfig:
     min_reflection_confidence: Optional[float] = None
     min_fact_quality: Optional[float] = None
     min_reflection_quality: Optional[float] = None
-    prune_semantic_max_items: int = 400
-    prune_reflections_max_items: int = 200
-    max_episodic_records: int = 2000
-    k_ep: int = 3
-    k_facts: int = 3
-    k_reflections: int = 3
+    
+    # Enhanced memory layer limits (research-backed increases)
+    prune_semantic_max_items: int = 800        # Increased from 400 (+100%)
+    prune_reflections_max_items: int = 400     # Increased from 200 (+100%)
+    max_episodic_records: int = 5000           # Increased from 2000 (+150%)
+    
+    # Enhanced retrieval parameters
+    k_ep: int = 5                              # Increased from 3 (+67%)
+    k_facts: int = 5                           # Increased from 3 (+67%)
+    k_reflections: int = 4                     # Increased from 3 (+33%)
+    
     summary_style: str = "bullets"
     audit_interval_turns: int = 12
     audit_window: int = 6
@@ -1245,13 +1250,13 @@ class LayeredMemoryConfig:
             self.critic_model = (configured or self.memory_model or "phi3:latest").strip()
         self.critic_enabled = self._bool_env("ATLAS_MEMORY_CRITIC", default=self.critic_enabled)
         if self.min_fact_confidence is None:
-            self.min_fact_confidence = self._float_env("ATLAS_MEMORY_MIN_FACT_CONF", default=0.6)
+            self.min_fact_confidence = self._float_env("ATLAS_MEMORY_MIN_FACT_CONF", default=0.7)  # Research-backed increase
         if self.min_reflection_confidence is None:
-            self.min_reflection_confidence = self._float_env("ATLAS_MEMORY_MIN_REFL_CONF", default=0.5)
+            self.min_reflection_confidence = self._float_env("ATLAS_MEMORY_MIN_REFL_CONF", default=0.6)  # Research-backed increase
         if self.min_fact_quality is None:
-            self.min_fact_quality = self._float_env("ATLAS_MEMORY_MIN_FACT_QUALITY", default=0.3)
+            self.min_fact_quality = self._float_env("ATLAS_MEMORY_MIN_FACT_QUALITY", default=0.5)  # Research-backed increase
         if self.min_reflection_quality is None:
-            self.min_reflection_quality = self._float_env("ATLAS_MEMORY_MIN_REFL_QUALITY", default=0.35)
+            self.min_reflection_quality = self._float_env("ATLAS_MEMORY_MIN_REFL_QUALITY", default=0.6)  # Research-backed increase
         self.audit_interval_turns = max(0, int(os.getenv("ATLAS_MEMORY_AUDIT_INTERVAL", self.audit_interval_turns)))
         self.audit_window = max(1, int(os.getenv("ATLAS_MEMORY_AUDIT_WINDOW", self.audit_window)))
         self.audit_sample_size = max(1, int(os.getenv("ATLAS_MEMORY_AUDIT_SAMPLE", self.audit_sample_size)))

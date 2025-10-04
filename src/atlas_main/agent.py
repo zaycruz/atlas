@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import List, Optional, Callable, Dict, Any
 import threading
-from .memory import WorkingMemory
+from .memory import WorkingMemory, HybridWorkingMemory, WorkingMemoryConfig
 from .memory_layers import LayeredMemoryConfig, LayeredMemoryManager, LayeredMemorySnapshot
 from .ollama import OllamaClient, OllamaError
 from .tools import (
@@ -31,7 +31,7 @@ from .tools import (
 )
 from .tools_browser import BrowserSession
 
-DEFAULT_CHAT_MODEL = os.getenv("ATLAS_CHAT_MODEL", "gpt-oss:latest")
+DEFAULT_CHAT_MODEL = os.getenv("ATLAS_CHAT_MODEL", "qwen3:latest")
 DEFAULT_MAX_TOOL_CALLS = 5
 DEFAULT_GPT_OSS_TOOL_LIMIT = 10
 DEFAULT_PROMPT = (
@@ -64,8 +64,10 @@ Summarizer: Whether it's the output of a long command, a file, or a webpage, pro
 
 Reasoning Protocol: Keep your internal reasoning silent by enclosing it in <think>...</think> tags. Provide the user-facing answer after those tags, separated by a blank line. Never include <think> content in the final spoken or printed reply.
 
-Final Instruction: You are not just a chatbot. You are an active participant in my workflow. Be direct, be brilliant, and let's get to work."""
-)
+Final Instruction: You are not just a chatbot. You are an active participant in my workflow. Be direct, be brilliant, and let's get to work.
+
+Think step-by-step only when the question is complex.
+""")
 
 TOOL_REQUEST_RE = re.compile(r"<<tool:(?P<name>[a-zA-Z0-9_\-]+)\|(?P<payload>[\s\S]+?)>>")
 
@@ -80,14 +82,22 @@ class AtlasAgent:
         client: OllamaClient,
         *,
         chat_model: str = DEFAULT_CHAT_MODEL,
-        working_memory_limit: int = 12,
+        working_memory_limit: int = 20,  # Updated default from research
+        working_memory_config: Optional[WorkingMemoryConfig] = None,
         system_prompt: str = DEFAULT_PROMPT,
         layered_memory_config: Optional[LayeredMemoryConfig] = None,
+        test_mode: bool = False,  # New: Disable memory logging in test mode
     ):
         self.client = client
         self.chat_model = chat_model
         self.system_prompt = system_prompt
-        self.working_memory = WorkingMemory(capacity=working_memory_limit)
+        self.test_mode = test_mode  # Store test mode flag
+        
+        # Initialize hybrid working memory with research-backed configuration
+        if working_memory_config is None:
+            working_memory_config = WorkingMemoryConfig(max_turns=working_memory_limit)
+        self.working_memory = HybridWorkingMemory(config=working_memory_config)
+        
         self.show_thinking = True
         # KV context buffer reused across turns (opt-in via ATLAS_KV_CACHE != "0")
         self._kv_context = [] if os.getenv("ATLAS_KV_CACHE", "1") != "0" else None
@@ -229,7 +239,16 @@ class AtlasAgent:
         if self._current_objective:
             self._register_turn_tag(f"objective:{self._slug_tag(self._current_objective)}")
 
-        self.working_memory.add_user(user_text)
+        # Add user message and handle any evicted messages
+        evicted = self.working_memory.add_user(user_text)
+        if evicted and event_callback:
+            # Emit event for evicted messages
+            event_callback({
+                "type": "working_memory_eviction",
+                "evicted_count": len(evicted),
+                "reason": "capacity_limit"
+            })
+            
         self._emit_event(
             event_callback,
             "turn_start",
@@ -238,13 +257,14 @@ class AtlasAgent:
                 "objective": self._current_objective,
                 "tags": list(self._current_turn_tags),
                 "context_usage": self._context_usage_snapshot(),
+                "memory_stats": self._memory_stats_snapshot(),
             },
         )
         self._cancel_event.clear()
 
         tool_calls = 0
         memory_snapshot: Optional[LayeredMemorySnapshot] = None
-        if self.layered_memory:
+        if self.layered_memory and not self.test_mode:  # Skip memory in test mode
             try:
                 self._emit_event(event_callback, "status", {"message": "Harvesting memory layers"})
                 memory_snapshot = self.layered_memory.build_snapshot(user_text, client=self.client)
@@ -504,6 +524,7 @@ class AtlasAgent:
                     "tags": list(self._current_turn_tags),
                     "tools": list(self._current_turn_tools),
                     "context_usage": self._context_usage_snapshot(),
+                    "memory_stats": self._memory_stats_snapshot(),
                 },
             )
             return text
@@ -528,13 +549,59 @@ class AtlasAgent:
             raise InteractionCancelled()
 
     def _context_usage_snapshot(self) -> Dict[str, Any]:
+        # Get hybrid working memory stats
+        wm_stats = self.working_memory.get_stats()
         usage = {
-            "turns": len(self.working_memory.to_messages()),
-            "capacity": self.working_memory.capacity,
+            "turns": wm_stats["turns"],
+            "capacity": self.working_memory.config.max_turns,
+            "tokens": wm_stats["tokens"],
+            "token_budget": self.working_memory.config.token_budget,
+            "capacity_pct": wm_stats["capacity_pct"],
+            "token_pct": wm_stats["token_pct"],
+            "important_messages": wm_stats["important_messages"],
         }
         if self._kv_context is not None:
             usage["kv_chunks"] = len(self._kv_context)
         return usage
+
+    def _memory_stats_snapshot(self) -> Dict[str, Any]:
+        """Get comprehensive memory statistics including working memory and layered memory."""
+        # Get working memory stats
+        wm_stats = self.working_memory.get_stats()
+        
+        stats = {
+            # Working memory stats (for progress bars)
+            "working_memory": {
+                "turns": wm_stats["turns"],
+                "capacity": self.working_memory.config.max_turns,
+                "tokens": wm_stats["tokens"],
+                "token_budget": self.working_memory.config.token_budget,
+                "capacity_pct": wm_stats["capacity_pct"],
+                "token_pct": wm_stats["token_pct"],
+            },
+            # Layered memory counts
+            "episodic_count": 0,
+            "semantic_count": 0,
+            "reflections_count": 0,
+            # Test mode flag
+            "test_mode": self.test_mode,
+        }
+        
+        # Add layered memory stats if available
+        if self.layered_memory:
+            layer_stats = self.layered_memory.get_stats()
+            stats.update({
+                "episodic_count": layer_stats.get("episodic_count", 0),
+                "semantic_count": layer_stats.get("semantic_count", 0),
+                "reflections_count": layer_stats.get("reflections_count", 0),
+            })
+            
+            # Add quality gate stats if available
+            quality_stats = layer_stats.get("quality_gates", {})
+            if quality_stats:
+                stats["quality_gates"] = quality_stats
+        
+        return stats
 
     def _make_embed_fn(self, model_name: str):
         if not model_name:
@@ -565,7 +632,7 @@ class AtlasAgent:
         if not assistant_text:
             return
         try:
-            if self.layered_memory:
+            if self.layered_memory and not self.test_mode:  # Skip memory processing in test mode
                 metadata = {
                     "tags": sorted(self._current_turn_tags) if hasattr(self, "_current_turn_tags") else [],
                     "objective": getattr(self, "_current_objective", None),
