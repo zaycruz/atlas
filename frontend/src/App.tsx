@@ -130,12 +130,10 @@ const DEFAULT_ATLAS_METRICS: AtlasMetrics = {
 };
 
 const App: React.FC = () => {
-  console.log('[App] Component mounting/rendering');
   const [time, setTime] = useState(() => new Date());
   const [activeModule, setActiveModule] = useState('terminal');
   const systemMetrics = useSystemMetrics();
   const { isConnected, lastMessage, sendMessage } = useWebSocket(WS_URL);
-  console.log('[App] isConnected:', isConnected);
 
   const [terminalInput, setTerminalInput] = useState('');
   const [terminalHistory, setTerminalHistory] = useState<TerminalEntry[]>(DEFAULT_TERMINAL);
@@ -172,23 +170,24 @@ const App: React.FC = () => {
   }, []);
 
   useEffect(() => {
-    console.log('[App] lastMessage changed:', lastMessage);
-    if (!lastMessage) return;
+    console.log('[App] useEffect triggered, lastMessage:', lastMessage);
+    if (!lastMessage) {
+      console.log('[App] lastMessage is null/undefined, returning early');
+      return;
+    }
 
-    console.log('[App] processing message type:', lastMessage.type);
+    console.log('[App] Received message:', lastMessage.type, lastMessage);
 
     if (lastMessage.type === 'response') {
       const text =
         typeof lastMessage.payload === 'string'
           ? lastMessage.payload
           : JSON.stringify(lastMessage.payload, null, 2);
-      console.info('[terminal] appending response', text);
-      setTerminalHistory((prev) => {
-        console.log('[terminal] current history length:', prev.length);
-        const newHistory = [...prev, { type: 'success', text: `Jarvis: ${text}` }];
-        console.log('[terminal] new history length:', newHistory.length);
-        return newHistory;
-      });
+      console.log('[App] Adding response to terminal:', text);
+      setTerminalHistory((prev) => [
+        ...prev,
+        { type: 'success', text: text }
+      ]);
     }
 
     if (lastMessage.type === 'error') {
@@ -196,7 +195,7 @@ const App: React.FC = () => {
         typeof lastMessage.payload === 'string'
           ? lastMessage.payload
           : JSON.stringify(lastMessage.payload, null, 2);
-      console.log('[terminal] appending error', text);
+      console.log('[App] Adding error to terminal:', text);
       setTerminalHistory((prev) => [
         ...prev,
         { type: 'error', text }
@@ -249,11 +248,16 @@ const App: React.FC = () => {
 
   useEffect(() => {
     if (isConnected) {
-      sendMessage({ type: 'get_metrics' });
+      console.log('[App] WebSocket connected, requesting initial metrics');
+      // Small delay to ensure connection is fully ready
+      setTimeout(() => {
+        sendMessage({ type: 'get_metrics' });
+      }, 100);
     }
   }, [isConnected, sendMessage]);
 
   const handleCommand = () => {
+    console.log('[App] handleCommand called, input:', terminalInput);
     if (!terminalInput.trim()) return;
 
     const commandText = `$ ${terminalInput.trim()}`;
@@ -262,9 +266,13 @@ const App: React.FC = () => {
       { type: 'command', text: commandText }
     ]);
 
+    console.log('[App] isConnected:', isConnected, 'sending message');
     if (isConnected) {
-      sendMessage({ type: 'command', payload: terminalInput.trim() });
+      const message = { type: 'command', payload: terminalInput.trim() };
+      console.log('[App] Sending WebSocket message:', message);
+      sendMessage(message);
     } else {
+      console.log('[App] WebSocket not connected, showing error');
       setTerminalHistory((prev) => [
         ...prev,
         { type: 'error', text: 'WebSocket disconnected. Unable to send command.' }
