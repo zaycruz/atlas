@@ -12,5 +12,17 @@ pytest_cache/
 # Local data directories
 atlas_data/
 
+# Desktop artifacts (legacy)
+atlas-desktop/
+
+# Frontend artifacts
+frontend/node_modules/
+frontend/dist/
+frontend/src-tauri/target/
+frontend/src-tauri/gen/
+frontend/tsconfig*.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts
+
 # VSCode
 .vscode/

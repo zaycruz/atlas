@@ -18,6 +18,8 @@ from typing import Any, Dict, Iterable, List, Optional
 
 import requests
 
+from .tools_browser import BrowserSession, DEFAULT_BUDGET, DEFAULT_TOPN
+
 
 USER_AGENT = "AtlasLite/1.0 (+https://github.com)"
 DEFAULT_FILE_CHUNK = 6000
@@ -51,12 +53,20 @@ class Tool:
     name: str = ""
     description: str = ""
     args_hint: str = ""
+    parameters_schema: Dict[str, Any] = {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": True,
+    }
 
     def describe(self) -> ToolDescription:
         return ToolDescription(self.name, self.description, self.args_hint)
 
     def run(self, *, agent=None, **kwargs: Any) -> str:  # pragma: no cover - interface
         raise NotImplementedError
+
+    def function_parameters(self) -> Dict[str, Any]:
+        return self.parameters_schema
 
 
 class ToolRegistry:
@@ -102,11 +112,7 @@ class ToolRegistry:
                     "function": {
                         "name": tool.name,
                         "description": tool.description,
-                        "parameters": {
-                            "type": "object",
-                            "properties": {},
-                            "additionalProperties": True,
-                        },
+                        "parameters": tool.function_parameters(),
                     },
                 }
             )
@@ -998,3 +1004,108 @@ class ListDirectoryTool(Tool):
         if len(collected) >= limit:
             lines.append("... limit reached")
         return "\n".join(lines)
+
+
+class _BrowserToolBase(Tool):
+    def __init__(self, session_resolver):
+        self._session_resolver = session_resolver
+
+    def _session(self, agent) -> BrowserSession:
+        if agent is None:
+            raise ToolError("browser tool requires agent context")
+        session = self._session_resolver(agent)
+        if session is None:
+            raise ToolError("browser session unavailable")
+        return session
+
+
+class BrowserSearchTool(_BrowserToolBase):
+    name = "browser.search"
+    description = "Federated web search with persistent browsing state."
+    args_hint = "query (str); topn (int); sources (list[str]); time_range (str); site (str); budget_tokens (int)"
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string"},
+            "topn": {"type": "integer", "minimum": 1},
+            "sources": {"type": "array", "items": {"type": "string"}},
+            "time_range": {"type": "string"},
+            "site": {"type": "string"},
+            "budget_tokens": {"type": "integer", "minimum": 256},
+        },
+        "required": ["query"],
+        "additionalProperties": False,
+    }
+
+    def run(self, *, agent=None, **kwargs: Any) -> str:  # type: ignore[override]
+        session = self._session(agent)
+        query = (kwargs.get("query") or "").strip()
+        if not query:
+            raise ToolError("browser.search requires 'query'")
+        topn = int(kwargs.get("topn") or os.getenv("ATLAS_SEARCH_TOPN", DEFAULT_TOPN))
+        sources = kwargs.get("sources")
+        time_range = kwargs.get("time_range")
+        site = kwargs.get("site")
+        budget = int(kwargs.get("budget_tokens") or DEFAULT_BUDGET)
+        result = session.search(
+            query=query,
+            topn=topn,
+            sources=sources,
+            time_range=time_range,
+            site=site,
+            budget_tokens=budget,
+        )
+        return result["pageText"]
+
+
+class BrowserOpenTool(_BrowserToolBase):
+    name = "browser.open"
+    description = "Open a search result or scroll the current page."
+    args_hint = "id (int|str); cursor (int); loc (int); num_lines (int)"
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "id": {"oneOf": [{"type": "integer"}, {"type": "string"}]},
+            "cursor": {"type": "integer"},
+            "loc": {"type": "integer"},
+            "num_lines": {"type": "integer", "minimum": -1},
+        },
+        "additionalProperties": False,
+    }
+
+    def run(self, *, agent=None, **kwargs: Any) -> str:  # type: ignore[override]
+        session = self._session(agent)
+        result = session.open(
+            id=kwargs.get("id"),
+            cursor=int(kwargs.get("cursor", -1)),
+            loc=int(kwargs.get("loc", -1)),
+            num_lines=int(kwargs.get("num_lines", -1)),
+        )
+        return result["pageText"]
+
+
+class BrowserFindTool(_BrowserToolBase):
+    name = "browser.find"
+    description = "Find text within the current browser page."
+    args_hint = "pattern (str); cursor (int)"
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "pattern": {"type": "string"},
+            "cursor": {"type": "integer"},
+        },
+        "required": ["pattern"],
+        "additionalProperties": False,
+    }
+
+    def run(self, *, agent=None, **kwargs: Any) -> str:  # type: ignore[override]
+        session = self._session(agent)
+        pattern = (kwargs.get("pattern") or "").strip()
+        if not pattern:
+            raise ToolError("browser.find requires 'pattern'")
+        result = session.find(pattern=pattern, cursor=int(kwargs.get("cursor", -1)))
+        return result["pageText"]
+
+if "__all__" not in globals():
+    __all__: List[str] = []
+__all__ += ["BrowserSearchTool", "BrowserOpenTool", "BrowserFindTool"]
