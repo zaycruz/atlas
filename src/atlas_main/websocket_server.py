@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
@@ -12,8 +13,26 @@ from typing import Any, Deque, Dict, List, Optional
 import websockets
 from websockets.server import WebSocketServerProtocol
 
-from .agent import AtlasAgent
-from .ollama import OllamaClient
+# Configure logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+if __package__:
+    from .agent import AtlasAgent
+    from .ollama import OllamaClient
+else:  # pragma: no cover - support `python websocket_server.py`
+    import sys
+    from pathlib import Path
+
+    package_root = Path(__file__).resolve().parent.parent
+    if str(package_root) not in sys.path:
+        sys.path.append(str(package_root))
+
+    from atlas_main.agent import AtlasAgent
+    from atlas_main.ollama import OllamaClient
 
 DEFAULT_MEMORY_EVENTS = [
     {"time": "09:41", "type": "EPISODE", "detail": "Reviewed system boot diagnostics."},
@@ -393,41 +412,68 @@ class AtlasWebSocketServer:
         self._closed = False
 
     async def handle_message(self, websocket: WebSocketServerProtocol, raw: str) -> None:
+        logger.debug(f"Received message: {raw[:100]}...")
         try:
             data = json.loads(raw)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse JSON: {e}")
             await self._send_error(websocket, "Invalid JSON payload")
             return
 
         msg_type = data.get("type")
+        logger.info(f"Processing message type: {msg_type}")
+
         if msg_type == "command":
             payload = data.get("payload", "")
             if not isinstance(payload, str):
                 await self._send_error(websocket, "Command payload must be a string")
                 return
+            logger.info(f"Executing command: {payload}")
             result = await self._execute_command(payload)
             await websocket.send(json.dumps({"type": "response", "payload": result}))
             metrics = self.collector.snapshot()
             await websocket.send(json.dumps({"type": "metrics", "payload": metrics}))
+        elif msg_type == "set_model":
+            payload = data.get("payload", "")
+            if not isinstance(payload, str):
+                await self._send_error(websocket, "Model payload must be a string")
+                return
+            logger.info(f"Setting model to: {payload}")
+            self.agent.set_chat_model(payload)
+            await websocket.send(json.dumps({"type": "response", "payload": f"Model switched to {payload}"}))
         elif msg_type == "get_metrics":
+            logger.debug("Sending metrics snapshot")
             metrics = self.collector.snapshot()
             await websocket.send(json.dumps({"type": "metrics", "payload": metrics}))
         else:
+            logger.warning(f"Unknown message type: {msg_type}")
             await self._send_error(websocket, f"Unknown message type: {msg_type}")
 
     async def handler(self, websocket: WebSocketServerProtocol) -> None:
+        client_info = f"{websocket.remote_address[0]}:{websocket.remote_address[1]}" if websocket.remote_address else "unknown"
+        logger.info(f"Client connected: {client_info}")
+
         try:
             async for message in websocket:
                 await self.handle_message(websocket, message)
-        except websockets.exceptions.ConnectionClosed:
+        except websockets.exceptions.ConnectionClosed as e:
+            logger.info(f"Connection closed from {client_info}: code={e.code}, reason={e.reason}")
             return
+        except Exception as e:
+            logger.error(f"Error handling connection from {client_info}: {e}", exc_info=True)
+            return
+        finally:
+            logger.info(f"Client disconnected: {client_info}")
 
     async def start(self) -> None:
+        logger.info(f"Starting WebSocket server on {self.host}:{self.port}")
         async with websockets.serve(self.handler, self.host, self.port):
+            logger.info(f"ATLAS WebSocket server running on ws://{self.host}:{self.port}")
             print(f"ATLAS WebSocket server running on ws://{self.host}:{self.port}")
             try:
                 await asyncio.Future()
             except asyncio.CancelledError:
+                logger.info("Server shutdown requested")
                 pass
 
     async def _execute_command(self, command: str) -> str:
@@ -448,6 +494,7 @@ class AtlasWebSocketServer:
         return response
 
     async def _send_error(self, websocket: WebSocketServerProtocol, message: str) -> None:
+        logger.error(f"Sending error to client: {message}")
         await websocket.send(json.dumps({"type": "error", "payload": message}))
 
     def shutdown(self) -> None:

@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Terminal chat interface for local Ollama models (ultra‑lite) with web search via Crawl4AI."
 authors = ["Your Name <you@example.com>"]
 readme = "README.md"
-packages = [{include = "atlas_main", from = "backend"}]
+packages = [{include = "atlas_main", from = "src"}]
 
 [tool.poetry.dependencies]
 python = "^3.9"
