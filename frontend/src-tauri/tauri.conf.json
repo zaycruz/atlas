@@ -4,7 +4,7 @@
   "version": "2.5.8",
   "identifier": "com.atlas.app",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "npm run dev:with-backend",
     "beforeBuildCommand": "npm run build",
     "devUrl": "http://localhost:5173",
     "frontendDist": "../dist"

@@ -133,12 +133,14 @@ const App: React.FC = () => {
   const [time, setTime] = useState(() => new Date());
   const [activeModule, setActiveModule] = useState('terminal');
   const systemMetrics = useSystemMetrics();
-  const { isConnected, lastMessage, sendMessage } = useWebSocket(WS_URL);
+  const { isConnected, messages, clearMessages, sendMessage } = useWebSocket(WS_URL);
 
   const [terminalInput, setTerminalInput] = useState('');
   const [terminalHistory, setTerminalHistory] = useState<TerminalEntry[]>(DEFAULT_TERMINAL);
   const [streamingResponse, setStreamingResponse] = useState<string>('');
   const streamingResponseRef = useRef<string>('');
+  const lastProcessedSequence = useRef<number>(0);
+  const lastConnectionId = useRef<number>(0);
   const [atlasMetrics, setAtlasMetrics] = useState<AtlasMetrics>(DEFAULT_ATLAS_METRICS);
   const [memoryLayers, setMemoryLayers] = useState<MemoryLayers>(DEFAULT_MEMORY_LAYERS);
   const [contextUsage, setContextUsage] = useState<ContextUsage>(DEFAULT_CONTEXT_USAGE);
@@ -172,102 +174,128 @@ const App: React.FC = () => {
   }, []);
 
   useEffect(() => {
-    console.log('[App] useEffect triggered, lastMessage:', lastMessage);
-    if (!lastMessage) {
-      console.log('[App] lastMessage is null/undefined, returning early');
+    if (!messages.length) {
       return;
     }
 
-    console.log('[App] Received message:', lastMessage.type, lastMessage);
+    for (const message of messages) {
+      console.log('[App] Processing message:', message.type, message);
 
-    if (lastMessage.type === 'response_chunk') {
-      const chunk = typeof lastMessage.payload === 'string' ? lastMessage.payload : '';
-      const isFinal = lastMessage.is_final === true;
+      const connectionId =
+        typeof message._connectionId === 'number' && message._connectionId > 0
+          ? message._connectionId
+          : lastConnectionId.current;
 
-      if (isFinal) {
-        // Final chunk - move accumulated response to history
-        if (streamingResponseRef.current) {
-          setTerminalHistory((prev) => [
-            ...prev,
-            { type: 'success', text: streamingResponseRef.current }
-          ]);
-        }
-        setStreamingResponse('');
+      if (connectionId !== lastConnectionId.current) {
+        console.log('[App] Detected new connection, resetting stream state');
+        lastConnectionId.current = connectionId;
+        lastProcessedSequence.current = 0;
         streamingResponseRef.current = '';
-      } else {
-        // Accumulate chunk
-        streamingResponseRef.current += chunk;
-        setStreamingResponse(streamingResponseRef.current);
+        setStreamingResponse('');
+      }
+
+      const sequence =
+        typeof message._sequence === 'number' && message._sequence > 0
+          ? message._sequence
+          : lastProcessedSequence.current + 1;
+
+      if (sequence <= lastProcessedSequence.current) {
+        console.log('[App] Message already processed, skipping');
+        continue;
+      }
+
+      lastProcessedSequence.current = sequence;
+
+      if (message.type === 'response_chunk') {
+        const chunk = typeof message.payload === 'string' ? message.payload : '';
+        const isFinal = message.is_final === true;
+
+        if (isFinal) {
+          if (streamingResponseRef.current.trim()) {
+            setTerminalHistory((prev) => [
+              ...prev,
+              { type: 'success', text: streamingResponseRef.current }
+            ]);
+          }
+          setStreamingResponse('');
+          streamingResponseRef.current = '';
+        } else {
+          setStreamingResponse((prev) => {
+            const next = prev + chunk;
+            streamingResponseRef.current = next;
+            return next;
+          });
+        }
+      }
+
+      if (message.type === 'response') {
+        const text =
+          typeof message.payload === 'string'
+            ? message.payload
+            : JSON.stringify(message.payload, null, 2);
+        setTerminalHistory((prev) => [
+          ...prev,
+          { type: 'success', text }
+        ]);
+      }
+
+      if (message.type === 'error') {
+        const text =
+          typeof message.payload === 'string'
+            ? message.payload
+            : JSON.stringify(message.payload, null, 2);
+        setTerminalHistory((prev) => [
+          ...prev,
+          { type: 'error', text }
+        ]);
+      }
+
+      if (message.type === 'metrics') {
+        const payload = message.payload as Partial<{
+          system: AtlasMetrics;
+          atlas: AtlasMetrics;
+          memoryLayers: MemoryLayers;
+          contextUsage: ContextUsage;
+          memoryEvents: MemoryEvent[];
+          toolRuns: ToolRun[];
+          topicDistribution: TopicDistribution[];
+          toolUsage: ToolUsageStats[];
+          processes: Process[];
+          fileAccess: FileAccess[];
+        }>;
+
+        if (payload.atlas) {
+          setAtlasMetrics(payload.atlas);
+        }
+        if (payload.memoryLayers) {
+          setMemoryLayers(payload.memoryLayers);
+        }
+        if (payload.contextUsage) {
+          setContextUsage(payload.contextUsage);
+        }
+        if (payload.memoryEvents) {
+          setMemoryEvents(payload.memoryEvents);
+        }
+        if (payload.toolRuns) {
+          setToolRuns(payload.toolRuns);
+        }
+        if (payload.topicDistribution) {
+          setTopicDistribution(payload.topicDistribution);
+        }
+        if (payload.toolUsage) {
+          setToolUsage(payload.toolUsage);
+        }
+        if (payload.processes) {
+          setProcesses(payload.processes);
+        }
+        if (payload.fileAccess) {
+          setFileAccess(payload.fileAccess);
+        }
       }
     }
 
-    if (lastMessage.type === 'response') {
-      const text =
-        typeof lastMessage.payload === 'string'
-          ? lastMessage.payload
-          : JSON.stringify(lastMessage.payload, null, 2);
-      console.log('[App] Adding response to terminal:', text);
-      setTerminalHistory((prev) => [
-        ...prev,
-        { type: 'success', text: text }
-      ]);
-    }
-
-    if (lastMessage.type === 'error') {
-      const text =
-        typeof lastMessage.payload === 'string'
-          ? lastMessage.payload
-          : JSON.stringify(lastMessage.payload, null, 2);
-      console.log('[App] Adding error to terminal:', text);
-      setTerminalHistory((prev) => [
-        ...prev,
-        { type: 'error', text }
-      ]);
-    }
-
-    if (lastMessage.type === 'metrics') {
-      const payload = lastMessage.payload as Partial<{
-        system: AtlasMetrics;
-        atlas: AtlasMetrics;
-        memoryLayers: MemoryLayers;
-        contextUsage: ContextUsage;
-        memoryEvents: MemoryEvent[];
-        toolRuns: ToolRun[];
-        topicDistribution: TopicDistribution[];
-        toolUsage: ToolUsageStats[];
-        processes: Process[];
-        fileAccess: FileAccess[];
-      }>;
-
-      if (payload.atlas) {
-        setAtlasMetrics(payload.atlas);
-      }
-      if (payload.memoryLayers) {
-        setMemoryLayers(payload.memoryLayers);
-      }
-      if (payload.contextUsage) {
-        setContextUsage(payload.contextUsage);
-      }
-      if (payload.memoryEvents) {
-        setMemoryEvents(payload.memoryEvents);
-      }
-      if (payload.toolRuns) {
-        setToolRuns(payload.toolRuns);
-      }
-      if (payload.topicDistribution) {
-        setTopicDistribution(payload.topicDistribution);
-      }
-      if (payload.toolUsage) {
-        setToolUsage(payload.toolUsage);
-      }
-      if (payload.processes) {
-        setProcesses(payload.processes);
-      }
-      if (payload.fileAccess) {
-        setFileAccess(payload.fileAccess);
-      }
-    }
-  }, [lastMessage]);
+    clearMessages(lastConnectionId.current, lastProcessedSequence.current);
+  }, [messages, clearMessages]);
 
   useEffect(() => {
     if (isConnected) {

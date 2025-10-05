@@ -1,14 +1,15 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { flushSync } from 'react-dom';
 
 const RECONNECT_DELAY_MS = 750;
 
 export const useWebSocket = (url: string) => {
   const [isConnected, setIsConnected] = useState(false);
-  const [lastMessage, setLastMessage] = useState<any>(null);
+  const [messageQueue, setMessageQueue] = useState<any[]>([]);
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const shouldReconnect = useRef(true);
+  const messageCounter = useRef(0);
+  const connectionId = useRef(0);
 
   useEffect(() => {
     shouldReconnect.current = true;
@@ -18,6 +19,8 @@ export const useWebSocket = (url: string) => {
 
       try {
         const ws = new WebSocket(url);
+        const currentConnectionId = ++connectionId.current;
+        messageCounter.current = 0;
         wsRef.current = ws;
 
         ws.onopen = () => {
@@ -31,13 +34,14 @@ export const useWebSocket = (url: string) => {
             console.info('[ws] RAW message received:', event.data);
             console.info('[ws] PARSED message:', data);
             console.info('[ws] message type:', data.type);
-            // Use flushSync to prevent React from batching state updates
-            // This ensures each message triggers its own render/effect
-            const newMessage = { ...data, _timestamp: Date.now() };
+            const newMessage = {
+              ...data,
+              _timestamp: Date.now(),
+              _sequence: ++messageCounter.current,
+              _connectionId: currentConnectionId
+            };
             console.info('[ws] Setting lastMessage to:', newMessage);
-            flushSync(() => {
-              setLastMessage(newMessage);
-            });
+            setMessageQueue((prev) => [...prev, newMessage]);
           } catch (error) {
             console.error('Failed to parse WebSocket message', error);
           }
@@ -88,5 +92,19 @@ export const useWebSocket = (url: string) => {
     }
   }, []);
 
-  return { isConnected, lastMessage, sendMessage };
+  const clearQueue = useCallback((connectionId: number, sequence: number) => {
+    setMessageQueue((prev) =>
+      prev.filter((message) => {
+        if (typeof message._connectionId !== 'number' || message._connectionId !== connectionId) {
+          return true;
+        }
+        if (typeof message._sequence !== 'number') {
+          return true;
+        }
+        return message._sequence > sequence;
+      })
+    );
+  }, []);
+
+  return { isConnected, messages: messageQueue, clearMessages: clearQueue, sendMessage };
 };
