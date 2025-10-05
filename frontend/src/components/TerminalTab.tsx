@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect, useRef } from 'react';
 import { Terminal } from 'lucide-react';
 import type { TerminalEntry } from '../types';
 
@@ -17,6 +17,27 @@ export const TerminalTab: React.FC<TerminalTabProps> = ({
   onCommand,
   streamingText = ''
 }) => {
+  const historyRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const node = historyRef.current;
+    if (!node) {
+      return;
+    }
+
+    const handleWheel = (event: WheelEvent) => {
+      if (!historyRef.current) return;
+      event.preventDefault();
+      event.stopPropagation();
+      historyRef.current.scrollTop += event.deltaY;
+    };
+
+    node.addEventListener('wheel', handleWheel, { passive: false });
+    return () => {
+      node.removeEventListener('wheel', handleWheel);
+    };
+  }, []);
+
   const getColorClass = (type: TerminalEntry['type']) => {
     switch (type) {
       case 'system':
@@ -41,7 +62,10 @@ export const TerminalTab: React.FC<TerminalTabProps> = ({
         <span className="text-[11px] text-atlas-yellow-400">COMMAND TERMINAL</span>
       </div>
 
-      <div className="flex-1 overflow-y-auto px-3 py-2 space-y-0.5 text-[11px]">
+      <div
+        ref={historyRef}
+        className="flex-1 overflow-y-auto px-3 py-2 space-y-0.5 text-[11px]"
+      >
         {history.map((entry, i) => (
           <div key={i} className={getColorClass(entry.type)}>
             {entry.text}
