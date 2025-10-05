@@ -75,49 +75,29 @@ class AtlasMetricsCollector:
         timestamp = datetime.now().strftime("%H:%M")
         with self.lock:
             if event == "turn_start":
-                objective = payload.get("objective") or "general focus"
-                detail = f"Objective: {objective}"
-                self._append_event("TURN", detail, timestamp)
                 context = payload.get("context_usage")
                 if isinstance(context, dict):
                     self._update_context_usage(context)
             elif event == "status":
-                message = str(payload.get("message", "")).strip()
-                if message:
-                    self._append_event("STATUS", message, timestamp)
+                pass
             elif event == "working_memory_eviction":
-                evicted = int(payload.get("evicted_count", 0))
-                detail = f"Evicted {evicted} messages from working memory."
-                self._append_event("EVICTION", detail, timestamp)
+                pass
             elif event == "tool_start":
-                tools = payload.get("tools") or []
-                for tool in tools:
-                    name = str(tool.get("name", "tool")).strip() or "tool"
-                    self._append_event("TOOL", f"Running {name}", timestamp)
+                pass
             elif event == "tool_result":
                 tool_name = str(payload.get("name", "tool")).strip() or "tool"
                 arguments = payload.get("arguments") or {}
                 output = str(payload.get("output", "")).strip()
                 self._record_tool_usage(tool_name, output, timestamp, arguments)
-                self._append_event("TOOL", f"Completed {tool_name}", timestamp)
             elif event == "tool_limit":
-                attempted = int(payload.get("attempted", 0))
-                maximum = payload.get("max")
-                detail = f"Tool limit reached ({attempted}/{maximum})."
-                self._append_event("LIMIT", detail, timestamp)
+                pass
             elif event == "tool_deferred":
-                tools = payload.get("tools") or []
-                if tools:
-                    detail = "Deferred tools: " + ", ".join(str(t) for t in tools)
-                    self._append_event("FOCUS", detail, timestamp)
+                pass
             elif event == "turn_complete":
                 summary = str(payload.get("text", "")).strip()
-                if summary:
-                    preview = summary.splitlines()[0][:140]
-                    self._append_event("TURN", f"Reply: {preview}", timestamp)
                 memory_stats = payload.get("memory_stats") or {}
                 if memory_stats:
-                    self._update_memory_layers_from_stats(memory_stats)
+                    self._update_memory_layers_from_stats(memory_stats, timestamp)
                     working = memory_stats.get("working_memory")
                     if isinstance(working, dict):
                         self._update_context_usage(working)
@@ -168,9 +148,6 @@ class AtlasMetricsCollector:
         with self.lock:
             self.command_count += 1
             self.total_inference_seconds += max(duration, 0.0)
-            status = "OK" if success else "ERR"
-            detail = f"[{status}] {command.strip()}"
-            self._append_event("COMMAND", detail, timestamp)
             self._maybe_update_processes(duration)
 
     # ------------------------------------------------------------------
@@ -227,16 +204,33 @@ class AtlasMetricsCollector:
             percentage = 0
         return {"current": current_k, "max": max_k, "percentage": percentage}
 
-    def _update_memory_layers_from_stats(self, stats: Dict[str, Any]) -> None:
+    def _record_memory_event(self, event_type: str, count: int, timestamp: Optional[str] = None) -> None:
+        label = "Semantic" if event_type.upper() == "FACT" else "Reflection"
+        plural = "memory" if count == 1 else "memories"
+        detail = f"Recorded {count} new {label.lower()} {plural}."
+        self._append_event(event_type, detail, timestamp)
+
+    def _update_memory_layers_from_stats(self, stats: Dict[str, Any], timestamp: Optional[str] = None) -> None:
+        prev_layers = dict(self.last_memory_layers)
         episodes = int(stats.get("episodic_count", 0))
         facts = int(stats.get("semantic_count", 0))
         insights = int(stats.get("reflections_count", 0))
-        if episodes or facts or insights:
-            self.last_memory_layers = {
-                "episodes": episodes,
-                "facts": facts,
-                "insights": insights,
-            }
+
+        new_layers = {
+            "episodes": episodes,
+            "facts": facts,
+            "insights": insights,
+        }
+        self.last_memory_layers = new_layers
+
+        ts = timestamp or datetime.now().strftime("%H:%M")
+        fact_delta = facts - prev_layers.get("facts", 0)
+        if fact_delta > 0:
+            self._record_memory_event("FACT", fact_delta, ts)
+
+        insight_delta = insights - prev_layers.get("insights", 0)
+        if insight_delta > 0:
+            self._record_memory_event("INSIGHT", insight_delta, ts)
 
     def _compute_memory_layers(self) -> Dict[str, int]:
         layers = {"episodes": 0, "facts": 0, "insights": 0}
