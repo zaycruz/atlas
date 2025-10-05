@@ -20,7 +20,7 @@ export const RightSidebar: React.FC<RightSidebarProps> = ({
     return 'text-atlas-cyan-400';
   };
 
-  const filled = Math.floor(contextUsage.percentage / 10);
+  const filled = Math.min(10, Math.max(0, Math.floor(contextUsage.percentage / 10)));
   const progressBar = '█'.repeat(filled) + '░'.repeat(10 - filled);
 
   return (

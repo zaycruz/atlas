@@ -34,64 +34,19 @@ else:  # pragma: no cover - support `python websocket_server.py`
     from atlas_main.agent import AtlasAgent
     from atlas_main.ollama import OllamaClient
 
-DEFAULT_MEMORY_EVENTS = [
-    {"time": "09:41", "type": "EPISODE", "detail": "Reviewed system boot diagnostics."},
-    {"time": "09:38", "type": "FACT", "detail": "Atlas connected to Ollama: qwen3:latest."},
-    {"time": "09:25", "type": "INSIGHT", "detail": "User prefers concise action plans."},
-    {"time": "09:12", "type": "EPISODE", "detail": "Indexed project workspace for quick search."},
-    {"time": "08:55", "type": "FACT", "detail": "Daily summary exported to /logs/atlas."},
-]
+DEFAULT_MEMORY_EVENTS: List[Dict[str, str]] = []
 
-DEFAULT_TOOL_RUNS = [
-    {
-        "id": "tool-4981",
-        "name": "Web Search",
-        "summary": "Gathered current market intel for AI assistants.",
-        "time": "09:32",
-    },
-    {
-        "id": "tool-4975",
-        "name": "File Read",
-        "summary": "Parsed roadmap.md for outstanding items.",
-        "time": "09:18",
-    },
-    {
-        "id": "tool-4960",
-        "name": "Shell Command",
-        "summary": "Monitored GPU utilization via nvidia-smi.",
-        "time": "08:50",
-    },
-]
+DEFAULT_TOOL_RUNS: List[Dict[str, str]] = []
 
-DEFAULT_TOPIC_DISTRIBUTION = [
-    {"topic": "System Ops", "percentage": 36},
-    {"topic": "Research", "percentage": 28},
-    {"topic": "Planning", "percentage": 22},
-    {"topic": "Support", "percentage": 14},
-]
+DEFAULT_TOPIC_DISTRIBUTION: List[Dict[str, int]] = []
 
-DEFAULT_TOOL_USAGE = [
-    {"tool": "web_search", "count": 14},
-    {"tool": "shell", "count": 9},
-    {"tool": "file_read", "count": 12},
-    {"tool": "memory_write", "count": 7},
-]
+DEFAULT_TOOL_USAGE: List[Dict[str, int]] = []
 
-DEFAULT_CONTEXT_USAGE = {"current": 18, "max": 32, "percentage": 56}
-DEFAULT_MEMORY_LAYERS = {"episodes": 124, "facts": 86, "insights": 32}
-DEFAULT_ATLAS_METRICS = {"tokens": 241_238, "operations": 128, "inference": 142}
-DEFAULT_PROCESSES = [
-    {"name": "atlas-agent", "cpu": 24, "mem": 512},
-    {"name": "ollama-server", "cpu": 36, "mem": 2048},
-    {"name": "memory-harvester", "cpu": 12, "mem": 256},
-    {"name": "context-assembler", "cpu": 18, "mem": 384},
-]
-DEFAULT_FILE_ACCESS = [
-    {"path": "~/Atlas/logs/session.log", "action": "WRITE", "time": "09:41:22"},
-    {"path": "~/Projects/atlas/notes.md", "action": "READ", "time": "09:33:08"},
-    {"path": "~/Atlas/memory/semantic.json", "action": "WRITE", "time": "09:21:45"},
-    {"path": "~/Atlas/memory/reflections.json", "action": "READ", "time": "09:18:11"},
-]
+DEFAULT_CONTEXT_USAGE = {"current": 0, "max": 0, "percentage": 0}
+DEFAULT_MEMORY_LAYERS = {"episodes": 0, "facts": 0, "insights": 0}
+DEFAULT_ATLAS_METRICS = {"tokens": 0, "operations": 0, "inference": 0}
+DEFAULT_PROCESSES: List[Dict[str, int]] = []
+DEFAULT_FILE_ACCESS: List[Dict[str, str]] = []
 
 
 class AtlasMetricsCollector:
@@ -108,9 +63,9 @@ class AtlasMetricsCollector:
         self.tool_usage_counter = Counter({item["tool"]: item["count"] for item in DEFAULT_TOOL_USAGE})
         self.topic_counter = Counter({item["topic"]: item["percentage"] for item in DEFAULT_TOPIC_DISTRIBUTION})
         self.processes = [dict(proc) for proc in DEFAULT_PROCESSES]
-        self.last_context_usage = dict(DEFAULT_CONTEXT_USAGE)
-        self.last_memory_layers = dict(DEFAULT_MEMORY_LAYERS)
-        self.last_metrics = dict(DEFAULT_ATLAS_METRICS)
+        self.last_context_usage = self._initial_context_usage()
+        self.last_memory_layers = self._compute_memory_layers()
+        self.last_metrics = self._initial_atlas_metrics()
         self._next_tool_id = 6000
 
     # ------------------------------------------------------------------
@@ -181,10 +136,7 @@ class AtlasMetricsCollector:
             self.last_metrics["operations"] = self.command_count
             self.last_metrics["inference"] = self._average_inference_ms()
 
-            if self.last_memory_layers == DEFAULT_MEMORY_LAYERS:
-                computed = self._compute_memory_layers()
-                if any(computed.values()):
-                    self.last_memory_layers = computed
+            self.last_memory_layers = self._compute_memory_layers()
 
             tool_usage = [
                 {"tool": name, "count": int(count)}
@@ -224,6 +176,28 @@ class AtlasMetricsCollector:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+    def _initial_context_usage(self) -> Dict[str, int]:
+        working = getattr(self.agent, "working_memory", None)
+        if working is not None:
+            try:
+                stats = working.get_stats()
+            except Exception:
+                stats = None
+            if isinstance(stats, dict):
+                return self._context_from_stats(stats)
+        budget = self._token_budget()
+        max_k = max(0, round(budget / 1000)) if budget else 0
+        return {"current": 0, "max": max_k, "percentage": 0}
+
+    def _initial_atlas_metrics(self) -> Dict[str, int]:
+        metrics = dict(DEFAULT_ATLAS_METRICS)
+        tokens = self._current_token_usage()
+        if tokens is not None:
+            metrics["tokens"] = tokens
+        metrics["operations"] = self.command_count
+        metrics["inference"] = self._average_inference_ms()
+        return metrics
+
     def _append_event(self, event_type: str, detail: str, timestamp: Optional[str] = None) -> None:
         if not detail:
             return
@@ -235,18 +209,23 @@ class AtlasMetricsCollector:
         self.memory_events.appendleft(entry)
 
     def _update_context_usage(self, snapshot: Dict[str, Any]) -> None:
-        tokens = int(snapshot.get("tokens", 0))
-        token_budget = int(snapshot.get("token_budget", 0)) or self._token_budget()
+        self.last_context_usage = self._context_from_stats(snapshot)
+
+    def _context_from_stats(self, stats: Dict[str, Any]) -> Dict[str, int]:
+        tokens = int(stats.get("tokens", 0))
+        token_budget = int(stats.get("token_budget", 0) or stats.get("token_limit", 0) or 0)
+        if token_budget <= 0:
+            token_budget = self._token_budget()
         current_k = max(0, round(tokens / 1000))
-        max_k = max(1, round(token_budget / 1000)) if token_budget else self.last_context_usage.get("max", 32)
-        pct = snapshot.get("token_pct")
+        max_k = max(0, round(token_budget / 1000)) if token_budget else 0
+        pct = stats.get("token_pct")
         if isinstance(pct, (int, float)):
             percentage = max(0, min(100, int(pct)))
         elif token_budget:
             percentage = max(0, min(100, int((tokens / token_budget) * 100)))
         else:
-            percentage = self.last_context_usage.get("percentage", DEFAULT_CONTEXT_USAGE["percentage"])
-        self.last_context_usage = {"current": current_k, "max": max_k, "percentage": percentage}
+            percentage = 0
+        return {"current": current_k, "max": max_k, "percentage": percentage}
 
     def _update_memory_layers_from_stats(self, stats: Dict[str, Any]) -> None:
         episodes = int(stats.get("episodic_count", 0))

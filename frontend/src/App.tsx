@@ -36,62 +36,17 @@ const DEFAULT_TERMINAL: TerminalEntry[] = [
   }
 ];
 
-const DEFAULT_MEMORY_EVENTS: MemoryEvent[] = [
-  { time: '09:41', type: 'EPISODE', detail: 'Reviewed system boot diagnostics.' },
-  { time: '09:38', type: 'FACT', detail: 'Atlas connected to Ollama: qwen3:latest.' },
-  { time: '09:25', type: 'INSIGHT', detail: 'User prefers concise action plans.' },
-  { time: '09:12', type: 'EPISODE', detail: 'Indexed project workspace for quick search.' },
-  { time: '08:55', type: 'FACT', detail: 'Daily summary exported to /logs/atlas.' }
-];
+const DEFAULT_MEMORY_EVENTS: MemoryEvent[] = [];
 
-const DEFAULT_TOOL_RUNS: ToolRun[] = [
-  {
-    id: 'tool-4981',
-    name: 'Web Search',
-    summary: 'Gathered current market intel for AI assistants.',
-    time: '09:32'
-  },
-  {
-    id: 'tool-4975',
-    name: 'File Read',
-    summary: 'Parsed roadmap.md for outstanding items.',
-    time: '09:18'
-  },
-  {
-    id: 'tool-4960',
-    name: 'Shell Command',
-    summary: 'Monitored GPU utilization via nvidia-smi.',
-    time: '08:50'
-  }
-];
+const DEFAULT_TOOL_RUNS: ToolRun[] = [];
 
-const DEFAULT_TOPICS: TopicDistribution[] = [
-  { topic: 'System Ops', percentage: 36 },
-  { topic: 'Research', percentage: 28 },
-  { topic: 'Planning', percentage: 22 },
-  { topic: 'Support', percentage: 14 }
-];
+const DEFAULT_TOPICS: TopicDistribution[] = [];
 
-const DEFAULT_TOOL_USAGE: ToolUsageStats[] = [
-  { tool: 'web_search', count: 14 },
-  { tool: 'shell', count: 9 },
-  { tool: 'file_read', count: 12 },
-  { tool: 'memory_write', count: 7 }
-];
+const DEFAULT_TOOL_USAGE: ToolUsageStats[] = [];
 
-const DEFAULT_PROCESSES: Process[] = [
-  { name: 'atlas-agent', cpu: 24, mem: 512 },
-  { name: 'ollama-server', cpu: 36, mem: 2048 },
-  { name: 'memory-harvester', cpu: 12, mem: 256 },
-  { name: 'context-assembler', cpu: 18, mem: 384 }
-];
+const DEFAULT_PROCESSES: Process[] = [];
 
-const DEFAULT_FILE_ACCESS: FileAccess[] = [
-  { path: '~/Atlas/logs/session.log', action: 'WRITE', time: '09:41:22' },
-  { path: '~/Projects/atlas/notes.md', action: 'READ', time: '09:33:08' },
-  { path: '~/Atlas/memory/semantic.json', action: 'WRITE', time: '09:21:45' },
-  { path: '~/Atlas/memory/reflections.json', action: 'READ', time: '09:18:11' }
-];
+const DEFAULT_FILE_ACCESS: FileAccess[] = [];
 
 const DEFAULT_GRAPH_NODES: GraphNode[] = [
   { id: 1, label: 'ATLAS', x: 50, y: 30, size: 'large' },
@@ -112,21 +67,21 @@ const DEFAULT_GRAPH_EDGES: GraphEdge[] = [
 ];
 
 const DEFAULT_MEMORY_LAYERS: MemoryLayers = {
-  episodes: 124,
-  facts: 86,
-  insights: 32
+  episodes: 0,
+  facts: 0,
+  insights: 0
 };
 
 const DEFAULT_CONTEXT_USAGE: ContextUsage = {
-  current: 18,
-  max: 32,
-  percentage: Math.round((18 / 32) * 100)
+  current: 0,
+  max: 0,
+  percentage: 0
 };
 
 const DEFAULT_ATLAS_METRICS: AtlasMetrics = {
-  tokens: 241_238,
-  operations: 128,
-  inference: 142
+  tokens: 0,
+  operations: 0,
+  inference: 0
 };
 
 const App: React.FC = () => {
@@ -154,23 +109,6 @@ const App: React.FC = () => {
   useEffect(() => {
     const timer = setInterval(() => setTime(new Date()), 1000);
     return () => clearInterval(timer);
-  }, []);
-
-  useEffect(() => {
-    const incrementer = setInterval(() => {
-      setAtlasMetrics((prev) => ({
-        tokens: prev.tokens + Math.floor(Math.random() * 120),
-        operations: prev.operations + 1,
-        inference: Math.max(80, Math.min(220, prev.inference + Math.floor(Math.random() * 12 - 6)))
-      }));
-      setContextUsage((prev) => {
-        const current = Math.max(8, Math.min(prev.max, prev.current + (Math.random() > 0.5 ? 1 : -1)));
-        const percentage = Math.round((current / prev.max) * 100);
-        return { ...prev, current, percentage };
-      });
-    }, 5000);
-
-    return () => clearInterval(incrementer);
   }, []);
 
   useEffect(() => {

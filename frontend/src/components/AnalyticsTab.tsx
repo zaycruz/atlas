@@ -26,7 +26,7 @@ export const AnalyticsTab: React.FC<AnalyticsTabProps> = ({
     return 'text-atlas-cyan-400';
   };
 
-  const filled = Math.floor(contextUsage.percentage / 5);
+  const filled = Math.min(20, Math.max(0, Math.floor(contextUsage.percentage / 5)));
   const progressBar = '█'.repeat(filled) + '░'.repeat(20 - filled);
 
   return (
