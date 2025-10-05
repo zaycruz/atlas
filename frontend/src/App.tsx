@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import { Header } from './components/Header';
 import { LeftSidebar } from './components/LeftSidebar';
 import { RightSidebar } from './components/RightSidebar';
@@ -138,6 +138,7 @@ const App: React.FC = () => {
   const [terminalInput, setTerminalInput] = useState('');
   const [terminalHistory, setTerminalHistory] = useState<TerminalEntry[]>(DEFAULT_TERMINAL);
   const [streamingResponse, setStreamingResponse] = useState<string>('');
+  const streamingResponseRef = useRef<string>('');
   const [atlasMetrics, setAtlasMetrics] = useState<AtlasMetrics>(DEFAULT_ATLAS_METRICS);
   const [memoryLayers, setMemoryLayers] = useState<MemoryLayers>(DEFAULT_MEMORY_LAYERS);
   const [contextUsage, setContextUsage] = useState<ContextUsage>(DEFAULT_CONTEXT_USAGE);
@@ -183,16 +184,20 @@ const App: React.FC = () => {
       const chunk = typeof lastMessage.payload === 'string' ? lastMessage.payload : '';
       const isFinal = lastMessage.is_final === true;
 
-      if (isFinal && streamingResponse) {
+      if (isFinal) {
         // Final chunk - move accumulated response to history
-        setTerminalHistory((prev) => [
-          ...prev,
-          { type: 'success', text: streamingResponse }
-        ]);
+        if (streamingResponseRef.current) {
+          setTerminalHistory((prev) => [
+            ...prev,
+            { type: 'success', text: streamingResponseRef.current }
+          ]);
+        }
         setStreamingResponse('');
-      } else if (!isFinal) {
+        streamingResponseRef.current = '';
+      } else {
         // Accumulate chunk
-        setStreamingResponse((prev) => prev + chunk);
+        streamingResponseRef.current += chunk;
+        setStreamingResponse(streamingResponseRef.current);
       }
     }
 
@@ -262,7 +267,7 @@ const App: React.FC = () => {
         setFileAccess(payload.fileAccess);
       }
     }
-  }, [lastMessage, streamingResponse]);
+  }, [lastMessage]);
 
   useEffect(() => {
     if (isConnected) {
