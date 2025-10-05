@@ -5,8 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "backend:dev": "poetry run python frontend/python-backend/main.py",
-    "dev:with-backend": "concurrently --kill-others-on-fail --kill-others --names vite,backend \"npm run dev -- --clearScreen=false\" \"poetry run python frontend/python-backend/main.py\"",
+    "backend:dev": "poetry --directory .. run python frontend/python-backend/main.py",
+    "dev:with-backend": "concurrently --kill-others-on-fail --kill-others --names vite,backend \"npm run dev -- --clearScreen=false\" \"poetry --directory .. run python frontend/python-backend/main.py\"",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "tauri:dev": "tauri dev",
