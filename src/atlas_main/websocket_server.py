@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -8,7 +9,7 @@ from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from threading import Lock
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional, Callable
 
 import websockets
 from websockets.server import WebSocketServerProtocol
@@ -52,7 +53,12 @@ DEFAULT_FILE_ACCESS: List[Dict[str, str]] = []
 class AtlasMetricsCollector:
     """Track agent activity and translate it into UI-facing metrics."""
 
-    def __init__(self, agent: AtlasAgent) -> None:
+    def __init__(
+        self,
+        agent: AtlasAgent,
+        *,
+        event_emitter: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> None:
         self.agent = agent
         self.lock = Lock()
         self.command_count = 0
@@ -67,6 +73,7 @@ class AtlasMetricsCollector:
         self.last_memory_layers = self._compute_memory_layers()
         self.last_metrics = self._initial_atlas_metrics()
         self._next_tool_id = 6000
+        self._event_emitter = event_emitter
 
     # ------------------------------------------------------------------
     # Event handling
@@ -184,6 +191,7 @@ class AtlasMetricsCollector:
             "detail": detail,
         }
         self.memory_events.appendleft(entry)
+        self._emit({"type": "memory_event", "payload": entry})
 
     def _update_context_usage(self, snapshot: Dict[str, Any]) -> None:
         self.last_context_usage = self._context_from_stats(snapshot)
@@ -209,6 +217,14 @@ class AtlasMetricsCollector:
         plural = "memory" if count == 1 else "memories"
         detail = f"Recorded {count} new {label.lower()} {plural}."
         self._append_event(event_type, detail, timestamp)
+
+    def _emit(self, event: Dict[str, Any]) -> None:
+        if self._event_emitter is None:
+            return
+        try:
+            self._event_emitter(event)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Failed to emit event %s: %s", event.get("type"), exc)
 
     def _update_memory_layers_from_stats(self, stats: Dict[str, Any], timestamp: Optional[str] = None) -> None:
         prev_layers = dict(self.last_memory_layers)
@@ -380,7 +396,9 @@ class AtlasWebSocketServer:
         self.port = port
         self.client = OllamaClient()
         self.agent = agent or AtlasAgent(self.client)
-        self.collector = AtlasMetricsCollector(self.agent)
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._subscribers: set[asyncio.Queue] = set()
+        self.collector = AtlasMetricsCollector(self.agent, event_emitter=self._queue_event)
         self._executor = ThreadPoolExecutor(max_workers=1)
         self._closed = False
 
@@ -403,8 +421,6 @@ class AtlasWebSocketServer:
                 return
             logger.info(f"Executing command: {payload}")
             await self._execute_command_streaming(websocket, payload)
-            metrics = self.collector.snapshot()
-            await websocket.send(json.dumps({"type": "metrics", "payload": metrics}))
         elif msg_type == "set_model":
             payload = data.get("payload", "")
             if not isinstance(payload, str):
@@ -425,6 +441,9 @@ class AtlasWebSocketServer:
         client_info = f"{websocket.remote_address[0]}:{websocket.remote_address[1]}" if websocket.remote_address else "unknown"
         logger.info(f"Client connected: {client_info}")
 
+        subscriber_queue = self._register_subscriber()
+        sender_task = asyncio.create_task(self._drain_queue(websocket, subscriber_queue))
+
         try:
             async for message in websocket:
                 await self.handle_message(websocket, message)
@@ -436,10 +455,15 @@ class AtlasWebSocketServer:
             return
         finally:
             logger.info(f"Client disconnected: {client_info}")
+            sender_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await sender_task
+            self._unregister_subscriber(subscriber_queue)
 
     async def start(self) -> None:
         logger.info(f"Starting WebSocket server on {self.host}:{self.port}")
         async with websockets.serve(self.handler, self.host, self.port):
+            self._loop = asyncio.get_running_loop()
             logger.info(f"ATLAS WebSocket server running on ws://{self.host}:{self.port}")
             print(f"ATLAS WebSocket server running on ws://{self.host}:{self.port}")
             try:
@@ -522,10 +546,53 @@ class AtlasWebSocketServer:
         duration = time.perf_counter() - start
         response_text = "".join(full_response)
         self.collector.record_command_result(command, response_text, duration, success=success)
+        self._queue_event({
+            "type": "metrics",
+            "payload": self.collector.snapshot()
+        })
 
     async def _send_error(self, websocket: WebSocketServerProtocol, message: str) -> None:
         logger.error(f"Sending error to client: {message}")
         await websocket.send(json.dumps({"type": "error", "payload": message}))
+
+    def _register_subscriber(self) -> asyncio.Queue:
+        queue: asyncio.Queue = asyncio.Queue(maxsize=200)
+        self._subscribers.add(queue)
+        return queue
+
+    def _unregister_subscriber(self, queue: asyncio.Queue) -> None:
+        self._subscribers.discard(queue)
+
+    async def _drain_queue(self, websocket: WebSocketServerProtocol, queue: asyncio.Queue) -> None:
+        try:
+            while True:
+                event = await queue.get()
+                await websocket.send(json.dumps(event))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Queue drain stopped for websocket %s: %s", websocket.remote_address, exc)
+
+    def _queue_event(self, event: Dict[str, Any]) -> None:
+        if not self._subscribers or self._loop is None:
+            return
+
+        for subscriber in list(self._subscribers):
+            self._loop.call_soon_threadsafe(self._enqueue_event, subscriber, dict(event))
+
+    @staticmethod
+    def _enqueue_event(queue: asyncio.Queue, event: Dict[str, Any]) -> None:
+        try:
+            queue.put_nowait(event)
+        except asyncio.QueueFull:
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            try:
+                queue.put_nowait(event)
+            except asyncio.QueueFull:
+                logger.debug("Dropping event %s due to persistent full queue", event.get("type"))
 
     def shutdown(self) -> None:
         if self._closed:
