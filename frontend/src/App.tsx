@@ -137,6 +137,7 @@ const App: React.FC = () => {
 
   const [terminalInput, setTerminalInput] = useState('');
   const [terminalHistory, setTerminalHistory] = useState<TerminalEntry[]>(DEFAULT_TERMINAL);
+  const [streamingResponse, setStreamingResponse] = useState<string>('');
   const [atlasMetrics, setAtlasMetrics] = useState<AtlasMetrics>(DEFAULT_ATLAS_METRICS);
   const [memoryLayers, setMemoryLayers] = useState<MemoryLayers>(DEFAULT_MEMORY_LAYERS);
   const [contextUsage, setContextUsage] = useState<ContextUsage>(DEFAULT_CONTEXT_USAGE);
@@ -177,6 +178,23 @@ const App: React.FC = () => {
     }
 
     console.log('[App] Received message:', lastMessage.type, lastMessage);
+
+    if (lastMessage.type === 'response_chunk') {
+      const chunk = typeof lastMessage.payload === 'string' ? lastMessage.payload : '';
+      const isFinal = lastMessage.is_final === true;
+
+      if (isFinal && streamingResponse) {
+        // Final chunk - move accumulated response to history
+        setTerminalHistory((prev) => [
+          ...prev,
+          { type: 'success', text: streamingResponse }
+        ]);
+        setStreamingResponse('');
+      } else if (!isFinal) {
+        // Accumulate chunk
+        setStreamingResponse((prev) => prev + chunk);
+      }
+    }
 
     if (lastMessage.type === 'response') {
       const text =
@@ -244,7 +262,7 @@ const App: React.FC = () => {
         setFileAccess(payload.fileAccess);
       }
     }
-  }, [lastMessage]);
+  }, [lastMessage, streamingResponse]);
 
   useEffect(() => {
     if (isConnected) {
@@ -313,6 +331,7 @@ const App: React.FC = () => {
               input={terminalInput}
               setInput={setTerminalInput}
               onCommand={handleCommand}
+              streamingText={streamingResponse}
             />
           )}
         </div>

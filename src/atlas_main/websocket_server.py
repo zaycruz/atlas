@@ -429,8 +429,7 @@ class AtlasWebSocketServer:
                 await self._send_error(websocket, "Command payload must be a string")
                 return
             logger.info(f"Executing command: {payload}")
-            result = await self._execute_command(payload)
-            await websocket.send(json.dumps({"type": "response", "payload": result}))
+            await self._execute_command_streaming(websocket, payload)
             metrics = self.collector.snapshot()
             await websocket.send(json.dumps({"type": "metrics", "payload": metrics}))
         elif msg_type == "set_model":
@@ -492,6 +491,64 @@ class AtlasWebSocketServer:
         duration = time.perf_counter() - start
         self.collector.record_command_result(command, response, duration, success=success)
         return response
+
+    async def _execute_command_streaming(self, websocket: WebSocketServerProtocol, command: str) -> None:
+        """Execute command and stream response chunks with Jarvis prefix."""
+        loop = asyncio.get_running_loop()
+        start = time.perf_counter()
+        full_response = []
+        sent_prefix = False
+
+        def run_agent_streaming():
+            """Generator that yields response chunks from agent."""
+            response_text = self.agent.respond(command, event_callback=self.collector.handle_event)
+            # Split response into chunks for streaming effect
+            words = response_text.split()
+            for i in range(0, len(words), 3):  # Send 3 words at a time
+                chunk = " ".join(words[i:i+3])
+                if i + 3 < len(words):
+                    chunk += " "
+                yield chunk
+            return response_text
+
+        try:
+            # Send initial "Jarvis: " prefix
+            await websocket.send(json.dumps({
+                "type": "response_chunk",
+                "payload": "Jarvis: ",
+                "is_final": False
+            }))
+            sent_prefix = True
+
+            # Stream the response in chunks
+            for chunk in await loop.run_in_executor(self._executor, lambda: list(run_agent_streaming())):
+                full_response.append(chunk)
+                await websocket.send(json.dumps({
+                    "type": "response_chunk",
+                    "payload": chunk,
+                    "is_final": False
+                }))
+
+            # Send final marker
+            await websocket.send(json.dumps({
+                "type": "response_chunk",
+                "payload": "",
+                "is_final": True
+            }))
+            success = True
+        except Exception as exc:  # noqa: BLE001 - surface agent failures
+            error_msg = f"Error: {exc}"
+            await websocket.send(json.dumps({
+                "type": "response_chunk",
+                "payload": error_msg if sent_prefix else f"Jarvis: {error_msg}",
+                "is_final": True
+            }))
+            full_response = [error_msg]
+            success = False
+
+        duration = time.perf_counter() - start
+        response_text = "".join(full_response)
+        self.collector.record_command_result(command, response_text, duration, success=success)
 
     async def _send_error(self, websocket: WebSocketServerProtocol, message: str) -> None:
         logger.error(f"Sending error to client: {message}")

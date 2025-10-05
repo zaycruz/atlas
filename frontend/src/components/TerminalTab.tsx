@@ -7,13 +7,15 @@ interface TerminalTabProps {
   input: string;
   setInput: (value: string) => void;
   onCommand: () => void;
+  streamingText?: string;
 }
 
 export const TerminalTab: React.FC<TerminalTabProps> = ({
   history,
   input,
   setInput,
-  onCommand
+  onCommand,
+  streamingText = ''
 }) => {
   const getColorClass = (type: TerminalEntry['type']) => {
     switch (type) {
@@ -45,6 +47,12 @@ export const TerminalTab: React.FC<TerminalTabProps> = ({
             {entry.text}
           </div>
         ))}
+        {streamingText && (
+          <div className="text-atlas-green-400 opacity-80">
+            {streamingText}
+            <span className="animate-pulse">▋</span>
+          </div>
+        )}
       </div>
 
       <div className="border-t border-atlas-green-900 px-3 py-1">
