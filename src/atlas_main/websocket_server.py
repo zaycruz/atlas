@@ -1,0 +1,479 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+from collections import Counter, deque
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from threading import Lock
+from typing import Any, Deque, Dict, List, Optional
+
+import websockets
+from websockets.server import WebSocketServerProtocol
+
+from .agent import AtlasAgent
+from .ollama import OllamaClient
+
+DEFAULT_MEMORY_EVENTS = [
+    {"time": "09:41", "type": "EPISODE", "detail": "Reviewed system boot diagnostics."},
+    {"time": "09:38", "type": "FACT", "detail": "Atlas connected to Ollama: qwen3:latest."},
+    {"time": "09:25", "type": "INSIGHT", "detail": "User prefers concise action plans."},
+    {"time": "09:12", "type": "EPISODE", "detail": "Indexed project workspace for quick search."},
+    {"time": "08:55", "type": "FACT", "detail": "Daily summary exported to /logs/atlas."},
+]
+
+DEFAULT_TOOL_RUNS = [
+    {
+        "id": "tool-4981",
+        "name": "Web Search",
+        "summary": "Gathered current market intel for AI assistants.",
+        "time": "09:32",
+    },
+    {
+        "id": "tool-4975",
+        "name": "File Read",
+        "summary": "Parsed roadmap.md for outstanding items.",
+        "time": "09:18",
+    },
+    {
+        "id": "tool-4960",
+        "name": "Shell Command",
+        "summary": "Monitored GPU utilization via nvidia-smi.",
+        "time": "08:50",
+    },
+]
+
+DEFAULT_TOPIC_DISTRIBUTION = [
+    {"topic": "System Ops", "percentage": 36},
+    {"topic": "Research", "percentage": 28},
+    {"topic": "Planning", "percentage": 22},
+    {"topic": "Support", "percentage": 14},
+]
+
+DEFAULT_TOOL_USAGE = [
+    {"tool": "web_search", "count": 14},
+    {"tool": "shell", "count": 9},
+    {"tool": "file_read", "count": 12},
+    {"tool": "memory_write", "count": 7},
+]
+
+DEFAULT_CONTEXT_USAGE = {"current": 18, "max": 32, "percentage": 56}
+DEFAULT_MEMORY_LAYERS = {"episodes": 124, "facts": 86, "insights": 32}
+DEFAULT_ATLAS_METRICS = {"tokens": 241_238, "operations": 128, "inference": 142}
+DEFAULT_PROCESSES = [
+    {"name": "atlas-agent", "cpu": 24, "mem": 512},
+    {"name": "ollama-server", "cpu": 36, "mem": 2048},
+    {"name": "memory-harvester", "cpu": 12, "mem": 256},
+    {"name": "context-assembler", "cpu": 18, "mem": 384},
+]
+DEFAULT_FILE_ACCESS = [
+    {"path": "~/Atlas/logs/session.log", "action": "WRITE", "time": "09:41:22"},
+    {"path": "~/Projects/atlas/notes.md", "action": "READ", "time": "09:33:08"},
+    {"path": "~/Atlas/memory/semantic.json", "action": "WRITE", "time": "09:21:45"},
+    {"path": "~/Atlas/memory/reflections.json", "action": "READ", "time": "09:18:11"},
+]
+
+
+class AtlasMetricsCollector:
+    """Track agent activity and translate it into UI-facing metrics."""
+
+    def __init__(self, agent: AtlasAgent) -> None:
+        self.agent = agent
+        self.lock = Lock()
+        self.command_count = 0
+        self.total_inference_seconds = 0.0
+        self.memory_events: Deque[Dict[str, str]] = deque(DEFAULT_MEMORY_EVENTS, maxlen=50)
+        self.tool_runs: Deque[Dict[str, str]] = deque(DEFAULT_TOOL_RUNS, maxlen=20)
+        self.file_access: Deque[Dict[str, str]] = deque(DEFAULT_FILE_ACCESS, maxlen=20)
+        self.tool_usage_counter = Counter({item["tool"]: item["count"] for item in DEFAULT_TOOL_USAGE})
+        self.topic_counter = Counter({item["topic"]: item["percentage"] for item in DEFAULT_TOPIC_DISTRIBUTION})
+        self.processes = [dict(proc) for proc in DEFAULT_PROCESSES]
+        self.last_context_usage = dict(DEFAULT_CONTEXT_USAGE)
+        self.last_memory_layers = dict(DEFAULT_MEMORY_LAYERS)
+        self.last_metrics = dict(DEFAULT_ATLAS_METRICS)
+        self._next_tool_id = 6000
+
+    # ------------------------------------------------------------------
+    # Event handling
+    # ------------------------------------------------------------------
+    def handle_event(self, event: str, payload: Dict[str, Any]) -> None:
+        timestamp = datetime.now().strftime("%H:%M")
+        with self.lock:
+            if event == "turn_start":
+                objective = payload.get("objective") or "general focus"
+                detail = f"Objective: {objective}"
+                self._append_event("TURN", detail, timestamp)
+                context = payload.get("context_usage")
+                if isinstance(context, dict):
+                    self._update_context_usage(context)
+            elif event == "status":
+                message = str(payload.get("message", "")).strip()
+                if message:
+                    self._append_event("STATUS", message, timestamp)
+            elif event == "working_memory_eviction":
+                evicted = int(payload.get("evicted_count", 0))
+                detail = f"Evicted {evicted} messages from working memory."
+                self._append_event("EVICTION", detail, timestamp)
+            elif event == "tool_start":
+                tools = payload.get("tools") or []
+                for tool in tools:
+                    name = str(tool.get("name", "tool")).strip() or "tool"
+                    self._append_event("TOOL", f"Running {name}", timestamp)
+            elif event == "tool_result":
+                tool_name = str(payload.get("name", "tool")).strip() or "tool"
+                arguments = payload.get("arguments") or {}
+                output = str(payload.get("output", "")).strip()
+                self._record_tool_usage(tool_name, output, timestamp, arguments)
+                self._append_event("TOOL", f"Completed {tool_name}", timestamp)
+            elif event == "tool_limit":
+                attempted = int(payload.get("attempted", 0))
+                maximum = payload.get("max")
+                detail = f"Tool limit reached ({attempted}/{maximum})."
+                self._append_event("LIMIT", detail, timestamp)
+            elif event == "tool_deferred":
+                tools = payload.get("tools") or []
+                if tools:
+                    detail = "Deferred tools: " + ", ".join(str(t) for t in tools)
+                    self._append_event("FOCUS", detail, timestamp)
+            elif event == "turn_complete":
+                summary = str(payload.get("text", "")).strip()
+                if summary:
+                    preview = summary.splitlines()[0][:140]
+                    self._append_event("TURN", f"Reply: {preview}", timestamp)
+                memory_stats = payload.get("memory_stats") or {}
+                if memory_stats:
+                    self._update_memory_layers_from_stats(memory_stats)
+                    working = memory_stats.get("working_memory")
+                    if isinstance(working, dict):
+                        self._update_context_usage(working)
+                for raw_tag in payload.get("tags", []) or []:
+                    tag = self._normalize_topic(str(raw_tag))
+                    self.topic_counter[tag] += 1
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def snapshot(self) -> Dict[str, Any]:
+        with self.lock:
+            tokens = self._current_token_usage()
+            if tokens is not None:
+                self.last_metrics["tokens"] = tokens
+            self.last_metrics["operations"] = self.command_count
+            self.last_metrics["inference"] = self._average_inference_ms()
+
+            if self.last_memory_layers == DEFAULT_MEMORY_LAYERS:
+                computed = self._compute_memory_layers()
+                if any(computed.values()):
+                    self.last_memory_layers = computed
+
+            tool_usage = [
+                {"tool": name, "count": int(count)}
+                for name, count in self.tool_usage_counter.most_common()
+            ] or list(DEFAULT_TOOL_USAGE)
+
+            snapshot = {
+                "atlas": dict(self.last_metrics),
+                "memoryLayers": dict(self.last_memory_layers),
+                "contextUsage": dict(self.last_context_usage),
+                "memoryEvents": list(self.memory_events),
+                "toolRuns": list(self.tool_runs),
+                "topicDistribution": self._topic_distribution(),
+                "toolUsage": tool_usage,
+                "processes": [dict(proc) for proc in self.processes],
+                "fileAccess": list(self.file_access),
+            }
+            return snapshot
+
+    def record_command_result(
+        self,
+        command: str,
+        response: str,
+        duration: float,
+        *,
+        success: bool,
+    ) -> None:
+        timestamp = datetime.now().strftime("%H:%M")
+        with self.lock:
+            self.command_count += 1
+            self.total_inference_seconds += max(duration, 0.0)
+            status = "OK" if success else "ERR"
+            detail = f"[{status}] {command.strip()}"
+            self._append_event("COMMAND", detail, timestamp)
+            self._maybe_update_processes(duration)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _append_event(self, event_type: str, detail: str, timestamp: Optional[str] = None) -> None:
+        if not detail:
+            return
+        entry = {
+            "time": timestamp or datetime.now().strftime("%H:%M"),
+            "type": event_type.upper(),
+            "detail": detail,
+        }
+        self.memory_events.appendleft(entry)
+
+    def _update_context_usage(self, snapshot: Dict[str, Any]) -> None:
+        tokens = int(snapshot.get("tokens", 0))
+        token_budget = int(snapshot.get("token_budget", 0)) or self._token_budget()
+        current_k = max(0, round(tokens / 1000))
+        max_k = max(1, round(token_budget / 1000)) if token_budget else self.last_context_usage.get("max", 32)
+        pct = snapshot.get("token_pct")
+        if isinstance(pct, (int, float)):
+            percentage = max(0, min(100, int(pct)))
+        elif token_budget:
+            percentage = max(0, min(100, int((tokens / token_budget) * 100)))
+        else:
+            percentage = self.last_context_usage.get("percentage", DEFAULT_CONTEXT_USAGE["percentage"])
+        self.last_context_usage = {"current": current_k, "max": max_k, "percentage": percentage}
+
+    def _update_memory_layers_from_stats(self, stats: Dict[str, Any]) -> None:
+        episodes = int(stats.get("episodic_count", 0))
+        facts = int(stats.get("semantic_count", 0))
+        insights = int(stats.get("reflections_count", 0))
+        if episodes or facts or insights:
+            self.last_memory_layers = {
+                "episodes": episodes,
+                "facts": facts,
+                "insights": insights,
+            }
+
+    def _compute_memory_layers(self) -> Dict[str, int]:
+        layers = {"episodes": 0, "facts": 0, "insights": 0}
+        layered = getattr(self.agent, "layered_memory", None)
+        if layered is None:
+            return layers
+
+        episodic = getattr(layered, "episodic", None)
+        if episodic is not None:
+            try:
+                conn = getattr(episodic, "_conn", None)
+                if conn is not None:
+                    cur = conn.cursor()
+                    cur.execute("SELECT COUNT(*) FROM episodes")
+                    row = cur.fetchone()
+                    if row:
+                        layers["episodes"] = int(row[0] or 0)
+            except Exception:
+                pass
+
+        semantic = getattr(layered, "semantic", None)
+        if semantic is not None:
+            try:
+                layers["facts"] = len(getattr(semantic, "_facts", []) or [])
+            except Exception:
+                pass
+
+        reflections = getattr(layered, "reflections", None)
+        if reflections is not None:
+            try:
+                layers["insights"] = len(reflections.all())
+            except Exception:
+                pass
+
+        return layers
+
+    def _record_tool_usage(
+        self,
+        tool_name: str,
+        output: str,
+        timestamp: str,
+        arguments: Dict[str, Any],
+    ) -> None:
+        clean_name = tool_name.strip() or "tool"
+        self.tool_usage_counter[clean_name] += 1
+        self._next_tool_id += 1
+        summary = output.splitlines()[0] if output else "(tool returned no output)"
+        summary = summary[:160]
+        label = clean_name.replace("_", " ").title()
+        self.tool_runs.appendleft(
+            {
+                "id": f"tool-{self._next_tool_id}",
+                "name": label,
+                "summary": summary,
+                "time": timestamp,
+            }
+        )
+        self._maybe_record_file_access(clean_name, arguments, timestamp)
+
+    def _maybe_record_file_access(self, tool_name: str, arguments: Dict[str, Any], timestamp: str) -> None:
+        if tool_name not in {"read_file", "write_file", "list_directory"}:
+            return
+        path = str(arguments.get("path") or arguments.get("directory") or "").strip()
+        if not path:
+            return
+        action = "READ"
+        if tool_name == "write_file":
+            action = "WRITE"
+        elif tool_name == "list_directory":
+            action = "LIST"
+        entry = {"path": path, "action": action, "time": timestamp}
+        self.file_access.appendleft(entry)
+
+    def _maybe_update_processes(self, duration: float) -> None:
+        if not self.processes:
+            self.processes = [dict(proc) for proc in DEFAULT_PROCESSES]
+        agent_entry = None
+        for proc in self.processes:
+            if proc.get("name") == "atlas-agent":
+                agent_entry = proc
+                break
+        if agent_entry is None:
+            agent_entry = {"name": "atlas-agent", "cpu": 24, "mem": 512}
+            self.processes.insert(0, agent_entry)
+        agent_entry["cpu"] = max(5, min(95, agent_entry.get("cpu", 0) + int(duration * 40) + 5))
+        agent_entry["mem"] = max(128, min(4096, agent_entry.get("mem", 256) + 16))
+
+    def _topic_distribution(self) -> List[Dict[str, int]]:
+        if not self.topic_counter:
+            return list(DEFAULT_TOPIC_DISTRIBUTION)
+        total = sum(self.topic_counter.values())
+        if total <= 0:
+            return list(DEFAULT_TOPIC_DISTRIBUTION)
+        entries: List[Dict[str, int]] = []
+        for name, count in self.topic_counter.most_common(6):
+            percentage = int(round((count / total) * 100))
+            entries.append({"topic": name, "percentage": max(1, percentage)})
+        overflow = sum(item["percentage"] for item in entries) - 100
+        if overflow > 0 and entries:
+            entries[0]["percentage"] = max(1, entries[0]["percentage"] - overflow)
+        return entries
+
+    def _average_inference_ms(self) -> int:
+        if self.command_count <= 0:
+            return DEFAULT_ATLAS_METRICS["inference"]
+        avg = (self.total_inference_seconds / self.command_count) * 1000.0
+        return max(1, int(avg))
+
+    def _current_token_usage(self) -> Optional[int]:
+        working = getattr(self.agent, "working_memory", None)
+        if working is None:
+            return None
+        try:
+            stats = working.get_stats()
+        except Exception:
+            return None
+        tokens = int(stats.get("tokens", 0))
+        self._update_context_usage(stats)
+        return tokens
+
+    def _token_budget(self) -> int:
+        working = getattr(self.agent, "working_memory", None)
+        if working is None:
+            return DEFAULT_CONTEXT_USAGE["max"] * 1000
+        config = getattr(working, "config", None)
+        budget = getattr(config, "token_budget", None)
+        if isinstance(budget, int) and budget > 0:
+            return budget
+        return DEFAULT_CONTEXT_USAGE["max"] * 1000
+
+    @staticmethod
+    def _normalize_topic(tag: str) -> str:
+        cleaned = tag.lower().strip()
+        if cleaned.startswith("objective:"):
+            cleaned = cleaned.split(":", 1)[1]
+        cleaned = cleaned.replace("tool:", "")
+        cleaned = cleaned.replace("_", " ").replace("-", " ")
+        words = [word for word in cleaned.split() if word]
+        return " ".join(words).title() or "General"
+
+
+class AtlasWebSocketServer:
+    """Expose the Atlas agent over a lightweight WebSocket protocol."""
+
+    def __init__(self, host: str = "localhost", port: int = 8765, *, agent: Optional[AtlasAgent] = None) -> None:
+        self.host = host
+        self.port = port
+        self.client = OllamaClient()
+        self.agent = agent or AtlasAgent(self.client)
+        self.collector = AtlasMetricsCollector(self.agent)
+        self._executor = ThreadPoolExecutor(max_workers=1)
+        self._closed = False
+
+    async def handle_message(self, websocket: WebSocketServerProtocol, raw: str) -> None:
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            await self._send_error(websocket, "Invalid JSON payload")
+            return
+
+        msg_type = data.get("type")
+        if msg_type == "command":
+            payload = data.get("payload", "")
+            if not isinstance(payload, str):
+                await self._send_error(websocket, "Command payload must be a string")
+                return
+            result = await self._execute_command(payload)
+            await websocket.send(json.dumps({"type": "response", "payload": result}))
+            metrics = self.collector.snapshot()
+            await websocket.send(json.dumps({"type": "metrics", "payload": metrics}))
+        elif msg_type == "get_metrics":
+            metrics = self.collector.snapshot()
+            await websocket.send(json.dumps({"type": "metrics", "payload": metrics}))
+        else:
+            await self._send_error(websocket, f"Unknown message type: {msg_type}")
+
+    async def handler(self, websocket: WebSocketServerProtocol) -> None:
+        try:
+            async for message in websocket:
+                await self.handle_message(websocket, message)
+        except websockets.exceptions.ConnectionClosed:
+            return
+
+    async def start(self) -> None:
+        async with websockets.serve(self.handler, self.host, self.port):
+            print(f"ATLAS WebSocket server running on ws://{self.host}:{self.port}")
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                pass
+
+    async def _execute_command(self, command: str) -> str:
+        loop = asyncio.get_running_loop()
+        start = time.perf_counter()
+
+        def run_agent() -> str:
+            return self.agent.respond(command, event_callback=self.collector.handle_event)
+
+        try:
+            response = await loop.run_in_executor(self._executor, run_agent)
+            success = True
+        except Exception as exc:  # noqa: BLE001 - surface agent failures
+            response = f"Error: {exc}"
+            success = False
+        duration = time.perf_counter() - start
+        self.collector.record_command_result(command, response, duration, success=success)
+        return response
+
+    async def _send_error(self, websocket: WebSocketServerProtocol, message: str) -> None:
+        await websocket.send(json.dumps({"type": "error", "payload": message}))
+
+    def shutdown(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self.agent.close()
+        except Exception:
+            pass
+        try:
+            self.client.close()
+        except Exception:
+            pass
+        self._executor.shutdown(wait=False)
+
+
+def run(host: str = "localhost", port: int = 8765) -> None:
+    server = AtlasWebSocketServer(host=host, port=port)
+    try:
+        asyncio.run(server.start())
+    except KeyboardInterrupt:
+        print("Stopping Atlas WebSocket server...")
+    finally:
+        server.shutdown()
+
+
+if __name__ == "__main__":
+    run()
