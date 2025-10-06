@@ -2,7 +2,8 @@ import React, { useEffect, useState, useRef } from 'react';
 import { Header } from './components/Header';
 import { LeftSidebar } from './components/LeftSidebar';
 import { RightSidebar } from './components/RightSidebar';
-import { TerminalTab } from './components/TerminalTab';
+import { ChatTab } from './components/ChatTab';
+import { TerminalFooter } from './components/TerminalFooter';
 import { AnalyticsTab } from './components/AnalyticsTab';
 import { NetworkTab } from './components/NetworkTab';
 import { SystemTab } from './components/SystemTab';
@@ -114,6 +115,7 @@ const App: React.FC = () => {
   const [currentModel, setCurrentModel] = useState<AIModel>('qwen3:latest');
   const [agentStatus, setAgentStatus] = useState<AgentState>('idle');
   const [isProfileOpen, setIsProfileOpen] = useState(false);
+  const [isTerminalExpanded, setIsTerminalExpanded] = useState(false);
   const [userProfile, setUserProfile] = useState<UserProfileData>({
     name: '',
     role: '',
@@ -409,14 +411,13 @@ const App: React.FC = () => {
             <SystemTab processes={processes} fileAccess={fileAccess} />
           )}
           {activeModule === 'terminal' && (
-            <TerminalTab
+            <ChatTab
               history={terminalHistory}
               input={terminalInput}
               setInput={setTerminalInput}
               onCommand={handleCommand}
               streamingText={streamingResponse}
               onNavigateHistory={commandHistory.navigateHistory}
-              onClear={handleClearTerminal}
             />
           )}
         </div>
@@ -427,10 +428,12 @@ const App: React.FC = () => {
           toolRuns={toolRuns}
         />
       </div>
-      <footer className="px-4 py-2 border-t border-atlas-green-900 text-xs text-atlas-green-700 flex justify-between">
-        <span>WS: {isConnected ? 'CONNECTED' : 'DISCONNECTED'}</span>
-        <span>© ATLAS Systems</span>
-      </footer>
+      <TerminalFooter
+        history={terminalHistory}
+        onClear={handleClearTerminal}
+        isExpanded={isTerminalExpanded}
+        onToggle={() => setIsTerminalExpanded(!isTerminalExpanded)}
+      />
 
       <UserProfile
         isOpen={isProfileOpen}

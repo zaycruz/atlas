@@ -31,7 +31,7 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
   atlasMetrics
 }) => {
   const modules: Module[] = [
-    { id: 'terminal', icon: Terminal, label: 'TERMINAL' },
+    { id: 'terminal', icon: Terminal, label: 'CHAT' },
     { id: 'analytics', icon: TrendingUp, label: 'ANALYTICS' },
     { id: 'network', icon: Network, label: 'NETWORK' },
     { id: 'system', icon: Cpu, label: 'SYSTEM' }
