@@ -2,18 +2,26 @@ import React, { useEffect, useState, useRef } from 'react';
 import { Header } from './components/Header';
 import { LeftSidebar } from './components/LeftSidebar';
 import { RightSidebar } from './components/RightSidebar';
-import { TerminalTab } from './components/TerminalTab';
+import { ChatTab, type ChatTabRef } from './components/ChatTab';
+import { TerminalFooter } from './components/TerminalFooter';
 import { AnalyticsTab } from './components/AnalyticsTab';
 import { NetworkTab } from './components/NetworkTab';
 import { SystemTab } from './components/SystemTab';
+import type { AIModel } from './components/ModelToggler';
+import { UserProfile, type UserProfileData } from './components/UserProfile';
+import type { AgentState } from './components/AgentStatus';
 import { useWebSocket } from './hooks/useWebSocket';
 import { useSystemMetrics } from './hooks/useSystemMetrics';
+import { useCommandHistory } from './hooks/useCommandHistory';
+import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts';
 import type {
   AtlasMetrics,
   ContextUsage,
   FileAccess,
   GraphEdge,
   GraphNode,
+  KnowledgeGraphEdge,
+  KnowledgeGraphNode,
   MemoryEvent,
   MemoryLayers,
   Process,
@@ -25,116 +33,117 @@ import type {
 
 const WS_URL = 'ws://localhost:8765';
 
-const DEFAULT_TERMINAL: TerminalEntry[] = [
+const DEFAULT_CHAT: TerminalEntry[] = [
   {
     type: 'system',
-    text: 'Initializing ATLAS command terminal...'
-  },
-  {
-    type: 'system',
-    text: 'Connecting to local agent at ws://localhost:8765'
+    text: 'ATLAS Interface Initialized'
   }
 ];
 
-const DEFAULT_MEMORY_EVENTS: MemoryEvent[] = [
-  { time: '09:41', type: 'EPISODE', detail: 'Reviewed system boot diagnostics.' },
-  { time: '09:38', type: 'FACT', detail: 'Atlas connected to Ollama: qwen3:latest.' },
-  { time: '09:25', type: 'INSIGHT', detail: 'User prefers concise action plans.' },
-  { time: '09:12', type: 'EPISODE', detail: 'Indexed project workspace for quick search.' },
-  { time: '08:55', type: 'FACT', detail: 'Daily summary exported to /logs/atlas.' }
-];
+const DEFAULT_TERMINAL: TerminalEntry[] = [];
 
-const DEFAULT_TOOL_RUNS: ToolRun[] = [
-  {
-    id: 'tool-4981',
-    name: 'Web Search',
-    summary: 'Gathered current market intel for AI assistants.',
-    time: '09:32'
-  },
-  {
-    id: 'tool-4975',
-    name: 'File Read',
-    summary: 'Parsed roadmap.md for outstanding items.',
-    time: '09:18'
-  },
-  {
-    id: 'tool-4960',
-    name: 'Shell Command',
-    summary: 'Monitored GPU utilization via nvidia-smi.',
-    time: '08:50'
-  }
-];
+const DEFAULT_MEMORY_EVENTS: MemoryEvent[] = [];
 
-const DEFAULT_TOPICS: TopicDistribution[] = [
-  { topic: 'System Ops', percentage: 36 },
-  { topic: 'Research', percentage: 28 },
-  { topic: 'Planning', percentage: 22 },
-  { topic: 'Support', percentage: 14 }
-];
+const DEFAULT_TOOL_RUNS: ToolRun[] = [];
 
-const DEFAULT_TOOL_USAGE: ToolUsageStats[] = [
-  { tool: 'web_search', count: 14 },
-  { tool: 'shell', count: 9 },
-  { tool: 'file_read', count: 12 },
-  { tool: 'memory_write', count: 7 }
-];
+const DEFAULT_TOPICS: TopicDistribution[] = [];
 
-const DEFAULT_PROCESSES: Process[] = [
-  { name: 'atlas-agent', cpu: 24, mem: 512 },
-  { name: 'ollama-server', cpu: 36, mem: 2048 },
-  { name: 'memory-harvester', cpu: 12, mem: 256 },
-  { name: 'context-assembler', cpu: 18, mem: 384 }
-];
+const DEFAULT_TOOL_USAGE: ToolUsageStats[] = [];
 
-const DEFAULT_FILE_ACCESS: FileAccess[] = [
-  { path: '~/Atlas/logs/session.log', action: 'WRITE', time: '09:41:22' },
-  { path: '~/Projects/atlas/notes.md', action: 'READ', time: '09:33:08' },
-  { path: '~/Atlas/memory/semantic.json', action: 'WRITE', time: '09:21:45' },
-  { path: '~/Atlas/memory/reflections.json', action: 'READ', time: '09:18:11' }
-];
+const DEFAULT_PROCESSES: Process[] = [];
 
-const DEFAULT_GRAPH_NODES: GraphNode[] = [
-  { id: 1, label: 'ATLAS', x: 50, y: 30, size: 'large' },
-  { id: 2, label: 'User Goals', x: 25, y: 55, size: 'medium' },
-  { id: 3, label: 'System Health', x: 70, y: 55, size: 'medium' },
-  { id: 4, label: 'Research', x: 20, y: 80, size: 'small' },
-  { id: 5, label: 'Memory Ops', x: 80, y: 80, size: 'small' },
-  { id: 6, label: 'Tools', x: 50, y: 75, size: 'small' }
-];
-
-const DEFAULT_GRAPH_EDGES: GraphEdge[] = [
-  { from: 1, to: 2 },
-  { from: 1, to: 3 },
-  { from: 2, to: 4 },
-  { from: 3, to: 5 },
-  { from: 1, to: 6 },
-  { from: 6, to: 4 }
-];
+const DEFAULT_FILE_ACCESS: FileAccess[] = [];
 
 const DEFAULT_MEMORY_LAYERS: MemoryLayers = {
-  episodes: 124,
-  facts: 86,
-  insights: 32
+  episodes: 0,
+  facts: 0,
+  insights: 0
 };
 
 const DEFAULT_CONTEXT_USAGE: ContextUsage = {
-  current: 18,
-  max: 32,
-  percentage: Math.round((18 / 32) * 100)
+  current: 0,
+  max: 0,
+  percentage: 0
 };
 
 const DEFAULT_ATLAS_METRICS: AtlasMetrics = {
-  tokens: 241_238,
-  operations: 128,
-  inference: 142
+  tokens: 0,
+  operations: 0,
+  inference: 0
+};
+
+const buildGraphLayout = (rawNodes: KnowledgeGraphNode[]): GraphNode[] => {
+  if (!rawNodes.length) {
+    return [];
+  }
+  const baseRadius = 30;
+  const centerX = 50;
+  const centerY = 50;
+  const total = rawNodes.length;
+
+  return rawNodes.map((node, index) => {
+    const angle = (2 * Math.PI * index) / Math.max(1, total);
+    const radiusOffset = node.type === 'Project' ? 12 : node.type === 'Decision' || node.type === 'Task' ? 8 : 4;
+    const radius = baseRadius + radiusOffset;
+    const x = centerX + radius * Math.cos(angle);
+    const y = centerY + radius * Math.sin(angle);
+
+    let size: GraphNode['size'] = 'small';
+    if (node.type === 'Project') {
+      size = 'large';
+    } else if (node.type === 'Decision' || node.type === 'Task') {
+      size = 'medium';
+    }
+
+    return {
+      id: node.id,
+      label: node.label,
+      x: Math.max(5, Math.min(95, x)),
+      y: Math.max(5, Math.min(95, y)),
+      size
+    };
+  });
+};
+
+const buildGraphEdges = (rawEdges: KnowledgeGraphEdge[]): GraphEdge[] =>
+  rawEdges.map((edge) => ({ from: edge.from, to: edge.to }));
+
+type ModelPullState = {
+  model: string | null;
+  status: 'idle' | 'started' | 'progress' | 'completed' | 'error';
+  message?: string;
 };
 
 const App: React.FC = () => {
   const [time, setTime] = useState(() => new Date());
   const [activeModule, setActiveModule] = useState('terminal');
+  const [currentModel, setCurrentModel] = useState<AIModel>('qwen3:latest');
+  const [installedModels, setInstalledModels] = useState<string[]>([]);
+  const [availableModels, setAvailableModels] = useState<string[]>([]);
+  const [modelPullStatus, setModelPullStatus] = useState<ModelPullState>({ model: null, status: 'idle' });
+  const [agentStatus, setAgentStatus] = useState<AgentState>('idle');
+  const [isProfileOpen, setIsProfileOpen] = useState(false);
+  const [isTerminalExpanded, setIsTerminalExpanded] = useState(false);
+  const [userProfile, setUserProfile] = useState<UserProfileData>({
+    name: '',
+    role: '',
+    expertise: [],
+    workingStyle: 'balanced',
+    preferences: {
+      codeComments: true,
+      stepByStep: false,
+      askBeforeAction: true
+    }
+  });
+
   const systemMetrics = useSystemMetrics();
   const { isConnected, messages, clearMessages, sendMessage } = useWebSocket(WS_URL);
+  const commandHistory = useCommandHistory();
+  const terminalCommandHistory = useCommandHistory();
+  const chatTabRef = useRef<ChatTabRef>(null);
 
+  const [chatInput, setChatInput] = useState('');
+  const [chatHistory, setChatHistory] = useState<TerminalEntry[]>(DEFAULT_CHAT);
   const [terminalInput, setTerminalInput] = useState('');
   const [terminalHistory, setTerminalHistory] = useState<TerminalEntry[]>(DEFAULT_TERMINAL);
   const [streamingResponse, setStreamingResponse] = useState<string>('');
@@ -150,27 +159,45 @@ const App: React.FC = () => {
   const [toolUsage, setToolUsage] = useState<ToolUsageStats[]>(DEFAULT_TOOL_USAGE);
   const [processes, setProcesses] = useState<Process[]>(DEFAULT_PROCESSES);
   const [fileAccess, setFileAccess] = useState<FileAccess[]>(DEFAULT_FILE_ACCESS);
+  const [graphNodes, setGraphNodes] = useState<GraphNode[]>([]);
+  const [graphEdges, setGraphEdges] = useState<GraphEdge[]>([]);
+  const modelClearTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Keyboard shortcuts
+  useKeyboardShortcuts([
+    {
+      key: 'k',
+      meta: true,
+      ctrl: true,
+      handler: () => {
+        setActiveModule('terminal');
+        setTimeout(() => chatTabRef.current?.focusInput(), 100);
+      },
+      description: 'Focus chat input'
+    },
+    {
+      key: 't',
+      meta: true,
+      ctrl: true,
+      handler: () => {
+        setIsTerminalExpanded((prev) => !prev);
+      },
+      description: 'Toggle terminal'
+    },
+    {
+      key: 'Escape',
+      handler: () => {
+        if (isProfileOpen) {
+          setIsProfileOpen(false);
+        }
+      },
+      description: 'Close modals'
+    }
+  ]);
 
   useEffect(() => {
     const timer = setInterval(() => setTime(new Date()), 1000);
     return () => clearInterval(timer);
-  }, []);
-
-  useEffect(() => {
-    const incrementer = setInterval(() => {
-      setAtlasMetrics((prev) => ({
-        tokens: prev.tokens + Math.floor(Math.random() * 120),
-        operations: prev.operations + 1,
-        inference: Math.max(80, Math.min(220, prev.inference + Math.floor(Math.random() * 12 - 6)))
-      }));
-      setContextUsage((prev) => {
-        const current = Math.max(8, Math.min(prev.max, prev.current + (Math.random() > 0.5 ? 1 : -1)));
-        const percentage = Math.round((current / prev.max) * 100);
-        return { ...prev, current, percentage };
-      });
-    }, 5000);
-
-    return () => clearInterval(incrementer);
   }, []);
 
   useEffect(() => {
@@ -194,17 +221,15 @@ const App: React.FC = () => {
         setStreamingResponse('');
       }
 
-      const sequence =
-        typeof message._sequence === 'number' && message._sequence > 0
-          ? message._sequence
-          : lastProcessedSequence.current + 1;
-
-      if (sequence <= lastProcessedSequence.current) {
-        console.log('[App] Message already processed, skipping');
-        continue;
+      const hasSequence = typeof message._sequence === 'number' && message._sequence > 0;
+      if (hasSequence) {
+        const sequence = Number(message._sequence);
+        if (sequence <= lastProcessedSequence.current) {
+          console.log('[App] Message already processed, skipping');
+          continue;
+        }
+        lastProcessedSequence.current = sequence;
       }
-
-      lastProcessedSequence.current = sequence;
 
       if (message.type === 'response_chunk') {
         const chunk = typeof message.payload === 'string' ? message.payload : '';
@@ -212,14 +237,21 @@ const App: React.FC = () => {
 
         if (isFinal) {
           if (streamingResponseRef.current.trim()) {
+            const timestamp = Date.now();
+            setChatHistory((prev) => [
+              ...prev,
+              { type: 'success', text: streamingResponseRef.current, timestamp }
+            ]);
             setTerminalHistory((prev) => [
               ...prev,
-              { type: 'success', text: streamingResponseRef.current }
+              { type: 'success', text: streamingResponseRef.current, timestamp }
             ]);
           }
           setStreamingResponse('');
           streamingResponseRef.current = '';
+          setAgentStatus('idle');
         } else {
+          setAgentStatus('responding');
           setStreamingResponse((prev) => {
             const next = prev + chunk;
             streamingResponseRef.current = next;
@@ -233,9 +265,14 @@ const App: React.FC = () => {
           typeof message.payload === 'string'
             ? message.payload
             : JSON.stringify(message.payload, null, 2);
+        const timestamp = Date.now();
+        setChatHistory((prev) => [
+          ...prev,
+          { type: 'success', text, timestamp }
+        ]);
         setTerminalHistory((prev) => [
           ...prev,
-          { type: 'success', text }
+          { type: 'success', text, timestamp }
         ]);
       }
 
@@ -244,9 +281,14 @@ const App: React.FC = () => {
           typeof message.payload === 'string'
             ? message.payload
             : JSON.stringify(message.payload, null, 2);
+        const timestamp = Date.now();
+        setChatHistory((prev) => [
+          ...prev,
+          { type: 'error', text, timestamp }
+        ]);
         setTerminalHistory((prev) => [
           ...prev,
-          { type: 'error', text }
+          { type: 'error', text, timestamp }
         ]);
       }
 
@@ -292,10 +334,137 @@ const App: React.FC = () => {
           setFileAccess(payload.fileAccess);
         }
       }
+
+      if (message.type === 'kg_context' || message.type === 'kg_neighbors') {
+        const payload = message.payload as {
+          nodes?: KnowledgeGraphNode[];
+          edges?: KnowledgeGraphEdge[];
+        };
+        const nodes = buildGraphLayout(payload?.nodes ?? []);
+        const edges = buildGraphEdges(payload?.edges ?? []);
+        setGraphNodes(nodes);
+        setGraphEdges(edges);
+      }
+
+      if (message.type === 'kg_update') {
+        // Refresh the active subgraph after updates land.
+        sendMessage({ type: 'kg_context', payload: { limit: 40 } });
+      }
+
+      if (message.type === 'models_list') {
+        const payload = message.payload as Partial<{
+          installed: string[];
+          available: string[];
+          current: string;
+        }>;
+        if (Array.isArray(payload.installed)) {
+          setInstalledModels(payload.installed);
+        }
+        if (Array.isArray(payload.available)) {
+          setAvailableModels(payload.available);
+        }
+        if (payload.current) {
+          setCurrentModel(payload.current as AIModel);
+        }
+      }
+
+      if (message.type === 'model_pull') {
+        const payload = message.payload as {
+          model?: string;
+          status?: string;
+          message?: string;
+          completed?: number;
+          total?: number;
+        };
+        const model = payload.model || null;
+        let status: ModelPullState['status'] = 'progress';
+        const rawStatus = (payload.status || '').toLowerCase();
+        if (rawStatus === 'started') {
+          status = 'started';
+        } else if (['completed', 'complete', 'done'].includes(rawStatus)) {
+          status = 'completed';
+        } else if (rawStatus === 'error' || rawStatus === 'failed') {
+          status = 'error';
+        } else {
+          status = 'progress';
+        }
+
+        let messageText = payload.message || payload.status;
+        if (!messageText && typeof payload.completed === 'number' && typeof payload.total === 'number') {
+          const percent = payload.total > 0 ? Math.round((payload.completed / payload.total) * 100) : undefined;
+          if (percent !== undefined && !Number.isNaN(percent)) {
+            messageText = `${percent}%`;
+          }
+        }
+
+        if (status === 'started' && !messageText) {
+          messageText = 'Starting pull...';
+        }
+
+        if (status === 'completed' && !messageText) {
+          messageText = 'Pull complete';
+        }
+
+        if (status === 'error' && !messageText) {
+          messageText = 'Pull failed';
+        }
+
+        setModelPullStatus({ model, status, message: messageText });
+      }
+
+      if (message.type === 'model_updated') {
+        const payload = message.payload as { model?: string };
+        if (payload.model) {
+          setCurrentModel(payload.model as AIModel);
+        }
+      }
+
+      if (message.type === 'shell_start') {
+        const payload = message.payload as { command?: string; cwd?: string | null };
+        const info = payload.command ? `Running: ${payload.command}` : 'Command started';
+        setTerminalHistory((prev) => [
+          ...prev,
+          { type: 'system', text: info, timestamp: Date.now() }
+        ]);
+      }
+
+      if (message.type === 'shell_output') {
+        const payload = message.payload as { data?: string; stream?: string };
+        if (payload.data) {
+          const stream = (payload.stream || 'stdout').toLowerCase();
+          const entryType: TerminalEntry['type'] = stream === 'stderr' ? 'error' : 'success';
+          const prefix = stream === 'stderr' ? '[stderr] ' : '';
+          setTerminalHistory((prev) => [
+            ...prev,
+            { type: entryType, text: `${prefix}${payload.data}`, timestamp: Date.now() }
+          ]);
+        }
+      }
+
+      if (message.type === 'shell_error') {
+        const payload = message.payload as { message?: string };
+        const text = payload.message || 'Shell command error';
+        setTerminalHistory((prev) => [
+          ...prev,
+          { type: 'error', text, timestamp: Date.now() }
+        ]);
+      }
+
+      if (message.type === 'shell_complete') {
+        const payload = message.payload as { exit_code?: number; timed_out?: boolean };
+        const exitCode = typeof payload.exit_code === 'number' ? payload.exit_code : 'unknown';
+        const text = payload.timed_out
+          ? `Command terminated after timeout`
+          : `Command exited with code ${exitCode}`;
+        setTerminalHistory((prev) => [
+          ...prev,
+          { type: payload.timed_out ? 'warn' : 'system', text, timestamp: Date.now() }
+        ]);
+      }
     }
 
     clearMessages(lastConnectionId.current, lastProcessedSequence.current);
-  }, [messages, clearMessages]);
+  }, [messages, clearMessages, sendMessage]);
 
   useEffect(() => {
     if (isConnected) {
@@ -303,39 +472,173 @@ const App: React.FC = () => {
       // Small delay to ensure connection is fully ready
       setTimeout(() => {
         sendMessage({ type: 'get_metrics' });
+        sendMessage({ type: 'kg_context', payload: { limit: 40 } });
+        sendMessage({ type: 'list_models' });
       }, 100);
     }
   }, [isConnected, sendMessage]);
 
-  const handleCommand = () => {
-    console.log('[App] handleCommand called, input:', terminalInput);
-    if (!terminalInput.trim()) return;
+  useEffect(() => {
+    if (modelPullStatus.status === 'completed' || modelPullStatus.status === 'error') {
+      if (modelClearTimer.current) {
+        clearTimeout(modelClearTimer.current);
+      }
+      modelClearTimer.current = setTimeout(() => {
+        setModelPullStatus({ model: null, status: 'idle' });
+      }, 2500);
+    }
+    return () => {
+      if (modelClearTimer.current) {
+        clearTimeout(modelClearTimer.current);
+        modelClearTimer.current = null;
+      }
+    };
+  }, [modelPullStatus.status]);
 
-    const commandText = `$ ${terminalInput.trim()}`;
+  const handleChatCommand = () => {
+    console.log('[App] handleChatCommand called, input:', chatInput);
+    if (!chatInput.trim()) return;
+
+    const trimmedInput = chatInput.trim();
+    const timestamp = Date.now();
+
+    // Add to command history
+    commandHistory.addCommand(trimmedInput);
+
+    // Add to chat history (without $ prefix)
+    setChatHistory((prev) => [
+      ...prev,
+      { type: 'command', text: trimmedInput, timestamp }
+    ]);
+
+    // Add to terminal history (with $ prefix)
+    const commandText = `$ ${trimmedInput}`;
     setTerminalHistory((prev) => [
       ...prev,
-      { type: 'command', text: commandText }
+      { type: 'command', text: commandText, timestamp }
     ]);
 
     console.log('[App] isConnected:', isConnected, 'sending message');
     if (isConnected) {
-      const message = { type: 'command', payload: terminalInput.trim() };
+      const message = { type: 'command', payload: trimmedInput };
       console.log('[App] Sending WebSocket message:', message);
+      setAgentStatus('processing');
       sendMessage(message);
     } else {
       console.log('[App] WebSocket not connected, showing error');
+      const errorMsg = 'WebSocket disconnected. Unable to send command.';
+      const timestamp = Date.now();
+      setChatHistory((prev) => [
+        ...prev,
+        { type: 'error', text: errorMsg, timestamp }
+      ]);
       setTerminalHistory((prev) => [
         ...prev,
-        { type: 'error', text: 'WebSocket disconnected. Unable to send command.' }
+        { type: 'error', text: errorMsg, timestamp }
+      ]);
+      setAgentStatus('idle');
+    }
+
+    setChatInput('');
+    commandHistory.resetPosition();
+  };
+
+  const handleTerminalCommand = () => {
+    console.log('[App] handleTerminalCommand called, input:', terminalInput);
+    if (!terminalInput.trim()) return;
+
+    const trimmedInput = terminalInput.trim();
+    const commandText = `$ ${trimmedInput}`;
+    const timestamp = Date.now();
+    const commandId = typeof crypto !== 'undefined' && 'randomUUID' in crypto
+      ? crypto.randomUUID()
+      : Math.random().toString(36).slice(2);
+
+    terminalCommandHistory.addCommand(trimmedInput);
+    terminalCommandHistory.resetPosition();
+
+    setTerminalHistory((prev) => [
+      ...prev,
+      { type: 'command', text: commandText, timestamp }
+    ]);
+
+    if (isConnected) {
+      sendMessage({ type: 'shell_command', payload: { id: commandId, command: trimmedInput } });
+    } else {
+      setTerminalHistory((prev) => [
+        ...prev,
+        { type: 'error', text: 'WebSocket disconnected. Unable to run command.', timestamp: Date.now() }
       ]);
     }
 
     setTerminalInput('');
   };
 
+  const handleModelChange = (model: AIModel) => {
+    console.log('[App] Model changed to:', model);
+    setCurrentModel(model);
+    // Send model change to backend
+    if (isConnected) {
+      sendMessage({ type: 'set_model', payload: { model } });
+    }
+  };
+
+  const handleAddModel = (model: string) => {
+    console.log('[App] Pulling model:', model);
+    if (isConnected) {
+      setModelPullStatus({ model, status: 'started', message: 'Starting pull...' });
+      sendMessage({ type: 'pull_model', payload: { model } });
+    }
+  };
+
+  const handleProfileSave = (profile: UserProfileData) => {
+    console.log('[App] User profile saved:', profile);
+    setUserProfile(profile);
+    // Send profile to backend
+    if (isConnected) {
+      sendMessage({ type: 'update_profile', payload: profile });
+    }
+    // Save to localStorage for persistence
+    localStorage.setItem('atlas_user_profile', JSON.stringify(profile));
+  };
+
+  const handleClearChat = () => {
+    console.log('[App] Clearing chat');
+    setChatHistory(DEFAULT_CHAT);
+    setStreamingResponse('');
+  };
+
+  const handleClearTerminal = () => {
+    console.log('[App] Clearing terminal');
+    setTerminalHistory(DEFAULT_TERMINAL);
+  };
+
+  // Load profile from localStorage on mount
+  useEffect(() => {
+    const savedProfile = localStorage.getItem('atlas_user_profile');
+    if (savedProfile) {
+      try {
+        setUserProfile(JSON.parse(savedProfile));
+      } catch (error) {
+        console.error('Failed to load user profile:', error);
+      }
+    }
+  }, []);
+
   return (
     <div className="min-h-screen bg-atlas-black text-atlas-green-500 flex flex-col">
-      <Header time={time} />
+      <Header
+        time={time}
+        isConnected={isConnected}
+        currentModel={currentModel}
+        onModelChange={handleModelChange}
+        installedModels={installedModels}
+        availableModels={availableModels}
+        onAddModel={handleAddModel}
+        modelPullStatus={modelPullStatus}
+        onOpenProfile={() => setIsProfileOpen(true)}
+        agentStatus={agentStatus}
+      />
       <div className="flex-1 grid grid-cols-12">
         <LeftSidebar
           activeModule={activeModule}
@@ -353,18 +656,21 @@ const App: React.FC = () => {
             />
           )}
           {activeModule === 'network' && (
-            <NetworkTab nodes={DEFAULT_GRAPH_NODES} edges={DEFAULT_GRAPH_EDGES} />
+            <NetworkTab nodes={graphNodes} edges={graphEdges} />
           )}
           {activeModule === 'system' && (
             <SystemTab processes={processes} fileAccess={fileAccess} />
           )}
           {activeModule === 'terminal' && (
-            <TerminalTab
-              history={terminalHistory}
-              input={terminalInput}
-              setInput={setTerminalInput}
-              onCommand={handleCommand}
+            <ChatTab
+              ref={chatTabRef}
+              history={chatHistory}
+              input={chatInput}
+              setInput={setChatInput}
+              onCommand={handleChatCommand}
               streamingText={streamingResponse}
+              onNavigateHistory={commandHistory.navigateHistory}
+              onClear={handleClearChat}
             />
           )}
         </div>
@@ -375,10 +681,23 @@ const App: React.FC = () => {
           toolRuns={toolRuns}
         />
       </div>
-      <footer className="px-3 py-1 border-t border-atlas-green-900 text-[9px] text-atlas-green-700 flex justify-between">
-        <span>WS: {isConnected ? 'CONNECTED' : 'DISCONNECTED'}</span>
-        <span>© ATLAS Systems</span>
-      </footer>
+      <TerminalFooter
+        history={terminalHistory}
+        input={terminalInput}
+        setInput={setTerminalInput}
+        onCommand={handleTerminalCommand}
+        onClear={handleClearTerminal}
+        isExpanded={isTerminalExpanded}
+        onToggle={() => setIsTerminalExpanded(!isTerminalExpanded)}
+        onNavigateHistory={terminalCommandHistory.navigateHistory}
+      />
+
+      <UserProfile
+        isOpen={isProfileOpen}
+        onClose={() => setIsProfileOpen(false)}
+        profile={userProfile}
+        onSave={handleProfileSave}
+      />
     </div>
   );
 };

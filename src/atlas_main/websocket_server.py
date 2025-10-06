@@ -1,17 +1,27 @@
 from __future__ import annotations
 
 import asyncio
+from asyncio.subprocess import PIPE
+import contextlib
 import json
 import logging
+import threading
 import time
+import uuid
 from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from pathlib import Path
 from threading import Lock
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional, Callable
 
 import websockets
 from websockets.server import WebSocketServerProtocol
+
+from .kg_config import KnowledgeGraphConfig
+from .knowledge_graph import SQLiteGraphStore
+from .kg_pipeline import KnowledgeGraphPipeline, set_pipeline, clear_pipeline
+from .kg_extractor import MemoryGraphExtractor
 
 # Configure logging
 logging.basicConfig(
@@ -33,71 +43,47 @@ else:  # pragma: no cover - support `python websocket_server.py`
 
     from atlas_main.agent import AtlasAgent
     from atlas_main.ollama import OllamaClient
+    from atlas_main.kg_config import KnowledgeGraphConfig
+    from atlas_main.knowledge_graph import SQLiteGraphStore
+    from atlas_main.kg_pipeline import KnowledgeGraphPipeline, set_pipeline, clear_pipeline
+    from atlas_main.kg_extractor import MemoryGraphExtractor
 
-DEFAULT_MEMORY_EVENTS = [
-    {"time": "09:41", "type": "EPISODE", "detail": "Reviewed system boot diagnostics."},
-    {"time": "09:38", "type": "FACT", "detail": "Atlas connected to Ollama: qwen3:latest."},
-    {"time": "09:25", "type": "INSIGHT", "detail": "User prefers concise action plans."},
-    {"time": "09:12", "type": "EPISODE", "detail": "Indexed project workspace for quick search."},
-    {"time": "08:55", "type": "FACT", "detail": "Daily summary exported to /logs/atlas."},
-]
+DEFAULT_MEMORY_EVENTS: List[Dict[str, str]] = []
 
-DEFAULT_TOOL_RUNS = [
-    {
-        "id": "tool-4981",
-        "name": "Web Search",
-        "summary": "Gathered current market intel for AI assistants.",
-        "time": "09:32",
-    },
-    {
-        "id": "tool-4975",
-        "name": "File Read",
-        "summary": "Parsed roadmap.md for outstanding items.",
-        "time": "09:18",
-    },
-    {
-        "id": "tool-4960",
-        "name": "Shell Command",
-        "summary": "Monitored GPU utilization via nvidia-smi.",
-        "time": "08:50",
-    },
-]
+DEFAULT_TOOL_RUNS: List[Dict[str, str]] = []
 
-DEFAULT_TOPIC_DISTRIBUTION = [
-    {"topic": "System Ops", "percentage": 36},
-    {"topic": "Research", "percentage": 28},
-    {"topic": "Planning", "percentage": 22},
-    {"topic": "Support", "percentage": 14},
-]
+DEFAULT_TOPIC_DISTRIBUTION: List[Dict[str, int]] = []
 
-DEFAULT_TOOL_USAGE = [
-    {"tool": "web_search", "count": 14},
-    {"tool": "shell", "count": 9},
-    {"tool": "file_read", "count": 12},
-    {"tool": "memory_write", "count": 7},
-]
+DEFAULT_TOOL_USAGE: List[Dict[str, int]] = []
 
-DEFAULT_CONTEXT_USAGE = {"current": 18, "max": 32, "percentage": 56}
-DEFAULT_MEMORY_LAYERS = {"episodes": 124, "facts": 86, "insights": 32}
-DEFAULT_ATLAS_METRICS = {"tokens": 241_238, "operations": 128, "inference": 142}
-DEFAULT_PROCESSES = [
-    {"name": "atlas-agent", "cpu": 24, "mem": 512},
-    {"name": "ollama-server", "cpu": 36, "mem": 2048},
-    {"name": "memory-harvester", "cpu": 12, "mem": 256},
-    {"name": "context-assembler", "cpu": 18, "mem": 384},
-]
-DEFAULT_FILE_ACCESS = [
-    {"path": "~/Atlas/logs/session.log", "action": "WRITE", "time": "09:41:22"},
-    {"path": "~/Projects/atlas/notes.md", "action": "READ", "time": "09:33:08"},
-    {"path": "~/Atlas/memory/semantic.json", "action": "WRITE", "time": "09:21:45"},
-    {"path": "~/Atlas/memory/reflections.json", "action": "READ", "time": "09:18:11"},
+DEFAULT_CONTEXT_USAGE = {"current": 0, "max": 0, "percentage": 0}
+DEFAULT_MEMORY_LAYERS = {"episodes": 0, "facts": 0, "insights": 0}
+DEFAULT_ATLAS_METRICS = {"tokens": 0, "operations": 0, "inference": 0}
+DEFAULT_PROCESSES: List[Dict[str, int]] = []
+DEFAULT_FILE_ACCESS: List[Dict[str, str]] = []
+
+DEFAULT_MODEL_CATALOG = [
+    "qwen2.5:latest",
+    "qwen3:latest",
+    "gpt-oss:latest",
+    "llama3:8b",
+    "llama3.1:8b",
+    "llama3.1:70b",
+    "mistral:7b",
+    "codellama:7b",
+    "phi3:mini",
 ]
 
 
 class AtlasMetricsCollector:
     """Track agent activity and translate it into UI-facing metrics."""
 
-    def __init__(self, agent: AtlasAgent) -> None:
+    def __init__(
+        self,
+        agent: AtlasAgent,
+        *,
+        event_emitter: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> None:
         self.agent = agent
         self.lock = Lock()
         self.command_count = 0
@@ -108,10 +94,11 @@ class AtlasMetricsCollector:
         self.tool_usage_counter = Counter({item["tool"]: item["count"] for item in DEFAULT_TOOL_USAGE})
         self.topic_counter = Counter({item["topic"]: item["percentage"] for item in DEFAULT_TOPIC_DISTRIBUTION})
         self.processes = [dict(proc) for proc in DEFAULT_PROCESSES]
-        self.last_context_usage = dict(DEFAULT_CONTEXT_USAGE)
-        self.last_memory_layers = dict(DEFAULT_MEMORY_LAYERS)
-        self.last_metrics = dict(DEFAULT_ATLAS_METRICS)
+        self.last_context_usage = self._initial_context_usage()
+        self.last_memory_layers = self._compute_memory_layers()
+        self.last_metrics = self._initial_atlas_metrics()
         self._next_tool_id = 6000
+        self._event_emitter = event_emitter
 
     # ------------------------------------------------------------------
     # Event handling
@@ -120,49 +107,29 @@ class AtlasMetricsCollector:
         timestamp = datetime.now().strftime("%H:%M")
         with self.lock:
             if event == "turn_start":
-                objective = payload.get("objective") or "general focus"
-                detail = f"Objective: {objective}"
-                self._append_event("TURN", detail, timestamp)
                 context = payload.get("context_usage")
                 if isinstance(context, dict):
                     self._update_context_usage(context)
             elif event == "status":
-                message = str(payload.get("message", "")).strip()
-                if message:
-                    self._append_event("STATUS", message, timestamp)
+                pass
             elif event == "working_memory_eviction":
-                evicted = int(payload.get("evicted_count", 0))
-                detail = f"Evicted {evicted} messages from working memory."
-                self._append_event("EVICTION", detail, timestamp)
+                pass
             elif event == "tool_start":
-                tools = payload.get("tools") or []
-                for tool in tools:
-                    name = str(tool.get("name", "tool")).strip() or "tool"
-                    self._append_event("TOOL", f"Running {name}", timestamp)
+                pass
             elif event == "tool_result":
                 tool_name = str(payload.get("name", "tool")).strip() or "tool"
                 arguments = payload.get("arguments") or {}
                 output = str(payload.get("output", "")).strip()
                 self._record_tool_usage(tool_name, output, timestamp, arguments)
-                self._append_event("TOOL", f"Completed {tool_name}", timestamp)
             elif event == "tool_limit":
-                attempted = int(payload.get("attempted", 0))
-                maximum = payload.get("max")
-                detail = f"Tool limit reached ({attempted}/{maximum})."
-                self._append_event("LIMIT", detail, timestamp)
+                pass
             elif event == "tool_deferred":
-                tools = payload.get("tools") or []
-                if tools:
-                    detail = "Deferred tools: " + ", ".join(str(t) for t in tools)
-                    self._append_event("FOCUS", detail, timestamp)
+                pass
             elif event == "turn_complete":
                 summary = str(payload.get("text", "")).strip()
-                if summary:
-                    preview = summary.splitlines()[0][:140]
-                    self._append_event("TURN", f"Reply: {preview}", timestamp)
                 memory_stats = payload.get("memory_stats") or {}
                 if memory_stats:
-                    self._update_memory_layers_from_stats(memory_stats)
+                    self._update_memory_layers_from_stats(memory_stats, timestamp)
                     working = memory_stats.get("working_memory")
                     if isinstance(working, dict):
                         self._update_context_usage(working)
@@ -181,10 +148,7 @@ class AtlasMetricsCollector:
             self.last_metrics["operations"] = self.command_count
             self.last_metrics["inference"] = self._average_inference_ms()
 
-            if self.last_memory_layers == DEFAULT_MEMORY_LAYERS:
-                computed = self._compute_memory_layers()
-                if any(computed.values()):
-                    self.last_memory_layers = computed
+            self.last_memory_layers = self._compute_memory_layers()
 
             tool_usage = [
                 {"tool": name, "count": int(count)}
@@ -216,14 +180,33 @@ class AtlasMetricsCollector:
         with self.lock:
             self.command_count += 1
             self.total_inference_seconds += max(duration, 0.0)
-            status = "OK" if success else "ERR"
-            detail = f"[{status}] {command.strip()}"
-            self._append_event("COMMAND", detail, timestamp)
             self._maybe_update_processes(duration)
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+    def _initial_context_usage(self) -> Dict[str, int]:
+        working = getattr(self.agent, "working_memory", None)
+        if working is not None:
+            try:
+                stats = working.get_stats()
+            except Exception:
+                stats = None
+            if isinstance(stats, dict):
+                return self._context_from_stats(stats)
+        budget = self._token_budget()
+        max_k = max(0, round(budget / 1000)) if budget else 0
+        return {"current": 0, "max": max_k, "percentage": 0}
+
+    def _initial_atlas_metrics(self) -> Dict[str, int]:
+        metrics = dict(DEFAULT_ATLAS_METRICS)
+        tokens = self._current_token_usage()
+        if tokens is not None:
+            metrics["tokens"] = tokens
+        metrics["operations"] = self.command_count
+        metrics["inference"] = self._average_inference_ms()
+        return metrics
+
     def _append_event(self, event_type: str, detail: str, timestamp: Optional[str] = None) -> None:
         if not detail:
             return
@@ -233,31 +216,62 @@ class AtlasMetricsCollector:
             "detail": detail,
         }
         self.memory_events.appendleft(entry)
+        self._emit({"type": "memory_event", "payload": entry})
 
     def _update_context_usage(self, snapshot: Dict[str, Any]) -> None:
-        tokens = int(snapshot.get("tokens", 0))
-        token_budget = int(snapshot.get("token_budget", 0)) or self._token_budget()
+        self.last_context_usage = self._context_from_stats(snapshot)
+
+    def _context_from_stats(self, stats: Dict[str, Any]) -> Dict[str, int]:
+        tokens = int(stats.get("tokens", 0))
+        token_budget = int(stats.get("token_budget", 0) or stats.get("token_limit", 0) or 0)
+        if token_budget <= 0:
+            token_budget = self._token_budget()
         current_k = max(0, round(tokens / 1000))
-        max_k = max(1, round(token_budget / 1000)) if token_budget else self.last_context_usage.get("max", 32)
-        pct = snapshot.get("token_pct")
+        max_k = max(0, round(token_budget / 1000)) if token_budget else 0
+        pct = stats.get("token_pct")
         if isinstance(pct, (int, float)):
             percentage = max(0, min(100, int(pct)))
         elif token_budget:
             percentage = max(0, min(100, int((tokens / token_budget) * 100)))
         else:
-            percentage = self.last_context_usage.get("percentage", DEFAULT_CONTEXT_USAGE["percentage"])
-        self.last_context_usage = {"current": current_k, "max": max_k, "percentage": percentage}
+            percentage = 0
+        return {"current": current_k, "max": max_k, "percentage": percentage}
 
-    def _update_memory_layers_from_stats(self, stats: Dict[str, Any]) -> None:
+    def _record_memory_event(self, event_type: str, count: int, timestamp: Optional[str] = None) -> None:
+        label = "Semantic" if event_type.upper() == "FACT" else "Reflection"
+        plural = "memory" if count == 1 else "memories"
+        detail = f"Recorded {count} new {label.lower()} {plural}."
+        self._append_event(event_type, detail, timestamp)
+
+    def _emit(self, event: Dict[str, Any]) -> None:
+        if self._event_emitter is None:
+            return
+        try:
+            self._event_emitter(event)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Failed to emit event %s: %s", event.get("type"), exc)
+
+    def _update_memory_layers_from_stats(self, stats: Dict[str, Any], timestamp: Optional[str] = None) -> None:
+        prev_layers = dict(self.last_memory_layers)
         episodes = int(stats.get("episodic_count", 0))
         facts = int(stats.get("semantic_count", 0))
         insights = int(stats.get("reflections_count", 0))
-        if episodes or facts or insights:
-            self.last_memory_layers = {
-                "episodes": episodes,
-                "facts": facts,
-                "insights": insights,
-            }
+
+        new_layers = {
+            "episodes": episodes,
+            "facts": facts,
+            "insights": insights,
+        }
+        self.last_memory_layers = new_layers
+
+        ts = timestamp or datetime.now().strftime("%H:%M")
+        fact_delta = facts - prev_layers.get("facts", 0)
+        if fact_delta > 0:
+            self._record_memory_event("FACT", fact_delta, ts)
+
+        insight_delta = insights - prev_layers.get("insights", 0)
+        if insight_delta > 0:
+            self._record_memory_event("INSIGHT", insight_delta, ts)
 
     def _compute_memory_layers(self) -> Dict[str, int]:
         layers = {"episodes": 0, "facts": 0, "insights": 0}
@@ -407,9 +421,19 @@ class AtlasWebSocketServer:
         self.port = port
         self.client = OllamaClient()
         self.agent = agent or AtlasAgent(self.client)
-        self.collector = AtlasMetricsCollector(self.agent)
-        self._executor = ThreadPoolExecutor(max_workers=1)
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._subscribers: set[asyncio.Queue] = set()
+        self.collector = AtlasMetricsCollector(self.agent, event_emitter=self._queue_event)
+        self.graph_config = KnowledgeGraphConfig.from_env()
+        self.graph_store: Optional[SQLiteGraphStore] = None
+        self.graph_pipeline: Optional[KnowledgeGraphPipeline] = None
+        self.graph_extractor = MemoryGraphExtractor()
+        self._executor = ThreadPoolExecutor(max_workers=2)
         self._closed = False
+        self._graph_started = False
+        self._model_catalog: List[str] = list(DEFAULT_MODEL_CATALOG)
+        self._model_lock = Lock()
+        self._last_installed_models: List[str] = []
 
     async def handle_message(self, websocket: WebSocketServerProtocol, raw: str) -> None:
         logger.debug(f"Received message: {raw[:100]}...")
@@ -430,20 +454,50 @@ class AtlasWebSocketServer:
                 return
             logger.info(f"Executing command: {payload}")
             await self._execute_command_streaming(websocket, payload)
-            metrics = self.collector.snapshot()
-            await websocket.send(json.dumps({"type": "metrics", "payload": metrics}))
         elif msg_type == "set_model":
-            payload = data.get("payload", "")
-            if not isinstance(payload, str):
-                await self._send_error(websocket, "Model payload must be a string")
+            payload = data.get("payload")
+            model_value: Optional[str]
+            if isinstance(payload, dict):
+                model_value = payload.get("model")
+            else:
+                model_value = payload if isinstance(payload, str) else None
+            if not isinstance(model_value, str) or not model_value.strip():
+                await self._send_error(websocket, "Model payload must include a non-empty 'model' value")
                 return
-            logger.info(f"Setting model to: {payload}")
-            self.agent.set_chat_model(payload)
-            await websocket.send(json.dumps({"type": "response", "payload": f"Model switched to {payload}"}))
+            model_value = model_value.strip()
+            logger.info("Setting model to: %s", model_value)
+            self.agent.set_chat_model(model_value)
+            await websocket.send(json.dumps({"type": "model_updated", "payload": {"model": model_value}}))
+        elif msg_type == "update_profile":
+            payload = data.get("payload")
+            if not isinstance(payload, dict):
+                await self._send_error(websocket, "Profile payload must be an object")
+                return
+            try:
+                self.agent.set_user_profile(payload)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Failed to update user profile")
+                await self._send_error(websocket, f"Failed to update profile: {exc}")
+                return
+            logger.info("User profile updated")
+            await websocket.send(json.dumps({"type": "profile_updated", "payload": {"status": "ok"}}))
+            self._queue_event({"type": "profile_updated", "payload": self.agent.get_user_profile()})
+        elif msg_type == "list_models":
+            await self._handle_list_models(websocket)
+        elif msg_type == "pull_model":
+            await self._handle_pull_model(websocket, data.get("payload", {}))
+        elif msg_type == "shell_command":
+            await self._handle_shell_command(websocket, data.get("payload", {}))
         elif msg_type == "get_metrics":
             logger.debug("Sending metrics snapshot")
             metrics = self.collector.snapshot()
             await websocket.send(json.dumps({"type": "metrics", "payload": metrics}))
+        elif msg_type == "kg_search":
+            await self._handle_kg_search(websocket, data.get("payload", {}))
+        elif msg_type == "kg_neighbors":
+            await self._handle_kg_neighbors(websocket, data.get("payload", {}))
+        elif msg_type == "kg_context":
+            await self._handle_kg_context(websocket, data.get("payload", {}))
         else:
             logger.warning(f"Unknown message type: {msg_type}")
             await self._send_error(websocket, f"Unknown message type: {msg_type}")
@@ -451,6 +505,9 @@ class AtlasWebSocketServer:
     async def handler(self, websocket: WebSocketServerProtocol) -> None:
         client_info = f"{websocket.remote_address[0]}:{websocket.remote_address[1]}" if websocket.remote_address else "unknown"
         logger.info(f"Client connected: {client_info}")
+
+        subscriber_queue = self._register_subscriber()
+        sender_task = asyncio.create_task(self._drain_queue(websocket, subscriber_queue))
 
         try:
             async for message in websocket:
@@ -463,17 +520,24 @@ class AtlasWebSocketServer:
             return
         finally:
             logger.info(f"Client disconnected: {client_info}")
+            sender_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await sender_task
+            self._unregister_subscriber(subscriber_queue)
 
     async def start(self) -> None:
         logger.info(f"Starting WebSocket server on {self.host}:{self.port}")
         async with websockets.serve(self.handler, self.host, self.port):
+            self._loop = asyncio.get_running_loop()
+            await self._start_graph_pipeline()
             logger.info(f"ATLAS WebSocket server running on ws://{self.host}:{self.port}")
             print(f"ATLAS WebSocket server running on ws://{self.host}:{self.port}")
             try:
                 await asyncio.Future()
             except asyncio.CancelledError:
                 logger.info("Server shutdown requested")
-                pass
+            finally:
+                await self._stop_graph_pipeline()
 
     async def _execute_command(self, command: str) -> str:
         loop = asyncio.get_running_loop()
@@ -493,7 +557,7 @@ class AtlasWebSocketServer:
         return response
 
     async def _execute_command_streaming(self, websocket: WebSocketServerProtocol, command: str) -> None:
-        """Execute command and stream response chunks with Jarvis prefix."""
+        """Execute command and stream response chunks with Atlas prefix."""
         loop = asyncio.get_running_loop()
         start = time.perf_counter()
         full_response = []
@@ -512,10 +576,10 @@ class AtlasWebSocketServer:
             return response_text
 
         try:
-            # Send initial "Jarvis: " prefix
+            # Send initial "Atlas: " prefix
             await websocket.send(json.dumps({
                 "type": "response_chunk",
-                "payload": "Jarvis: ",
+                "payload": "Atlas: ",
                 "is_final": False
             }))
             sent_prefix = True
@@ -540,7 +604,7 @@ class AtlasWebSocketServer:
             error_msg = f"Error: {exc}"
             await websocket.send(json.dumps({
                 "type": "response_chunk",
-                "payload": error_msg if sent_prefix else f"Jarvis: {error_msg}",
+                "payload": error_msg if sent_prefix else f"Atlas: {error_msg}",
                 "is_final": True
             }))
             full_response = [error_msg]
@@ -549,10 +613,353 @@ class AtlasWebSocketServer:
         duration = time.perf_counter() - start
         response_text = "".join(full_response)
         self.collector.record_command_result(command, response_text, duration, success=success)
+        self._queue_event({
+            "type": "metrics",
+            "payload": self.collector.snapshot()
+        })
 
     async def _send_error(self, websocket: WebSocketServerProtocol, message: str) -> None:
         logger.error(f"Sending error to client: {message}")
         await websocket.send(json.dumps({"type": "error", "payload": message}))
+
+    async def _handle_kg_search(self, websocket: WebSocketServerProtocol, payload: Dict[str, Any]) -> None:
+        if not self.graph_store:
+            await self._send_error(websocket, "Knowledge graph is disabled")
+            return
+        query = str(payload.get("q") or payload.get("query") or "").strip()
+        if not query:
+            await self._send_error(websocket, "Missing search query")
+            return
+        limit = _safe_int(payload.get("limit"), 20)
+        records = self.graph_store.search_nodes(query, limit=limit)
+        await websocket.send(json.dumps({
+            "type": "kg_search",
+            "payload": {"nodes": self._serialize_nodes(records)}
+        }))
+
+    async def _handle_kg_neighbors(self, websocket: WebSocketServerProtocol, payload: Dict[str, Any]) -> None:
+        if not self.graph_store:
+            await self._send_error(websocket, "Knowledge graph is disabled")
+            return
+        try:
+            node_id = int(payload.get("node_id"))
+        except Exception:
+            await self._send_error(websocket, "node_id must be provided")
+            return
+        types = payload.get("types")
+        if types and not isinstance(types, list):
+            await self._send_error(websocket, "types must be a list")
+            return
+        limit = _safe_int(payload.get("limit"), 25)
+        neighbors, edges = self.graph_store.neighbors(node_id, types=types, limit=limit)
+        await websocket.send(json.dumps({
+            "type": "kg_neighbors",
+            "payload": {
+                "nodes": self._serialize_nodes(neighbors),
+                "edges": self._serialize_edges(edges),
+            },
+        }))
+
+    async def _handle_kg_context(self, websocket: WebSocketServerProtocol, payload: Dict[str, Any]) -> None:
+        if not self.graph_store:
+            await self._send_error(websocket, "Knowledge graph is disabled")
+            return
+        seeds_raw = payload.get("seeds")
+        seeds: List[int] = []
+        if isinstance(seeds_raw, list):
+            for item in seeds_raw:
+                try:
+                    seeds.append(int(item))
+                except (TypeError, ValueError):
+                    continue
+        depth = _safe_int(payload.get("depth"), 1)
+        limit = _safe_int(payload.get("limit"), 50)
+        if not seeds:
+            recent = self.graph_store.recent_nodes(limit=limit)
+            seeds = [record.id for record in recent]
+        nodes, edges = self.graph_store.subgraph(seeds, depth=depth, limit=limit)
+        await websocket.send(json.dumps({
+            "type": "kg_context",
+            "payload": {
+                "nodes": self._serialize_nodes(nodes),
+                "edges": self._serialize_edges(edges),
+            },
+        }))
+
+    async def _handle_list_models(self, websocket: WebSocketServerProtocol) -> None:
+        payload = self._models_payload()
+        await websocket.send(json.dumps({"type": "models_list", "payload": payload}))
+
+    async def _handle_pull_model(self, websocket: WebSocketServerProtocol, payload: Dict[str, Any]) -> None:
+        model = str(payload.get("model", "")).strip()
+        if not model:
+            await self._send_error(websocket, "Model name is required")
+            return
+
+        await websocket.send(json.dumps({
+            "type": "model_pull",
+            "payload": {"model": model, "status": "started"},
+        }))
+
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue()
+
+        def worker() -> None:
+            try:
+                for event in self.client.pull_model(model):
+                    loop.call_soon_threadsafe(queue.put_nowait, ("progress", event))
+                loop.call_soon_threadsafe(queue.put_nowait, ("done", None))
+            except Exception as exc:  # noqa: BLE001
+                loop.call_soon_threadsafe(queue.put_nowait, ("error", str(exc)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+        while True:
+            kind, data = await queue.get()
+            if kind == "progress":
+                progress = data if isinstance(data, dict) else {"status": str(data)}
+                progress_payload = {
+                    "model": model,
+                    "status": progress.get("status", "progress"),
+                    "completed": progress.get("completed"),
+                    "total": progress.get("total"),
+                }
+                await websocket.send(json.dumps({
+                    "type": "model_pull",
+                    "payload": progress_payload,
+                }))
+            elif kind == "error":
+                await websocket.send(json.dumps({
+                    "type": "model_pull",
+                    "payload": {"model": model, "status": "error", "message": str(data)},
+                }))
+                return
+            elif kind == "done":
+                break
+
+        snapshot = self._models_payload()
+        await websocket.send(json.dumps({
+            "type": "model_pull",
+            "payload": {"model": model, "status": "completed"},
+        }))
+        await websocket.send(json.dumps({"type": "models_list", "payload": snapshot}))
+        self._broadcast_models(snapshot["installed"])
+
+    async def _handle_shell_command(self, websocket: WebSocketServerProtocol, payload: Dict[str, Any]) -> None:
+        command = str(payload.get("command", "")).strip()
+        if not command:
+            await self._send_error(websocket, "Shell command is required")
+            return
+
+        cwd_value = payload.get("cwd")
+        cwd_path: Optional[Path] = None
+        if isinstance(cwd_value, str) and cwd_value.strip():
+            cwd_path = Path(cwd_value).expanduser()
+            if not cwd_path.exists():
+                await self._send_error(websocket, f"cwd does not exist: {cwd_path}")
+                return
+            if not cwd_path.is_dir():
+                await self._send_error(websocket, f"cwd is not a directory: {cwd_path}")
+                return
+
+        timeout_raw = payload.get("timeout")
+        try:
+            timeout_value = max(1, int(timeout_raw)) if timeout_raw is not None else 120
+        except (TypeError, ValueError):
+            timeout_value = 120
+
+        command_id = str(payload.get("id") or uuid.uuid4())
+
+        await websocket.send(json.dumps({
+            "type": "shell_start",
+            "payload": {"id": command_id, "command": command, "cwd": str(cwd_path) if cwd_path else None},
+        }))
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "/bin/bash",
+                "-lc",
+                command,
+                stdout=PIPE,
+                stderr=PIPE,
+                cwd=str(cwd_path) if cwd_path else None,
+            )
+        except FileNotFoundError:
+            await websocket.send(json.dumps({
+                "type": "shell_error",
+                "payload": {"id": command_id, "message": "Failed to launch shell"},
+            }))
+            return
+
+        stdout_task = asyncio.create_task(self._stream_process_stream(process.stdout, "stdout", command_id, websocket))
+        stderr_task = asyncio.create_task(self._stream_process_stream(process.stderr, "stderr", command_id, websocket))
+
+        timed_out = False
+        try:
+            exit_code = await asyncio.wait_for(process.wait(), timeout=timeout_value)
+        except asyncio.TimeoutError:
+            timed_out = True
+            process.kill()
+            exit_code = await process.wait()
+        finally:
+            await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+
+        if timed_out:
+            await websocket.send(json.dumps({
+                "type": "shell_error",
+                "payload": {"id": command_id, "message": f"Command timed out after {timeout_value}s"},
+            }))
+
+        await websocket.send(json.dumps({
+            "type": "shell_complete",
+            "payload": {"id": command_id, "exit_code": exit_code, "timed_out": timed_out},
+        }))
+
+    async def _stream_process_stream(
+        self,
+        stream: asyncio.StreamReader,
+        stream_name: str,
+        command_id: str,
+        websocket: WebSocketServerProtocol,
+    ) -> None:
+        try:
+            while True:
+                line = await stream.readline()
+                if not line:
+                    break
+                text = line.decode("utf-8", errors="replace").rstrip()
+                if not text:
+                    continue
+                await websocket.send(json.dumps({
+                    "type": "shell_output",
+                    "payload": {"id": command_id, "stream": stream_name, "data": text},
+                }))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Shell stream %s failed: %s", stream_name, exc)
+
+    def _register_subscriber(self) -> asyncio.Queue:
+        queue: asyncio.Queue = asyncio.Queue(maxsize=200)
+        self._subscribers.add(queue)
+        return queue
+
+    def _unregister_subscriber(self, queue: asyncio.Queue) -> None:
+        self._subscribers.discard(queue)
+
+    async def _drain_queue(self, websocket: WebSocketServerProtocol, queue: asyncio.Queue) -> None:
+        try:
+            while True:
+                event = await queue.get()
+                await websocket.send(json.dumps(event))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Queue drain stopped for websocket %s: %s", websocket.remote_address, exc)
+
+    def _queue_event(self, event: Dict[str, Any]) -> None:
+        if not self._subscribers or self._loop is None:
+            return
+
+        for subscriber in list(self._subscribers):
+            self._loop.call_soon_threadsafe(self._enqueue_event, subscriber, dict(event))
+
+    @staticmethod
+    def _enqueue_event(queue: asyncio.Queue, event: Dict[str, Any]) -> None:
+        try:
+            queue.put_nowait(event)
+        except asyncio.QueueFull:
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            try:
+                queue.put_nowait(event)
+            except asyncio.QueueFull:
+                logger.debug("Dropping event %s due to persistent full queue", event.get("type"))
+
+    def _models_payload(self, installed: Optional[List[str]] = None) -> Dict[str, Any]:
+        if installed is None:
+            try:
+                installed = self.client.list_models()
+            except Exception as exc:
+                logger.debug("Failed to list models from Ollama: %s", exc)
+                installed = list(self._last_installed_models)
+        installed_clean = sorted({model.strip() for model in installed if model})
+        with self._model_lock:
+            catalog = sorted({*self._model_catalog, *installed_clean})
+            self._model_catalog = catalog
+        self._last_installed_models = installed_clean
+        return {
+            "installed": installed_clean,
+            "available": list(self._model_catalog),
+            "current": self.agent.chat_model,
+        }
+
+    def _broadcast_models(self, installed: Optional[List[str]] = None) -> None:
+        payload = self._models_payload(installed)
+        self._queue_event({"type": "models_list", "payload": payload})
+
+    async def _start_graph_pipeline(self) -> None:
+        if self._graph_started or not self.graph_config.enabled or self._loop is None:
+            return
+        try:
+            self.graph_store = SQLiteGraphStore(self.graph_config)
+            self.graph_pipeline = KnowledgeGraphPipeline(
+                loop=self._loop,
+                config=self.graph_config,
+                store=self.graph_store,
+                extractor=self.graph_extractor,
+                event_callback=self._queue_event,
+            )
+            set_pipeline(self.graph_pipeline)
+            self._graph_started = True
+        except Exception:
+            logger.exception("Failed to initialize knowledge graph pipeline")
+            self.graph_store = None
+            self.graph_pipeline = None
+            self._graph_started = False
+
+    async def _stop_graph_pipeline(self) -> None:
+        if self.graph_pipeline:
+            try:
+                await self.graph_pipeline.shutdown()
+            except Exception:
+                logger.debug("Graph pipeline shutdown encountered an error", exc_info=True)
+        clear_pipeline()
+        if self.graph_store:
+            try:
+                self.graph_store.close()
+            except Exception:
+                logger.debug("Graph store close encountered an error", exc_info=True)
+        self.graph_store = None
+        self.graph_pipeline = None
+        self._graph_started = False
+
+    def _serialize_nodes(self, nodes: Iterable) -> List[Dict[str, Any]]:
+        serialized: List[Dict[str, Any]] = []
+        for node in nodes:
+            props = getattr(node, "props", {}) or {}
+            serialized.append(
+                {
+                    "id": int(getattr(node, "id")),
+                    "type": getattr(node, "type"),
+                    "label": getattr(node, "label"),
+                    "props": props,
+                }
+            )
+        return serialized
+
+    def _serialize_edges(self, edges: Iterable) -> List[Dict[str, Any]]:
+        serialized: List[Dict[str, Any]] = []
+        for edge in edges:
+            serialized.append(
+                {
+                    "id": int(getattr(edge, "id")),
+                    "from": int(getattr(edge, "src")),
+                    "to": int(getattr(edge, "dst")),
+                    "type": getattr(edge, "type"),
+                }
+            )
+        return serialized
 
     def shutdown(self) -> None:
         if self._closed:
@@ -566,7 +973,21 @@ class AtlasWebSocketServer:
             self.client.close()
         except Exception:
             pass
+        if self.graph_store:
+            try:
+                self.graph_store.close()
+            except Exception:
+                pass
+        clear_pipeline()
         self._executor.shutdown(wait=False)
+
+
+def _safe_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+        return max(1, parsed)
+    except (TypeError, ValueError):
+        return default
 
 
 def run(host: str = "localhost", port: int = 8765) -> None:

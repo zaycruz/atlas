@@ -7,7 +7,7 @@
 }
 
 body {
-  @apply bg-atlas-black text-atlas-green-500 font-mono text-[11px];
+  @apply bg-atlas-black text-atlas-green-500 font-mono text-[14px];
 }
 
 #root {
@@ -15,7 +15,7 @@ body {
 }
 
 ::-webkit-scrollbar {
-  width: 6px;
+  width: 10px;
 }
 
 ::-webkit-scrollbar-track {
@@ -24,4 +24,9 @@ body {
 
 ::-webkit-scrollbar-thumb {
   background: #0f5132;
+  border-radius: 5px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #16A34A;
 }

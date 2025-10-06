@@ -39,6 +39,7 @@ export interface ToolRun {
 export interface TerminalEntry {
   type: 'system' | 'command' | 'success' | 'error' | 'warn' | 'info';
   text: string;
+  timestamp?: number;
 }
 
 export interface TopicDistribution {
@@ -62,6 +63,20 @@ export interface GraphNode {
 export interface GraphEdge {
   from: number;
   to: number;
+}
+
+export interface KnowledgeGraphNode {
+  id: number;
+  type: string;
+  label: string;
+  props?: Record<string, string>;
+}
+
+export interface KnowledgeGraphEdge {
+  id: number;
+  from: number;
+  to: number;
+  type: string;
 }
 
 export interface Process {

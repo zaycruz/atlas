@@ -3,10 +3,11 @@
 
 import asyncio
 import json
+
 import websockets
 
 
-async def test_websocket():
+async def _run_test() -> None:
     """Test sending a command and receiving a response."""
     uri = "ws://localhost:8765"
 
@@ -46,4 +47,8 @@ async def test_websocket():
 
 
 if __name__ == "__main__":
-    asyncio.run(test_websocket())
+    asyncio.run(_run_test())
+
+
+def test_websocket() -> None:
+    asyncio.run(_run_test())

@@ -32,13 +32,18 @@ export const NetworkTab: React.FC<NetworkTabProps> = ({ nodes, edges }) => {
 
   return (
     <div className="h-full">
-      <div className="flex items-center gap-2 px-3 py-1 border-b border-atlas-green-900">
-        <Network size={12} className="text-atlas-yellow-400" />
-        <span className="text-[11px] text-atlas-yellow-400">KNOWLEDGE GRAPH</span>
+      <div className="flex items-center gap-2 px-4 py-2 border-b border-atlas-green-900">
+        <Network size={16} className="text-atlas-yellow-400" />
+        <span className="text-sm font-semibold text-atlas-yellow-400">KNOWLEDGE GRAPH</span>
       </div>
 
       <div className="relative h-full flex items-center justify-center p-4">
-        <svg className="w-full h-full">
+        {nodes.length === 0 ? (
+          <div className="text-atlas-green-600 text-sm">
+            Knowledge graph is not available yet.
+          </div>
+        ) : (
+          <svg className="w-full h-full">
           {edges.map((edge, i) => {
             const from = nodes.find((n) => n.id === edge.from);
             const to = nodes.find((n) => n.id === edge.to);
@@ -70,26 +75,27 @@ export const NetworkTab: React.FC<NetworkTabProps> = ({ nodes, edges }) => {
                 x={`${node.x}%`}
                 y={`${node.y + 4}%`}
                 textAnchor="middle"
-                className="text-[9px] fill-current text-atlas-green-400"
+                className="text-xs fill-current text-atlas-green-400"
               >
                 {node.label}
               </text>
             </g>
           ))}
-        </svg>
+          </svg>
+        )}
 
-        <div className="absolute bottom-4 left-4 text-[10px] space-y-0.5">
-          <div className="text-atlas-cyan-400 mb-1">Legend:</div>
+        <div className="absolute bottom-4 left-4 text-xs space-y-1">
+          <div className="text-atlas-cyan-400 mb-2 font-semibold">Legend:</div>
           <div className="flex items-center gap-2">
-            <div className="w-3 h-3 rounded-full bg-atlas-yellow-400" />
+            <div className="w-4 h-4 rounded-full bg-atlas-yellow-400" />
             <span className="text-atlas-green-500">Core Concept</span>
           </div>
           <div className="flex items-center gap-2">
-            <div className="w-2 h-2 rounded-full bg-atlas-cyan-400" />
+            <div className="w-3 h-3 rounded-full bg-atlas-cyan-400" />
             <span className="text-atlas-green-500">Major Topic</span>
           </div>
           <div className="flex items-center gap-2">
-            <div className="w-1.5 h-1.5 rounded-full bg-atlas-green-500" />
+            <div className="w-2 h-2 rounded-full bg-atlas-green-500" />
             <span className="text-atlas-green-500">Related Concept</span>
           </div>
         </div>
