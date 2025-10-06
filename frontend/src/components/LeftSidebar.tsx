@@ -1,5 +1,5 @@
-import React from 'react';
-import { Cpu, Network, Terminal, TrendingUp } from 'lucide-react';
+import React, { useState } from 'react';
+import { Cpu, Network, Terminal, TrendingUp, ChevronDown } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 
 interface Module {
@@ -17,19 +17,14 @@ interface LeftSidebarProps {
     network: number;
     disk: number;
   };
-  atlasMetrics: {
-    tokens: number;
-    operations: number;
-    inference: number;
-  };
 }
 
 export const LeftSidebar: React.FC<LeftSidebarProps> = ({
   activeModule,
   setActiveModule,
-  systemMetrics,
-  atlasMetrics
+  systemMetrics
 }) => {
+  const [isSystemExpanded, setIsSystemExpanded] = useState(true);
   const modules: Module[] = [
     { id: 'terminal', icon: Terminal, label: 'CHAT' },
     { id: 'analytics', icon: TrendingUp, label: 'ANALYTICS' },
@@ -64,42 +59,31 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
       </div>
 
       <div className="border-b border-atlas-green-900">
-        <div className="text-xs font-semibold text-atlas-yellow-400 px-3 py-2 border-b border-atlas-green-900">
-          SYSTEM
-        </div>
-        <div className="px-3 py-2 space-y-2 text-xs">
-          {Object.entries(systemMetrics).map(([key, value]) => (
-            <div key={key}>
-              <div className="flex justify-between mb-1">
-                <span className="text-atlas-green-700 uppercase">{key}</span>
-                <span className="text-atlas-green-400">{Math.round(value)}%</span>
+        <button
+          onClick={() => setIsSystemExpanded(!isSystemExpanded)}
+          className="w-full text-xs font-semibold text-atlas-yellow-400 px-3 py-2 border-b border-atlas-green-900 flex items-center justify-between hover:bg-atlas-green-950/30 transition-colors"
+        >
+          <span>SYSTEM</span>
+          <ChevronDown
+            size={14}
+            className={`transition-transform ${isSystemExpanded ? 'rotate-180' : ''}`}
+          />
+        </button>
+        {isSystemExpanded && (
+          <div className="px-3 py-2 space-y-2 text-xs">
+            {Object.entries(systemMetrics).map(([key, value]) => (
+              <div key={key}>
+                <div className="flex justify-between mb-1">
+                  <span className="text-atlas-green-700 uppercase">{key}</span>
+                  <span className="text-atlas-green-400">{Math.round(value)}%</span>
+                </div>
+                <div className="w-full bg-atlas-green-950 h-1 rounded-full">
+                  <div className="bg-atlas-green-500 h-1 rounded-full" style={{ width: `${Math.min(100, value)}%` }} />
+                </div>
               </div>
-              <div className="w-full bg-atlas-green-950 h-1 rounded-full">
-                <div className="bg-atlas-green-500 h-1 rounded-full" style={{ width: `${Math.min(100, value)}%` }} />
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>
-
-      <div className="border-b border-atlas-green-900">
-        <div className="text-xs font-semibold text-atlas-yellow-400 px-3 py-2 border-b border-atlas-green-900">
-          ATLAS
-        </div>
-        <div className="px-3 py-2 space-y-1.5 text-xs">
-          <div className="flex justify-between">
-            <span className="text-atlas-green-700">Tokens</span>
-            <span className="text-atlas-cyan-400">{atlasMetrics.tokens.toLocaleString()}</span>
+            ))}
           </div>
-          <div className="flex justify-between">
-            <span className="text-atlas-green-700">Operations</span>
-            <span className="text-atlas-cyan-400">{atlasMetrics.operations}</span>
-          </div>
-          <div className="flex justify-between">
-            <span className="text-atlas-green-700">Inference</span>
-            <span className="text-atlas-cyan-400">{atlasMetrics.inference}ms</span>
-          </div>
-        </div>
+        )}
       </div>
     </div>
   );

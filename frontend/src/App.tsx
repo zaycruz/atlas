@@ -644,7 +644,6 @@ const App: React.FC = () => {
           activeModule={activeModule}
           setActiveModule={setActiveModule}
           systemMetrics={systemMetrics}
-          atlasMetrics={atlasMetrics}
         />
         <div className="col-span-7 border-r border-atlas-green-900 flex flex-col">
           {activeModule === 'analytics' && (
