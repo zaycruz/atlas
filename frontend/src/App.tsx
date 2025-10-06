@@ -310,7 +310,7 @@ const App: React.FC = () => {
 
   return (
     <div className="min-h-screen bg-atlas-black text-atlas-green-500 flex flex-col">
-      <Header time={time} />
+      <Header time={time} isConnected={isConnected} />
       <div className="flex-1 grid grid-cols-12">
         <LeftSidebar
           activeModule={activeModule}
