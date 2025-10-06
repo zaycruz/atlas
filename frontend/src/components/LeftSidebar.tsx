@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Cpu, Network, Terminal, TrendingUp, ChevronDown } from 'lucide-react';
+import { Cpu, Network, Terminal, TrendingUp, ChevronDown, Settings } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 
 interface Module {
@@ -24,12 +24,13 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
   setActiveModule,
   systemMetrics
 }) => {
-  const [isSystemExpanded, setIsSystemExpanded] = useState(true);
+  const [isSystemExpanded, setIsSystemExpanded] = useState(false);
   const modules: Module[] = [
     { id: 'terminal', icon: Terminal, label: 'CHAT' },
     { id: 'analytics', icon: TrendingUp, label: 'ANALYTICS' },
     { id: 'network', icon: Network, label: 'NETWORK' },
-    { id: 'system', icon: Cpu, label: 'SYSTEM' }
+    { id: 'system', icon: Cpu, label: 'SYSTEM' },
+    { id: 'settings', icon: Settings, label: 'SETTINGS' }
   ];
 
   return (

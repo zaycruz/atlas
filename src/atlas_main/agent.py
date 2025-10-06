@@ -234,6 +234,10 @@ class AtlasAgent:
         with self._profile_lock:
             return dict(self._user_profile)
 
+    def set_test_mode(self, enabled: bool) -> None:
+        """Enable or disable test mode. When enabled, interactions are not logged to memory."""
+        self.test_mode = enabled
+
     def _format_user_profile(self) -> str:
         with self._profile_lock:
             profile = dict(self._user_profile)

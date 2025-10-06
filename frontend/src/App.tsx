@@ -7,6 +7,7 @@ import { TerminalFooter } from './components/TerminalFooter';
 import { AnalyticsTab } from './components/AnalyticsTab';
 import { NetworkTab } from './components/NetworkTab';
 import { SystemTab } from './components/SystemTab';
+import { SettingsTab } from './components/SettingsTab';
 import type { AIModel } from './components/ModelToggler';
 import { UserProfile, type UserProfileData } from './components/UserProfile';
 import type { AgentState } from './components/AgentStatus';
@@ -135,6 +136,11 @@ const App: React.FC = () => {
       askBeforeAction: true
     }
   });
+  const [apiKeys, setApiKeys] = useState({
+    openai: '',
+    anthropic: ''
+  });
+  const [testMode, setTestMode] = useState(false);
 
   const systemMetrics = useSystemMetrics();
   const { isConnected, messages, clearMessages, sendMessage } = useWebSocket(WS_URL);
@@ -242,10 +248,6 @@ const App: React.FC = () => {
               ...prev,
               { type: 'success', text: streamingResponseRef.current, timestamp }
             ]);
-            setTerminalHistory((prev) => [
-              ...prev,
-              { type: 'success', text: streamingResponseRef.current, timestamp }
-            ]);
           }
           setStreamingResponse('');
           streamingResponseRef.current = '';
@@ -270,10 +272,6 @@ const App: React.FC = () => {
           ...prev,
           { type: 'success', text, timestamp }
         ]);
-        setTerminalHistory((prev) => [
-          ...prev,
-          { type: 'success', text, timestamp }
-        ]);
       }
 
       if (message.type === 'error') {
@@ -283,10 +281,6 @@ const App: React.FC = () => {
             : JSON.stringify(message.payload, null, 2);
         const timestamp = Date.now();
         setChatHistory((prev) => [
-          ...prev,
-          { type: 'error', text, timestamp }
-        ]);
-        setTerminalHistory((prev) => [
           ...prev,
           { type: 'error', text, timestamp }
         ]);
@@ -505,17 +499,10 @@ const App: React.FC = () => {
     // Add to command history
     commandHistory.addCommand(trimmedInput);
 
-    // Add to chat history (without $ prefix)
+    // Add to chat history only (without $ prefix)
     setChatHistory((prev) => [
       ...prev,
       { type: 'command', text: trimmedInput, timestamp }
-    ]);
-
-    // Add to terminal history (with $ prefix)
-    const commandText = `$ ${trimmedInput}`;
-    setTerminalHistory((prev) => [
-      ...prev,
-      { type: 'command', text: commandText, timestamp }
     ]);
 
     console.log('[App] isConnected:', isConnected, 'sending message');
@@ -527,14 +514,9 @@ const App: React.FC = () => {
     } else {
       console.log('[App] WebSocket not connected, showing error');
       const errorMsg = 'WebSocket disconnected. Unable to send command.';
-      const timestamp = Date.now();
       setChatHistory((prev) => [
         ...prev,
-        { type: 'error', text: errorMsg, timestamp }
-      ]);
-      setTerminalHistory((prev) => [
-        ...prev,
-        { type: 'error', text: errorMsg, timestamp }
+        { type: 'error', text: errorMsg, timestamp: Date.now() }
       ]);
       setAgentStatus('idle');
     }
@@ -613,7 +595,29 @@ const App: React.FC = () => {
     setTerminalHistory(DEFAULT_TERMINAL);
   };
 
-  // Load profile from localStorage on mount
+  const handleApiKeysUpdate = (keys: { openai?: string; anthropic?: string }) => {
+    console.log('[App] API keys updated');
+    const updatedKeys = { ...apiKeys, ...keys };
+    setApiKeys(updatedKeys);
+    // Send API keys to backend
+    if (isConnected) {
+      sendMessage({ type: 'update_api_keys', payload: updatedKeys });
+    }
+    // Save to localStorage for persistence
+    localStorage.setItem('atlas_api_keys', JSON.stringify(updatedKeys));
+  };
+
+  const handleTestModeToggle = () => {
+    const newTestMode = !testMode;
+    console.log('[App] Test mode toggled:', newTestMode);
+    setTestMode(newTestMode);
+    // Send test mode to backend
+    if (isConnected) {
+      sendMessage({ type: 'set_test_mode', payload: { enabled: newTestMode } });
+    }
+  };
+
+  // Load profile and API keys from localStorage on mount
   useEffect(() => {
     const savedProfile = localStorage.getItem('atlas_user_profile');
     if (savedProfile) {
@@ -623,29 +627,36 @@ const App: React.FC = () => {
         console.error('Failed to load user profile:', error);
       }
     }
+
+    const savedApiKeys = localStorage.getItem('atlas_api_keys');
+    if (savedApiKeys) {
+      try {
+        setApiKeys(JSON.parse(savedApiKeys));
+      } catch (error) {
+        console.error('Failed to load API keys:', error);
+      }
+    }
   }, []);
 
   return (
-    <div className="min-h-screen bg-atlas-black text-atlas-green-500 flex flex-col">
+    <div className="h-screen bg-atlas-black text-atlas-green-500 flex flex-col overflow-hidden">
       <Header
         time={time}
         isConnected={isConnected}
         currentModel={currentModel}
         onModelChange={handleModelChange}
         installedModels={installedModels}
-        availableModels={availableModels}
-        onAddModel={handleAddModel}
-        modelPullStatus={modelPullStatus}
-        onOpenProfile={() => setIsProfileOpen(true)}
         agentStatus={agentStatus}
+        testMode={testMode}
+        onTestModeToggle={handleTestModeToggle}
       />
-      <div className="flex-1 grid grid-cols-12">
+      <div className="flex-1 grid grid-cols-12 overflow-hidden">
         <LeftSidebar
           activeModule={activeModule}
           setActiveModule={setActiveModule}
           systemMetrics={systemMetrics}
         />
-        <div className="col-span-7 border-r border-atlas-green-900 flex flex-col">
+        <div className="col-span-7 border-r border-atlas-green-900 flex flex-col h-full overflow-hidden">
           {activeModule === 'analytics' && (
             <AnalyticsTab
               topicDistribution={topicDistribution}
@@ -670,6 +681,20 @@ const App: React.FC = () => {
               streamingText={streamingResponse}
               onNavigateHistory={commandHistory.navigateHistory}
               onClear={handleClearChat}
+            />
+          )}
+          {activeModule === 'settings' && (
+            <SettingsTab
+              profile={userProfile}
+              onProfileSave={handleProfileSave}
+              currentModel={currentModel}
+              installedModels={installedModels}
+              availableModels={availableModels}
+              onModelChange={handleModelChange}
+              onAddModel={handleAddModel}
+              modelPullStatus={modelPullStatus}
+              apiKeys={apiKeys}
+              onApiKeysUpdate={handleApiKeysUpdate}
             />
           )}
         </div>

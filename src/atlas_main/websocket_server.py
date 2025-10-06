@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from threading import Lock
-from typing import Any, Deque, Dict, List, Optional, Callable
+from typing import Any, Deque, Dict, Iterable, List, Optional, Callable
 
 import websockets
 from websockets.server import WebSocketServerProtocol
@@ -482,6 +482,39 @@ class AtlasWebSocketServer:
             logger.info("User profile updated")
             await websocket.send(json.dumps({"type": "profile_updated", "payload": {"status": "ok"}}))
             self._queue_event({"type": "profile_updated", "payload": self.agent.get_user_profile()})
+        elif msg_type == "update_api_keys":
+            payload = data.get("payload")
+            if not isinstance(payload, dict):
+                await self._send_error(websocket, "API keys payload must be an object")
+                return
+            try:
+                # Store API keys in agent's configuration
+                openai_key = payload.get("openai", "")
+                anthropic_key = payload.get("anthropic", "")
+                # TODO: Implement actual API key storage and model integration
+                # For now, just acknowledge receipt
+                logger.info("API keys updated (OpenAI: %s, Anthropic: %s)",
+                           "***" if openai_key else "empty",
+                           "***" if anthropic_key else "empty")
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Failed to update API keys")
+                await self._send_error(websocket, f"Failed to update API keys: {exc}")
+                return
+            await websocket.send(json.dumps({"type": "api_keys_updated", "payload": {"status": "ok"}}))
+        elif msg_type == "set_test_mode":
+            payload = data.get("payload")
+            if not isinstance(payload, dict):
+                await self._send_error(websocket, "Test mode payload must be an object")
+                return
+            try:
+                enabled = payload.get("enabled", False)
+                self.agent.set_test_mode(enabled)
+                logger.info("Test mode set to: %s", enabled)
+                await websocket.send(json.dumps({"type": "test_mode_updated", "payload": {"enabled": enabled}}))
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Failed to set test mode")
+                await self._send_error(websocket, f"Failed to set test mode: {exc}")
+                return
         elif msg_type == "list_models":
             await self._handle_list_models(websocket)
         elif msg_type == "pull_model":

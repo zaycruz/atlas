@@ -1,9 +1,8 @@
 import React from 'react';
-import { User } from 'lucide-react';
 import { ConnectionStatus } from './ConnectionStatus';
 import { ModelToggler, type AIModel } from './ModelToggler';
 import { AgentStatus, type AgentState } from './AgentStatus';
-import { Tooltip } from './Tooltip';
+import { TestModeToggle } from './TestModeToggle';
 
 interface HeaderProps {
   time: Date;
@@ -11,15 +10,9 @@ interface HeaderProps {
   currentModel: AIModel;
   onModelChange: (model: AIModel) => void;
   installedModels: string[];
-  availableModels: string[];
-  onAddModel: (model: string) => void;
-  modelPullStatus?: {
-    model: string | null;
-    status: 'idle' | 'started' | 'progress' | 'completed' | 'error';
-    message?: string;
-  };
-  onOpenProfile: () => void;
   agentStatus: AgentState;
+  testMode: boolean;
+  onTestModeToggle: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -28,11 +21,9 @@ export const Header: React.FC<HeaderProps> = ({
   currentModel,
   onModelChange,
   installedModels,
-  availableModels,
-  onAddModel,
-  modelPullStatus,
-  onOpenProfile,
-  agentStatus
+  agentStatus,
+  testMode,
+  onTestModeToggle
 }) => {
   return (
     <div className="px-4 py-3 border-b border-atlas-green-900 flex justify-between items-center">
@@ -47,22 +38,11 @@ export const Header: React.FC<HeaderProps> = ({
 
       <div className="flex items-center gap-4">
         <AgentStatus status={agentStatus} />
-        <Tooltip content="User Profile & Preferences" position="bottom">
-          <button
-            onClick={onOpenProfile}
-            className="flex items-center gap-2 px-3 py-1.5 bg-atlas-green-950/30 border border-atlas-green-900 rounded-md hover:border-atlas-cyan-400 transition-colors"
-          >
-            <User size={14} className="text-atlas-green-500" />
-            <span className="text-xs font-semibold text-atlas-green-500">Profile</span>
-          </button>
-        </Tooltip>
+        <TestModeToggle enabled={testMode} onToggle={onTestModeToggle} />
         <ModelToggler
           currentModel={currentModel}
           installed={installedModels}
-          available={availableModels}
           onModelChange={onModelChange}
-          onAddModel={onAddModel}
-          pullStatus={modelPullStatus}
         />
         <ConnectionStatus isConnected={isConnected} />
         <div className="text-right">
