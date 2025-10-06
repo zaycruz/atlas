@@ -8,6 +8,7 @@ interface TerminalTabProps {
   setInput: (value: string) => void;
   onCommand: () => void;
   streamingText?: string;
+  onNavigateHistory?: (direction: 'up' | 'down') => string | null;
 }
 
 export const TerminalTab: React.FC<TerminalTabProps> = ({
@@ -15,7 +16,8 @@ export const TerminalTab: React.FC<TerminalTabProps> = ({
   input,
   setInput,
   onCommand,
-  streamingText = ''
+  streamingText = '',
+  onNavigateHistory
 }) => {
   const historyRef = useRef<HTMLDivElement | null>(null);
   const handleWheel = useCallback((event: React.WheelEvent<HTMLDivElement>) => {
@@ -102,6 +104,18 @@ export const TerminalTab: React.FC<TerminalTabProps> = ({
               if (e.key === 'Enter') {
                 e.preventDefault();
                 onCommand();
+              } else if (e.key === 'ArrowUp' && onNavigateHistory) {
+                e.preventDefault();
+                const command = onNavigateHistory('up');
+                if (command !== null) {
+                  setInput(command);
+                }
+              } else if (e.key === 'ArrowDown' && onNavigateHistory) {
+                e.preventDefault();
+                const command = onNavigateHistory('down');
+                if (command !== null) {
+                  setInput(command);
+                }
               }
             }}
             className="flex-1 bg-transparent outline-none text-atlas-green-400 text-sm"

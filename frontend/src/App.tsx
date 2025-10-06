@@ -10,6 +10,7 @@ import { ModelToggler, type AIModel } from './components/ModelToggler';
 import { UserProfile, type UserProfileData } from './components/UserProfile';
 import { useWebSocket } from './hooks/useWebSocket';
 import { useSystemMetrics } from './hooks/useSystemMetrics';
+import { useCommandHistory } from './hooks/useCommandHistory';
 import type {
   AtlasMetrics,
   ContextUsage,
@@ -125,6 +126,7 @@ const App: React.FC = () => {
 
   const systemMetrics = useSystemMetrics();
   const { isConnected, messages, clearMessages, sendMessage } = useWebSocket(WS_URL);
+  const commandHistory = useCommandHistory();
 
   const [terminalInput, setTerminalInput] = useState('');
   const [terminalHistory, setTerminalHistory] = useState<TerminalEntry[]>(DEFAULT_TERMINAL);
@@ -302,7 +304,12 @@ const App: React.FC = () => {
     console.log('[App] handleCommand called, input:', terminalInput);
     if (!terminalInput.trim()) return;
 
-    const commandText = `$ ${terminalInput.trim()}`;
+    const trimmedInput = terminalInput.trim();
+
+    // Add to command history
+    commandHistory.addCommand(trimmedInput);
+
+    const commandText = `$ ${trimmedInput}`;
     setTerminalHistory((prev) => [
       ...prev,
       { type: 'command', text: commandText }
@@ -310,7 +317,7 @@ const App: React.FC = () => {
 
     console.log('[App] isConnected:', isConnected, 'sending message');
     if (isConnected) {
-      const message = { type: 'command', payload: terminalInput.trim() };
+      const message = { type: 'command', payload: trimmedInput };
       console.log('[App] Sending WebSocket message:', message);
       sendMessage(message);
     } else {
@@ -322,6 +329,7 @@ const App: React.FC = () => {
     }
 
     setTerminalInput('');
+    commandHistory.resetPosition();
   };
 
   const handleModelChange = (model: AIModel) => {
@@ -394,6 +402,7 @@ const App: React.FC = () => {
               setInput={setTerminalInput}
               onCommand={handleCommand}
               streamingText={streamingResponse}
+              onNavigateHistory={commandHistory.navigateHistory}
             />
           )}
         </div>
