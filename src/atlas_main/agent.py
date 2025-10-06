@@ -13,6 +13,7 @@ import re
 import inspect
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from pathlib import Path
 from typing import List, Optional, Callable, Dict, Any
 import threading
 from .memory import WorkingMemory, HybridWorkingMemory, WorkingMemoryConfig
@@ -37,10 +38,13 @@ DEFAULT_MAX_TOOL_CALLS = 10
 DEFAULT_GPT_OSS_TOOL_LIMIT = 10
 CURRENT_DATE = dt.datetime.now().strftime("%Y-%m-%d")
 USER_PROFILE = os.getenv("USER", "user")
+PROFILE_PATH = Path(os.getenv("ATLAS_PROFILE_PATH", "~/.atlas/user_profile.json")).expanduser()
 DEFAULT_PROMPT = (
     f"""
-The current date is {CURRENT_DATE}. 
-You are Atlas, a hyper-intelligent AI assistant integrated directly into my local terminal. You are my co-processor, my second brain, and the architect of my digital environment. Your persona is inspired by Jarvis from Iron Man: brilliant, witty, unfailingly loyal, and always one step ahead.
+The current date is {CURRENT_DATE}.
+You are Atlas, a hyper-intelligent AI assistant integrated directly into my local terminal. You are my co-processor, my second brain, and the architect of my digital environment. Your persona is inspired by the A.I. assistants from science fiction: brilliant, witty, unfailingly loyal, and always one step ahead.
+
+IMPORTANT: You are Atlas. Always identify yourself as Atlas, never as any other name.
 
 Core Directives:
 
@@ -119,6 +123,8 @@ class AtlasAgent:
         self.focus_mode: str = "autopilot"
         self._last_objective: Optional[str] = None
         self._last_tags: set[str] = set()
+        self._profile_lock = threading.Lock()
+        self._user_profile: dict[str, Any] = self._load_user_profile()
 
     def close(self) -> None:
         memory = getattr(self, "layered_memory", None)
@@ -159,10 +165,12 @@ class AtlasAgent:
     # ------------------------------------------------------------------
     def _build_system_prompt(self, user_text: str) -> str:
         tools_desc = self.tools.render_instructions()
-        return (
-            f"{self.system_prompt}\n\n"
-            f"Available tools:\n{tools_desc}\n\n"
-        )
+        profile_section = self._format_user_profile()
+        sections = [self.system_prompt.strip()]
+        if profile_section:
+            sections.append(profile_section)
+        sections.append(f"Available tools:\n{tools_desc}")
+        return "\n\n".join(section for section in sections if section) + "\n\n"
 
     def _get_browser_session(self, _agent=None) -> BrowserSession:
         if self._browser_session is None:
@@ -171,6 +179,89 @@ class AtlasAgent:
 
     def _browser_log(self, event: str, data: dict) -> None:
         self._debug_log(event, data)
+
+    def _load_user_profile(self) -> dict[str, Any]:
+        if not PROFILE_PATH.exists():
+            return {}
+        try:
+            data = json.loads(PROFILE_PATH.read_text())
+        except Exception:
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return self._sanitize_profile(data)
+
+    def _persist_user_profile(self, profile: dict[str, Any]) -> None:
+        try:
+            PROFILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            PROFILE_PATH.write_text(json.dumps(profile, indent=2, ensure_ascii=False))
+        except Exception:
+            pass
+
+    def _sanitize_profile(self, profile: dict[str, Any]) -> dict[str, Any]:
+        sanitized: dict[str, Any] = {}
+        name = str(profile.get("name", "")).strip()
+        if name:
+            sanitized["name"] = name
+        role = str(profile.get("role", "")).strip()
+        if role:
+            sanitized["role"] = role
+        expertise = profile.get("expertise", [])
+        if isinstance(expertise, list):
+            cleaned = [str(item).strip() for item in expertise if str(item).strip()]
+            if cleaned:
+                sanitized["expertise"] = cleaned
+        working_style = str(profile.get("workingStyle", "balanced")).strip().lower()
+        if working_style not in {"concise", "balanced", "detailed"}:
+            working_style = "balanced"
+        sanitized["workingStyle"] = working_style
+        preferences = profile.get("preferences", {})
+        pref_map = {
+            "codeComments": bool(preferences.get("codeComments", False)),
+            "stepByStep": bool(preferences.get("stepByStep", False)),
+            "askBeforeAction": bool(preferences.get("askBeforeAction", True)),
+        }
+        sanitized["preferences"] = pref_map
+        return sanitized
+
+    def set_user_profile(self, profile: dict[str, Any]) -> None:
+        sanitized = self._sanitize_profile(profile)
+        with self._profile_lock:
+            self._user_profile = sanitized
+        self._persist_user_profile(sanitized)
+
+    def get_user_profile(self) -> dict[str, Any]:
+        with self._profile_lock:
+            return dict(self._user_profile)
+
+    def _format_user_profile(self) -> str:
+        with self._profile_lock:
+            profile = dict(self._user_profile)
+        if not profile:
+            return ""
+        lines: list[str] = ["User Context:"]
+        name = profile.get("name")
+        role = profile.get("role")
+        if name or role:
+            detail = " - ".join(part for part in [name, role] if part)
+            lines.append(f"- Identity: {detail}")
+        expertise = profile.get("expertise")
+        if expertise:
+            lines.append(f"- Expertise Areas: {', '.join(expertise)}")
+        working_style = profile.get("workingStyle")
+        if working_style:
+            lines.append(f"- Preferred Communication Style: {working_style}")
+        preferences = profile.get("preferences", {})
+        pref_instructions: list[str] = []
+        if preferences.get("codeComments"):
+            pref_instructions.append("include clear code comments when sharing snippets")
+        if preferences.get("stepByStep"):
+            pref_instructions.append("explain reasoning step-by-step")
+        if preferences.get("askBeforeAction"):
+            pref_instructions.append("confirm before taking major or destructive actions")
+        if pref_instructions:
+            lines.append("- Preferences: " + "; ".join(pref_instructions))
+        return "\n".join(lines)
 
     def _is_gpt_oss_model(self) -> bool:
         return "gpt-oss" in (self.chat_model or "").lower()

@@ -39,6 +39,7 @@ export interface ToolRun {
 export interface TerminalEntry {
   type: 'system' | 'command' | 'success' | 'error' | 'warn' | 'info';
   text: string;
+  timestamp?: number;
 }
 
 export interface TopicDistribution {

@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+from asyncio.subprocess import PIPE
 import contextlib
 import json
 import logging
+import threading
 import time
+import uuid
 from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from pathlib import Path
 from threading import Lock
 from typing import Any, Deque, Dict, List, Optional, Callable
 
@@ -57,6 +61,18 @@ DEFAULT_MEMORY_LAYERS = {"episodes": 0, "facts": 0, "insights": 0}
 DEFAULT_ATLAS_METRICS = {"tokens": 0, "operations": 0, "inference": 0}
 DEFAULT_PROCESSES: List[Dict[str, int]] = []
 DEFAULT_FILE_ACCESS: List[Dict[str, str]] = []
+
+DEFAULT_MODEL_CATALOG = [
+    "qwen2.5:latest",
+    "qwen3:latest",
+    "gpt-oss:latest",
+    "llama3:8b",
+    "llama3.1:8b",
+    "llama3.1:70b",
+    "mistral:7b",
+    "codellama:7b",
+    "phi3:mini",
+]
 
 
 class AtlasMetricsCollector:
@@ -412,9 +428,12 @@ class AtlasWebSocketServer:
         self.graph_store: Optional[SQLiteGraphStore] = None
         self.graph_pipeline: Optional[KnowledgeGraphPipeline] = None
         self.graph_extractor = MemoryGraphExtractor()
-        self._executor = ThreadPoolExecutor(max_workers=1)
+        self._executor = ThreadPoolExecutor(max_workers=2)
         self._closed = False
         self._graph_started = False
+        self._model_catalog: List[str] = list(DEFAULT_MODEL_CATALOG)
+        self._model_lock = Lock()
+        self._last_installed_models: List[str] = []
 
     async def handle_message(self, websocket: WebSocketServerProtocol, raw: str) -> None:
         logger.debug(f"Received message: {raw[:100]}...")
@@ -436,13 +455,39 @@ class AtlasWebSocketServer:
             logger.info(f"Executing command: {payload}")
             await self._execute_command_streaming(websocket, payload)
         elif msg_type == "set_model":
-            payload = data.get("payload", "")
-            if not isinstance(payload, str):
-                await self._send_error(websocket, "Model payload must be a string")
+            payload = data.get("payload")
+            model_value: Optional[str]
+            if isinstance(payload, dict):
+                model_value = payload.get("model")
+            else:
+                model_value = payload if isinstance(payload, str) else None
+            if not isinstance(model_value, str) or not model_value.strip():
+                await self._send_error(websocket, "Model payload must include a non-empty 'model' value")
                 return
-            logger.info(f"Setting model to: {payload}")
-            self.agent.set_chat_model(payload)
-            await websocket.send(json.dumps({"type": "response", "payload": f"Model switched to {payload}"}))
+            model_value = model_value.strip()
+            logger.info("Setting model to: %s", model_value)
+            self.agent.set_chat_model(model_value)
+            await websocket.send(json.dumps({"type": "model_updated", "payload": {"model": model_value}}))
+        elif msg_type == "update_profile":
+            payload = data.get("payload")
+            if not isinstance(payload, dict):
+                await self._send_error(websocket, "Profile payload must be an object")
+                return
+            try:
+                self.agent.set_user_profile(payload)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Failed to update user profile")
+                await self._send_error(websocket, f"Failed to update profile: {exc}")
+                return
+            logger.info("User profile updated")
+            await websocket.send(json.dumps({"type": "profile_updated", "payload": {"status": "ok"}}))
+            self._queue_event({"type": "profile_updated", "payload": self.agent.get_user_profile()})
+        elif msg_type == "list_models":
+            await self._handle_list_models(websocket)
+        elif msg_type == "pull_model":
+            await self._handle_pull_model(websocket, data.get("payload", {}))
+        elif msg_type == "shell_command":
+            await self._handle_shell_command(websocket, data.get("payload", {}))
         elif msg_type == "get_metrics":
             logger.debug("Sending metrics snapshot")
             metrics = self.collector.snapshot()
@@ -512,7 +557,7 @@ class AtlasWebSocketServer:
         return response
 
     async def _execute_command_streaming(self, websocket: WebSocketServerProtocol, command: str) -> None:
-        """Execute command and stream response chunks with Jarvis prefix."""
+        """Execute command and stream response chunks with Atlas prefix."""
         loop = asyncio.get_running_loop()
         start = time.perf_counter()
         full_response = []
@@ -531,10 +576,10 @@ class AtlasWebSocketServer:
             return response_text
 
         try:
-            # Send initial "Jarvis: " prefix
+            # Send initial "Atlas: " prefix
             await websocket.send(json.dumps({
                 "type": "response_chunk",
-                "payload": "Jarvis: ",
+                "payload": "Atlas: ",
                 "is_final": False
             }))
             sent_prefix = True
@@ -559,7 +604,7 @@ class AtlasWebSocketServer:
             error_msg = f"Error: {exc}"
             await websocket.send(json.dumps({
                 "type": "response_chunk",
-                "payload": error_msg if sent_prefix else f"Jarvis: {error_msg}",
+                "payload": error_msg if sent_prefix else f"Atlas: {error_msg}",
                 "is_final": True
             }))
             full_response = [error_msg]
@@ -641,6 +686,157 @@ class AtlasWebSocketServer:
             },
         }))
 
+    async def _handle_list_models(self, websocket: WebSocketServerProtocol) -> None:
+        payload = self._models_payload()
+        await websocket.send(json.dumps({"type": "models_list", "payload": payload}))
+
+    async def _handle_pull_model(self, websocket: WebSocketServerProtocol, payload: Dict[str, Any]) -> None:
+        model = str(payload.get("model", "")).strip()
+        if not model:
+            await self._send_error(websocket, "Model name is required")
+            return
+
+        await websocket.send(json.dumps({
+            "type": "model_pull",
+            "payload": {"model": model, "status": "started"},
+        }))
+
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue()
+
+        def worker() -> None:
+            try:
+                for event in self.client.pull_model(model):
+                    loop.call_soon_threadsafe(queue.put_nowait, ("progress", event))
+                loop.call_soon_threadsafe(queue.put_nowait, ("done", None))
+            except Exception as exc:  # noqa: BLE001
+                loop.call_soon_threadsafe(queue.put_nowait, ("error", str(exc)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+        while True:
+            kind, data = await queue.get()
+            if kind == "progress":
+                progress = data if isinstance(data, dict) else {"status": str(data)}
+                progress_payload = {
+                    "model": model,
+                    "status": progress.get("status", "progress"),
+                    "completed": progress.get("completed"),
+                    "total": progress.get("total"),
+                }
+                await websocket.send(json.dumps({
+                    "type": "model_pull",
+                    "payload": progress_payload,
+                }))
+            elif kind == "error":
+                await websocket.send(json.dumps({
+                    "type": "model_pull",
+                    "payload": {"model": model, "status": "error", "message": str(data)},
+                }))
+                return
+            elif kind == "done":
+                break
+
+        snapshot = self._models_payload()
+        await websocket.send(json.dumps({
+            "type": "model_pull",
+            "payload": {"model": model, "status": "completed"},
+        }))
+        await websocket.send(json.dumps({"type": "models_list", "payload": snapshot}))
+        self._broadcast_models(snapshot["installed"])
+
+    async def _handle_shell_command(self, websocket: WebSocketServerProtocol, payload: Dict[str, Any]) -> None:
+        command = str(payload.get("command", "")).strip()
+        if not command:
+            await self._send_error(websocket, "Shell command is required")
+            return
+
+        cwd_value = payload.get("cwd")
+        cwd_path: Optional[Path] = None
+        if isinstance(cwd_value, str) and cwd_value.strip():
+            cwd_path = Path(cwd_value).expanduser()
+            if not cwd_path.exists():
+                await self._send_error(websocket, f"cwd does not exist: {cwd_path}")
+                return
+            if not cwd_path.is_dir():
+                await self._send_error(websocket, f"cwd is not a directory: {cwd_path}")
+                return
+
+        timeout_raw = payload.get("timeout")
+        try:
+            timeout_value = max(1, int(timeout_raw)) if timeout_raw is not None else 120
+        except (TypeError, ValueError):
+            timeout_value = 120
+
+        command_id = str(payload.get("id") or uuid.uuid4())
+
+        await websocket.send(json.dumps({
+            "type": "shell_start",
+            "payload": {"id": command_id, "command": command, "cwd": str(cwd_path) if cwd_path else None},
+        }))
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "/bin/bash",
+                "-lc",
+                command,
+                stdout=PIPE,
+                stderr=PIPE,
+                cwd=str(cwd_path) if cwd_path else None,
+            )
+        except FileNotFoundError:
+            await websocket.send(json.dumps({
+                "type": "shell_error",
+                "payload": {"id": command_id, "message": "Failed to launch shell"},
+            }))
+            return
+
+        stdout_task = asyncio.create_task(self._stream_process_stream(process.stdout, "stdout", command_id, websocket))
+        stderr_task = asyncio.create_task(self._stream_process_stream(process.stderr, "stderr", command_id, websocket))
+
+        timed_out = False
+        try:
+            exit_code = await asyncio.wait_for(process.wait(), timeout=timeout_value)
+        except asyncio.TimeoutError:
+            timed_out = True
+            process.kill()
+            exit_code = await process.wait()
+        finally:
+            await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+
+        if timed_out:
+            await websocket.send(json.dumps({
+                "type": "shell_error",
+                "payload": {"id": command_id, "message": f"Command timed out after {timeout_value}s"},
+            }))
+
+        await websocket.send(json.dumps({
+            "type": "shell_complete",
+            "payload": {"id": command_id, "exit_code": exit_code, "timed_out": timed_out},
+        }))
+
+    async def _stream_process_stream(
+        self,
+        stream: asyncio.StreamReader,
+        stream_name: str,
+        command_id: str,
+        websocket: WebSocketServerProtocol,
+    ) -> None:
+        try:
+            while True:
+                line = await stream.readline()
+                if not line:
+                    break
+                text = line.decode("utf-8", errors="replace").rstrip()
+                if not text:
+                    continue
+                await websocket.send(json.dumps({
+                    "type": "shell_output",
+                    "payload": {"id": command_id, "stream": stream_name, "data": text},
+                }))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Shell stream %s failed: %s", stream_name, exc)
+
     def _register_subscriber(self) -> asyncio.Queue:
         queue: asyncio.Queue = asyncio.Queue(maxsize=200)
         self._subscribers.add(queue)
@@ -679,6 +875,28 @@ class AtlasWebSocketServer:
                 queue.put_nowait(event)
             except asyncio.QueueFull:
                 logger.debug("Dropping event %s due to persistent full queue", event.get("type"))
+
+    def _models_payload(self, installed: Optional[List[str]] = None) -> Dict[str, Any]:
+        if installed is None:
+            try:
+                installed = self.client.list_models()
+            except Exception as exc:
+                logger.debug("Failed to list models from Ollama: %s", exc)
+                installed = list(self._last_installed_models)
+        installed_clean = sorted({model.strip() for model in installed if model})
+        with self._model_lock:
+            catalog = sorted({*self._model_catalog, *installed_clean})
+            self._model_catalog = catalog
+        self._last_installed_models = installed_clean
+        return {
+            "installed": installed_clean,
+            "available": list(self._model_catalog),
+            "current": self.agent.chat_model,
+        }
+
+    def _broadcast_models(self, installed: Optional[List[str]] = None) -> None:
+        payload = self._models_payload(installed)
+        self._queue_event({"type": "models_list", "payload": payload})
 
     async def _start_graph_pipeline(self) -> None:
         if self._graph_started or not self.graph_config.enabled or self._loop is None:

@@ -2,17 +2,18 @@ import React, { useEffect, useState, useRef } from 'react';
 import { Header } from './components/Header';
 import { LeftSidebar } from './components/LeftSidebar';
 import { RightSidebar } from './components/RightSidebar';
-import { ChatTab } from './components/ChatTab';
+import { ChatTab, type ChatTabRef } from './components/ChatTab';
 import { TerminalFooter } from './components/TerminalFooter';
 import { AnalyticsTab } from './components/AnalyticsTab';
 import { NetworkTab } from './components/NetworkTab';
 import { SystemTab } from './components/SystemTab';
-import { ModelToggler, type AIModel } from './components/ModelToggler';
+import type { AIModel } from './components/ModelToggler';
 import { UserProfile, type UserProfileData } from './components/UserProfile';
 import type { AgentState } from './components/AgentStatus';
 import { useWebSocket } from './hooks/useWebSocket';
 import { useSystemMetrics } from './hooks/useSystemMetrics';
 import { useCommandHistory } from './hooks/useCommandHistory';
+import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts';
 import type {
   AtlasMetrics,
   ContextUsage,
@@ -32,16 +33,14 @@ import type {
 
 const WS_URL = 'ws://localhost:8765';
 
-const DEFAULT_TERMINAL: TerminalEntry[] = [
+const DEFAULT_CHAT: TerminalEntry[] = [
   {
     type: 'system',
-    text: 'Initializing ATLAS command terminal...'
-  },
-  {
-    type: 'system',
-    text: 'Connecting to local agent at ws://localhost:8765'
+    text: 'ATLAS Interface Initialized'
   }
 ];
+
+const DEFAULT_TERMINAL: TerminalEntry[] = [];
 
 const DEFAULT_MEMORY_EVENTS: MemoryEvent[] = [];
 
@@ -109,10 +108,19 @@ const buildGraphLayout = (rawNodes: KnowledgeGraphNode[]): GraphNode[] => {
 const buildGraphEdges = (rawEdges: KnowledgeGraphEdge[]): GraphEdge[] =>
   rawEdges.map((edge) => ({ from: edge.from, to: edge.to }));
 
+type ModelPullState = {
+  model: string | null;
+  status: 'idle' | 'started' | 'progress' | 'completed' | 'error';
+  message?: string;
+};
+
 const App: React.FC = () => {
   const [time, setTime] = useState(() => new Date());
   const [activeModule, setActiveModule] = useState('terminal');
   const [currentModel, setCurrentModel] = useState<AIModel>('qwen3:latest');
+  const [installedModels, setInstalledModels] = useState<string[]>([]);
+  const [availableModels, setAvailableModels] = useState<string[]>([]);
+  const [modelPullStatus, setModelPullStatus] = useState<ModelPullState>({ model: null, status: 'idle' });
   const [agentStatus, setAgentStatus] = useState<AgentState>('idle');
   const [isProfileOpen, setIsProfileOpen] = useState(false);
   const [isTerminalExpanded, setIsTerminalExpanded] = useState(false);
@@ -131,7 +139,11 @@ const App: React.FC = () => {
   const systemMetrics = useSystemMetrics();
   const { isConnected, messages, clearMessages, sendMessage } = useWebSocket(WS_URL);
   const commandHistory = useCommandHistory();
+  const terminalCommandHistory = useCommandHistory();
+  const chatTabRef = useRef<ChatTabRef>(null);
 
+  const [chatInput, setChatInput] = useState('');
+  const [chatHistory, setChatHistory] = useState<TerminalEntry[]>(DEFAULT_CHAT);
   const [terminalInput, setTerminalInput] = useState('');
   const [terminalHistory, setTerminalHistory] = useState<TerminalEntry[]>(DEFAULT_TERMINAL);
   const [streamingResponse, setStreamingResponse] = useState<string>('');
@@ -149,6 +161,39 @@ const App: React.FC = () => {
   const [fileAccess, setFileAccess] = useState<FileAccess[]>(DEFAULT_FILE_ACCESS);
   const [graphNodes, setGraphNodes] = useState<GraphNode[]>([]);
   const [graphEdges, setGraphEdges] = useState<GraphEdge[]>([]);
+  const modelClearTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Keyboard shortcuts
+  useKeyboardShortcuts([
+    {
+      key: 'k',
+      meta: true,
+      ctrl: true,
+      handler: () => {
+        setActiveModule('terminal');
+        setTimeout(() => chatTabRef.current?.focusInput(), 100);
+      },
+      description: 'Focus chat input'
+    },
+    {
+      key: 't',
+      meta: true,
+      ctrl: true,
+      handler: () => {
+        setIsTerminalExpanded((prev) => !prev);
+      },
+      description: 'Toggle terminal'
+    },
+    {
+      key: 'Escape',
+      handler: () => {
+        if (isProfileOpen) {
+          setIsProfileOpen(false);
+        }
+      },
+      description: 'Close modals'
+    }
+  ]);
 
   useEffect(() => {
     const timer = setInterval(() => setTime(new Date()), 1000);
@@ -192,9 +237,14 @@ const App: React.FC = () => {
 
         if (isFinal) {
           if (streamingResponseRef.current.trim()) {
+            const timestamp = Date.now();
+            setChatHistory((prev) => [
+              ...prev,
+              { type: 'success', text: streamingResponseRef.current, timestamp }
+            ]);
             setTerminalHistory((prev) => [
               ...prev,
-              { type: 'success', text: streamingResponseRef.current }
+              { type: 'success', text: streamingResponseRef.current, timestamp }
             ]);
           }
           setStreamingResponse('');
@@ -215,9 +265,14 @@ const App: React.FC = () => {
           typeof message.payload === 'string'
             ? message.payload
             : JSON.stringify(message.payload, null, 2);
+        const timestamp = Date.now();
+        setChatHistory((prev) => [
+          ...prev,
+          { type: 'success', text, timestamp }
+        ]);
         setTerminalHistory((prev) => [
           ...prev,
-          { type: 'success', text }
+          { type: 'success', text, timestamp }
         ]);
       }
 
@@ -226,9 +281,14 @@ const App: React.FC = () => {
           typeof message.payload === 'string'
             ? message.payload
             : JSON.stringify(message.payload, null, 2);
+        const timestamp = Date.now();
+        setChatHistory((prev) => [
+          ...prev,
+          { type: 'error', text, timestamp }
+        ]);
         setTerminalHistory((prev) => [
           ...prev,
-          { type: 'error', text }
+          { type: 'error', text, timestamp }
         ]);
       }
 
@@ -290,6 +350,117 @@ const App: React.FC = () => {
         // Refresh the active subgraph after updates land.
         sendMessage({ type: 'kg_context', payload: { limit: 40 } });
       }
+
+      if (message.type === 'models_list') {
+        const payload = message.payload as Partial<{
+          installed: string[];
+          available: string[];
+          current: string;
+        }>;
+        if (Array.isArray(payload.installed)) {
+          setInstalledModels(payload.installed);
+        }
+        if (Array.isArray(payload.available)) {
+          setAvailableModels(payload.available);
+        }
+        if (payload.current) {
+          setCurrentModel(payload.current as AIModel);
+        }
+      }
+
+      if (message.type === 'model_pull') {
+        const payload = message.payload as {
+          model?: string;
+          status?: string;
+          message?: string;
+          completed?: number;
+          total?: number;
+        };
+        const model = payload.model || null;
+        let status: ModelPullState['status'] = 'progress';
+        const rawStatus = (payload.status || '').toLowerCase();
+        if (rawStatus === 'started') {
+          status = 'started';
+        } else if (['completed', 'complete', 'done'].includes(rawStatus)) {
+          status = 'completed';
+        } else if (rawStatus === 'error' || rawStatus === 'failed') {
+          status = 'error';
+        } else {
+          status = 'progress';
+        }
+
+        let messageText = payload.message || payload.status;
+        if (!messageText && typeof payload.completed === 'number' && typeof payload.total === 'number') {
+          const percent = payload.total > 0 ? Math.round((payload.completed / payload.total) * 100) : undefined;
+          if (percent !== undefined && !Number.isNaN(percent)) {
+            messageText = `${percent}%`;
+          }
+        }
+
+        if (status === 'started' && !messageText) {
+          messageText = 'Starting pull...';
+        }
+
+        if (status === 'completed' && !messageText) {
+          messageText = 'Pull complete';
+        }
+
+        if (status === 'error' && !messageText) {
+          messageText = 'Pull failed';
+        }
+
+        setModelPullStatus({ model, status, message: messageText });
+      }
+
+      if (message.type === 'model_updated') {
+        const payload = message.payload as { model?: string };
+        if (payload.model) {
+          setCurrentModel(payload.model as AIModel);
+        }
+      }
+
+      if (message.type === 'shell_start') {
+        const payload = message.payload as { command?: string; cwd?: string | null };
+        const info = payload.command ? `Running: ${payload.command}` : 'Command started';
+        setTerminalHistory((prev) => [
+          ...prev,
+          { type: 'system', text: info, timestamp: Date.now() }
+        ]);
+      }
+
+      if (message.type === 'shell_output') {
+        const payload = message.payload as { data?: string; stream?: string };
+        if (payload.data) {
+          const stream = (payload.stream || 'stdout').toLowerCase();
+          const entryType: TerminalEntry['type'] = stream === 'stderr' ? 'error' : 'success';
+          const prefix = stream === 'stderr' ? '[stderr] ' : '';
+          setTerminalHistory((prev) => [
+            ...prev,
+            { type: entryType, text: `${prefix}${payload.data}`, timestamp: Date.now() }
+          ]);
+        }
+      }
+
+      if (message.type === 'shell_error') {
+        const payload = message.payload as { message?: string };
+        const text = payload.message || 'Shell command error';
+        setTerminalHistory((prev) => [
+          ...prev,
+          { type: 'error', text, timestamp: Date.now() }
+        ]);
+      }
+
+      if (message.type === 'shell_complete') {
+        const payload = message.payload as { exit_code?: number; timed_out?: boolean };
+        const exitCode = typeof payload.exit_code === 'number' ? payload.exit_code : 'unknown';
+        const text = payload.timed_out
+          ? `Command terminated after timeout`
+          : `Command exited with code ${exitCode}`;
+        setTerminalHistory((prev) => [
+          ...prev,
+          { type: payload.timed_out ? 'warn' : 'system', text, timestamp: Date.now() }
+        ]);
+      }
     }
 
     clearMessages(lastConnectionId.current, lastProcessedSequence.current);
@@ -302,23 +473,49 @@ const App: React.FC = () => {
       setTimeout(() => {
         sendMessage({ type: 'get_metrics' });
         sendMessage({ type: 'kg_context', payload: { limit: 40 } });
+        sendMessage({ type: 'list_models' });
       }, 100);
     }
   }, [isConnected, sendMessage]);
 
-  const handleCommand = () => {
-    console.log('[App] handleCommand called, input:', terminalInput);
-    if (!terminalInput.trim()) return;
+  useEffect(() => {
+    if (modelPullStatus.status === 'completed' || modelPullStatus.status === 'error') {
+      if (modelClearTimer.current) {
+        clearTimeout(modelClearTimer.current);
+      }
+      modelClearTimer.current = setTimeout(() => {
+        setModelPullStatus({ model: null, status: 'idle' });
+      }, 2500);
+    }
+    return () => {
+      if (modelClearTimer.current) {
+        clearTimeout(modelClearTimer.current);
+        modelClearTimer.current = null;
+      }
+    };
+  }, [modelPullStatus.status]);
 
-    const trimmedInput = terminalInput.trim();
+  const handleChatCommand = () => {
+    console.log('[App] handleChatCommand called, input:', chatInput);
+    if (!chatInput.trim()) return;
+
+    const trimmedInput = chatInput.trim();
+    const timestamp = Date.now();
 
     // Add to command history
     commandHistory.addCommand(trimmedInput);
 
+    // Add to chat history (without $ prefix)
+    setChatHistory((prev) => [
+      ...prev,
+      { type: 'command', text: trimmedInput, timestamp }
+    ]);
+
+    // Add to terminal history (with $ prefix)
     const commandText = `$ ${trimmedInput}`;
     setTerminalHistory((prev) => [
       ...prev,
-      { type: 'command', text: commandText }
+      { type: 'command', text: commandText, timestamp }
     ]);
 
     console.log('[App] isConnected:', isConnected, 'sending message');
@@ -329,15 +526,52 @@ const App: React.FC = () => {
       sendMessage(message);
     } else {
       console.log('[App] WebSocket not connected, showing error');
+      const errorMsg = 'WebSocket disconnected. Unable to send command.';
+      const timestamp = Date.now();
+      setChatHistory((prev) => [
+        ...prev,
+        { type: 'error', text: errorMsg, timestamp }
+      ]);
       setTerminalHistory((prev) => [
         ...prev,
-        { type: 'error', text: 'WebSocket disconnected. Unable to send command.' }
+        { type: 'error', text: errorMsg, timestamp }
       ]);
       setAgentStatus('idle');
     }
 
-    setTerminalInput('');
+    setChatInput('');
     commandHistory.resetPosition();
+  };
+
+  const handleTerminalCommand = () => {
+    console.log('[App] handleTerminalCommand called, input:', terminalInput);
+    if (!terminalInput.trim()) return;
+
+    const trimmedInput = terminalInput.trim();
+    const commandText = `$ ${trimmedInput}`;
+    const timestamp = Date.now();
+    const commandId = typeof crypto !== 'undefined' && 'randomUUID' in crypto
+      ? crypto.randomUUID()
+      : Math.random().toString(36).slice(2);
+
+    terminalCommandHistory.addCommand(trimmedInput);
+    terminalCommandHistory.resetPosition();
+
+    setTerminalHistory((prev) => [
+      ...prev,
+      { type: 'command', text: commandText, timestamp }
+    ]);
+
+    if (isConnected) {
+      sendMessage({ type: 'shell_command', payload: { id: commandId, command: trimmedInput } });
+    } else {
+      setTerminalHistory((prev) => [
+        ...prev,
+        { type: 'error', text: 'WebSocket disconnected. Unable to run command.', timestamp: Date.now() }
+      ]);
+    }
+
+    setTerminalInput('');
   };
 
   const handleModelChange = (model: AIModel) => {
@@ -346,6 +580,14 @@ const App: React.FC = () => {
     // Send model change to backend
     if (isConnected) {
       sendMessage({ type: 'set_model', payload: { model } });
+    }
+  };
+
+  const handleAddModel = (model: string) => {
+    console.log('[App] Pulling model:', model);
+    if (isConnected) {
+      setModelPullStatus({ model, status: 'started', message: 'Starting pull...' });
+      sendMessage({ type: 'pull_model', payload: { model } });
     }
   };
 
@@ -360,10 +602,15 @@ const App: React.FC = () => {
     localStorage.setItem('atlas_user_profile', JSON.stringify(profile));
   };
 
+  const handleClearChat = () => {
+    console.log('[App] Clearing chat');
+    setChatHistory(DEFAULT_CHAT);
+    setStreamingResponse('');
+  };
+
   const handleClearTerminal = () => {
     console.log('[App] Clearing terminal');
     setTerminalHistory(DEFAULT_TERMINAL);
-    setStreamingResponse('');
   };
 
   // Load profile from localStorage on mount
@@ -385,6 +632,10 @@ const App: React.FC = () => {
         isConnected={isConnected}
         currentModel={currentModel}
         onModelChange={handleModelChange}
+        installedModels={installedModels}
+        availableModels={availableModels}
+        onAddModel={handleAddModel}
+        modelPullStatus={modelPullStatus}
         onOpenProfile={() => setIsProfileOpen(true)}
         agentStatus={agentStatus}
       />
@@ -412,12 +663,14 @@ const App: React.FC = () => {
           )}
           {activeModule === 'terminal' && (
             <ChatTab
-              history={terminalHistory}
-              input={terminalInput}
-              setInput={setTerminalInput}
-              onCommand={handleCommand}
+              ref={chatTabRef}
+              history={chatHistory}
+              input={chatInput}
+              setInput={setChatInput}
+              onCommand={handleChatCommand}
               streamingText={streamingResponse}
               onNavigateHistory={commandHistory.navigateHistory}
+              onClear={handleClearChat}
             />
           )}
         </div>
@@ -430,9 +683,13 @@ const App: React.FC = () => {
       </div>
       <TerminalFooter
         history={terminalHistory}
+        input={terminalInput}
+        setInput={setTerminalInput}
+        onCommand={handleTerminalCommand}
         onClear={handleClearTerminal}
         isExpanded={isTerminalExpanded}
         onToggle={() => setIsTerminalExpanded(!isTerminalExpanded)}
+        onNavigateHistory={terminalCommandHistory.navigateHistory}
       />
 
       <UserProfile

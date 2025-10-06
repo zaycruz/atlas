@@ -1,4 +1,4 @@
-"""Layered memory for Jarvis-like agent: episodic, semantic, reflections, assembly.
+"""Layered memory for Atlas agent: episodic, semantic, reflections, assembly.
 
 All components are local and optional. Designed to run without external services.
 """

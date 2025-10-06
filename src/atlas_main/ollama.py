@@ -149,6 +149,20 @@ class OllamaClient:
         items = body.get("models", [])
         return [item.get("name", "") for item in items if item.get("name")]
 
+    def pull_model(self, name: str) -> Iterator[Dict[str, str]]:
+        payload = {"name": name}
+        response = self._post("/api/pull", payload, stream=True, request_timeout=None)
+        for line in response.iter_lines():
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                event = {"status": line.decode("utf-8", errors="replace")}
+            yield event
+            if event.get("done"):
+                break
+
     def close(self) -> None:
         self._session.close()
 

@@ -1,6 +1,7 @@
-import React, { useRef, useCallback, useEffect, useState } from 'react';
-import { MessageSquare, User, Bot } from 'lucide-react';
+import React, { useRef, useCallback, useEffect, useState, useImperativeHandle, forwardRef } from 'react';
+import { MessageSquare, User, Bot, Trash2 } from 'lucide-react';
 import type { TerminalEntry } from '../types';
+import { Tooltip } from './Tooltip';
 
 interface ChatTabProps {
   history: TerminalEntry[];
@@ -9,18 +10,31 @@ interface ChatTabProps {
   onCommand: () => void;
   streamingText?: string;
   onNavigateHistory?: (direction: 'up' | 'down') => string | null;
+  onClear?: () => void;
 }
 
-export const ChatTab: React.FC<ChatTabProps> = ({
+export interface ChatTabRef {
+  focusInput: () => void;
+}
+
+export const ChatTab = forwardRef<ChatTabRef, ChatTabProps>(({
   history,
   input,
   setInput,
   onCommand,
   streamingText = '',
-  onNavigateHistory
-}) => {
+  onNavigateHistory,
+  onClear
+}, ref) => {
   const chatRef = useRef<HTMLDivElement | null>(null);
+  const inputRef = useRef<HTMLInputElement | null>(null);
   const [autoScroll, setAutoScroll] = useState(true);
+
+  useImperativeHandle(ref, () => ({
+    focusInput: () => {
+      inputRef.current?.focus();
+    }
+  }));
 
   const handleWheel = useCallback((event: React.WheelEvent<HTMLDivElement>) => {
     event.stopPropagation();
@@ -46,6 +60,12 @@ export const ChatTab: React.FC<ChatTabProps> = ({
   const handleScroll = useCallback(() => {
     checkScrollPosition();
   }, [checkScrollPosition]);
+
+  const formatTime = (timestamp?: number): string => {
+    if (!timestamp) return '';
+    const date = new Date(timestamp);
+    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  };
 
   const renderMessage = (entry: TerminalEntry, index: number) => {
     const isUserMessage = entry.type === 'command';
@@ -84,6 +104,11 @@ export const ChatTab: React.FC<ChatTabProps> = ({
           }`}
         >
           <div className="text-sm whitespace-pre-wrap break-words">{messageText}</div>
+          {entry.timestamp && (
+            <div className="text-xs text-atlas-green-700 mt-1 opacity-70">
+              {formatTime(entry.timestamp)}
+            </div>
+          )}
         </div>
 
         {isUserMessage && (
@@ -97,9 +122,22 @@ export const ChatTab: React.FC<ChatTabProps> = ({
 
   return (
     <div className="flex flex-col h-full bg-atlas-black">
-      <div className="bg-black px-4 py-3 border-b border-atlas-green-900 flex items-center gap-2">
-        <MessageSquare size={16} className="text-atlas-yellow-400" />
-        <span className="text-sm font-semibold text-atlas-yellow-400">JARVIS INTERFACE</span>
+      <div className="bg-black px-4 py-3 border-b border-atlas-green-900 flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <MessageSquare size={16} className="text-atlas-yellow-400" />
+          <span className="text-sm font-semibold text-atlas-yellow-400">ATLAS INTERFACE</span>
+        </div>
+        {onClear && (
+          <Tooltip content="Clear chat" position="bottom">
+            <button
+              onClick={onClear}
+              className="p-1.5 hover:bg-red-900/30 rounded transition-colors"
+              aria-label="Clear"
+            >
+              <Trash2 size={12} className="text-atlas-red-400" />
+            </button>
+          </Tooltip>
+        )}
       </div>
 
       <div
@@ -134,6 +172,7 @@ export const ChatTab: React.FC<ChatTabProps> = ({
           <div className="flex items-center gap-3 bg-atlas-green-950/50 border border-atlas-green-900 rounded-2xl px-4 py-3 focus-within:border-atlas-cyan-400 transition-colors">
             <User size={16} className="text-atlas-cyan-400 flex-shrink-0" />
             <input
+              ref={inputRef}
               type="text"
               value={input}
               onChange={(e) => setInput(e.target.value)}
@@ -156,7 +195,7 @@ export const ChatTab: React.FC<ChatTabProps> = ({
                 }
               }}
               className="flex-1 bg-transparent outline-none text-atlas-green-400 text-sm placeholder-atlas-green-700"
-              placeholder="Ask JARVIS anything..."
+              placeholder="Ask ATLAS anything..."
             />
           </div>
           <div className="text-xs text-atlas-green-700 mt-2 text-center">
@@ -166,4 +205,4 @@ export const ChatTab: React.FC<ChatTabProps> = ({
       </div>
     </div>
   );
-};
+});

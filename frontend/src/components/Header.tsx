@@ -10,6 +10,14 @@ interface HeaderProps {
   isConnected: boolean;
   currentModel: AIModel;
   onModelChange: (model: AIModel) => void;
+  installedModels: string[];
+  availableModels: string[];
+  onAddModel: (model: string) => void;
+  modelPullStatus?: {
+    model: string | null;
+    status: 'idle' | 'started' | 'progress' | 'completed' | 'error';
+    message?: string;
+  };
   onOpenProfile: () => void;
   agentStatus: AgentState;
 }
@@ -19,6 +27,10 @@ export const Header: React.FC<HeaderProps> = ({
   isConnected,
   currentModel,
   onModelChange,
+  installedModels,
+  availableModels,
+  onAddModel,
+  modelPullStatus,
   onOpenProfile,
   agentStatus
 }) => {
@@ -44,7 +56,14 @@ export const Header: React.FC<HeaderProps> = ({
             <span className="text-xs font-semibold text-atlas-green-500">Profile</span>
           </button>
         </Tooltip>
-        <ModelToggler currentModel={currentModel} onModelChange={onModelChange} />
+        <ModelToggler
+          currentModel={currentModel}
+          installed={installedModels}
+          available={availableModels}
+          onModelChange={onModelChange}
+          onAddModel={onAddModel}
+          pullStatus={modelPullStatus}
+        />
         <ConnectionStatus isConnected={isConnected} />
         <div className="text-right">
           <div className="text-xl text-atlas-yellow-400 leading-tight">
