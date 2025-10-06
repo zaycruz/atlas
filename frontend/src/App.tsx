@@ -108,7 +108,7 @@ const buildGraphEdges = (rawEdges: KnowledgeGraphEdge[]): GraphEdge[] =>
 const App: React.FC = () => {
   const [time, setTime] = useState(() => new Date());
   const [activeModule, setActiveModule] = useState('terminal');
-  const [currentModel, setCurrentModel] = useState<AIModel>('sonnet');
+  const [currentModel, setCurrentModel] = useState<AIModel>('qwen3:latest');
   const systemMetrics = useSystemMetrics();
   const { isConnected, messages, clearMessages, sendMessage } = useWebSocket(WS_URL);
 

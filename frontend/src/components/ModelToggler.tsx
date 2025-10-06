@@ -2,7 +2,7 @@ import React from 'react';
 import { Cpu, Zap, Brain } from 'lucide-react';
 import { Tooltip } from './Tooltip';
 
-export type AIModel = 'sonnet' | 'opus' | 'haiku';
+export type AIModel = 'qwen2.5:latest' | 'qwen3:latest' | 'gpt-oss:latest';
 
 interface ModelTogglerProps {
   currentModel: AIModel;
@@ -12,24 +12,24 @@ interface ModelTogglerProps {
 
 const models = [
   {
-    id: 'haiku' as AIModel,
-    name: 'Haiku',
+    id: 'qwen2.5:latest' as AIModel,
+    name: 'Qwen 2.5',
     icon: Zap,
-    description: 'Fast & efficient for quick tasks',
+    description: 'Fast & efficient Qwen model',
     color: 'text-atlas-cyan-400'
   },
   {
-    id: 'sonnet' as AIModel,
-    name: 'Sonnet',
+    id: 'qwen3:latest' as AIModel,
+    name: 'Qwen 3',
     icon: Brain,
-    description: 'Balanced performance & capability',
+    description: 'Latest Qwen generation',
     color: 'text-atlas-yellow-400'
   },
   {
-    id: 'opus' as AIModel,
-    name: 'Opus',
+    id: 'gpt-oss:latest' as AIModel,
+    name: 'GPT-OSS',
     icon: Cpu,
-    description: 'Maximum capability & reasoning',
+    description: 'Open source GPT model',
     color: 'text-atlas-green-400'
   }
 ];
