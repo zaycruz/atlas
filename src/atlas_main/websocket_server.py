@@ -14,6 +14,11 @@ from typing import Any, Deque, Dict, List, Optional, Callable
 import websockets
 from websockets.server import WebSocketServerProtocol
 
+from .kg_config import KnowledgeGraphConfig
+from .knowledge_graph import SQLiteGraphStore
+from .kg_pipeline import KnowledgeGraphPipeline, set_pipeline, clear_pipeline
+from .kg_extractor import MemoryGraphExtractor
+
 # Configure logging
 logging.basicConfig(
     level=logging.DEBUG,
@@ -34,6 +39,10 @@ else:  # pragma: no cover - support `python websocket_server.py`
 
     from atlas_main.agent import AtlasAgent
     from atlas_main.ollama import OllamaClient
+    from atlas_main.kg_config import KnowledgeGraphConfig
+    from atlas_main.knowledge_graph import SQLiteGraphStore
+    from atlas_main.kg_pipeline import KnowledgeGraphPipeline, set_pipeline, clear_pipeline
+    from atlas_main.kg_extractor import MemoryGraphExtractor
 
 DEFAULT_MEMORY_EVENTS: List[Dict[str, str]] = []
 
@@ -399,8 +408,13 @@ class AtlasWebSocketServer:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._subscribers: set[asyncio.Queue] = set()
         self.collector = AtlasMetricsCollector(self.agent, event_emitter=self._queue_event)
+        self.graph_config = KnowledgeGraphConfig.from_env()
+        self.graph_store: Optional[SQLiteGraphStore] = None
+        self.graph_pipeline: Optional[KnowledgeGraphPipeline] = None
+        self.graph_extractor = MemoryGraphExtractor()
         self._executor = ThreadPoolExecutor(max_workers=1)
         self._closed = False
+        self._graph_started = False
 
     async def handle_message(self, websocket: WebSocketServerProtocol, raw: str) -> None:
         logger.debug(f"Received message: {raw[:100]}...")
@@ -433,6 +447,12 @@ class AtlasWebSocketServer:
             logger.debug("Sending metrics snapshot")
             metrics = self.collector.snapshot()
             await websocket.send(json.dumps({"type": "metrics", "payload": metrics}))
+        elif msg_type == "kg_search":
+            await self._handle_kg_search(websocket, data.get("payload", {}))
+        elif msg_type == "kg_neighbors":
+            await self._handle_kg_neighbors(websocket, data.get("payload", {}))
+        elif msg_type == "kg_context":
+            await self._handle_kg_context(websocket, data.get("payload", {}))
         else:
             logger.warning(f"Unknown message type: {msg_type}")
             await self._send_error(websocket, f"Unknown message type: {msg_type}")
@@ -464,13 +484,15 @@ class AtlasWebSocketServer:
         logger.info(f"Starting WebSocket server on {self.host}:{self.port}")
         async with websockets.serve(self.handler, self.host, self.port):
             self._loop = asyncio.get_running_loop()
+            await self._start_graph_pipeline()
             logger.info(f"ATLAS WebSocket server running on ws://{self.host}:{self.port}")
             print(f"ATLAS WebSocket server running on ws://{self.host}:{self.port}")
             try:
                 await asyncio.Future()
             except asyncio.CancelledError:
                 logger.info("Server shutdown requested")
-                pass
+            finally:
+                await self._stop_graph_pipeline()
 
     async def _execute_command(self, command: str) -> str:
         loop = asyncio.get_running_loop()
@@ -555,6 +577,70 @@ class AtlasWebSocketServer:
         logger.error(f"Sending error to client: {message}")
         await websocket.send(json.dumps({"type": "error", "payload": message}))
 
+    async def _handle_kg_search(self, websocket: WebSocketServerProtocol, payload: Dict[str, Any]) -> None:
+        if not self.graph_store:
+            await self._send_error(websocket, "Knowledge graph is disabled")
+            return
+        query = str(payload.get("q") or payload.get("query") or "").strip()
+        if not query:
+            await self._send_error(websocket, "Missing search query")
+            return
+        limit = _safe_int(payload.get("limit"), 20)
+        records = self.graph_store.search_nodes(query, limit=limit)
+        await websocket.send(json.dumps({
+            "type": "kg_search",
+            "payload": {"nodes": self._serialize_nodes(records)}
+        }))
+
+    async def _handle_kg_neighbors(self, websocket: WebSocketServerProtocol, payload: Dict[str, Any]) -> None:
+        if not self.graph_store:
+            await self._send_error(websocket, "Knowledge graph is disabled")
+            return
+        try:
+            node_id = int(payload.get("node_id"))
+        except Exception:
+            await self._send_error(websocket, "node_id must be provided")
+            return
+        types = payload.get("types")
+        if types and not isinstance(types, list):
+            await self._send_error(websocket, "types must be a list")
+            return
+        limit = _safe_int(payload.get("limit"), 25)
+        neighbors, edges = self.graph_store.neighbors(node_id, types=types, limit=limit)
+        await websocket.send(json.dumps({
+            "type": "kg_neighbors",
+            "payload": {
+                "nodes": self._serialize_nodes(neighbors),
+                "edges": self._serialize_edges(edges),
+            },
+        }))
+
+    async def _handle_kg_context(self, websocket: WebSocketServerProtocol, payload: Dict[str, Any]) -> None:
+        if not self.graph_store:
+            await self._send_error(websocket, "Knowledge graph is disabled")
+            return
+        seeds_raw = payload.get("seeds")
+        seeds: List[int] = []
+        if isinstance(seeds_raw, list):
+            for item in seeds_raw:
+                try:
+                    seeds.append(int(item))
+                except (TypeError, ValueError):
+                    continue
+        depth = _safe_int(payload.get("depth"), 1)
+        limit = _safe_int(payload.get("limit"), 50)
+        if not seeds:
+            recent = self.graph_store.recent_nodes(limit=limit)
+            seeds = [record.id for record in recent]
+        nodes, edges = self.graph_store.subgraph(seeds, depth=depth, limit=limit)
+        await websocket.send(json.dumps({
+            "type": "kg_context",
+            "payload": {
+                "nodes": self._serialize_nodes(nodes),
+                "edges": self._serialize_edges(edges),
+            },
+        }))
+
     def _register_subscriber(self) -> asyncio.Queue:
         queue: asyncio.Queue = asyncio.Queue(maxsize=200)
         self._subscribers.add(queue)
@@ -594,6 +680,69 @@ class AtlasWebSocketServer:
             except asyncio.QueueFull:
                 logger.debug("Dropping event %s due to persistent full queue", event.get("type"))
 
+    async def _start_graph_pipeline(self) -> None:
+        if self._graph_started or not self.graph_config.enabled or self._loop is None:
+            return
+        try:
+            self.graph_store = SQLiteGraphStore(self.graph_config)
+            self.graph_pipeline = KnowledgeGraphPipeline(
+                loop=self._loop,
+                config=self.graph_config,
+                store=self.graph_store,
+                extractor=self.graph_extractor,
+                event_callback=self._queue_event,
+            )
+            set_pipeline(self.graph_pipeline)
+            self._graph_started = True
+        except Exception:
+            logger.exception("Failed to initialize knowledge graph pipeline")
+            self.graph_store = None
+            self.graph_pipeline = None
+            self._graph_started = False
+
+    async def _stop_graph_pipeline(self) -> None:
+        if self.graph_pipeline:
+            try:
+                await self.graph_pipeline.shutdown()
+            except Exception:
+                logger.debug("Graph pipeline shutdown encountered an error", exc_info=True)
+        clear_pipeline()
+        if self.graph_store:
+            try:
+                self.graph_store.close()
+            except Exception:
+                logger.debug("Graph store close encountered an error", exc_info=True)
+        self.graph_store = None
+        self.graph_pipeline = None
+        self._graph_started = False
+
+    def _serialize_nodes(self, nodes: Iterable) -> List[Dict[str, Any]]:
+        serialized: List[Dict[str, Any]] = []
+        for node in nodes:
+            props = getattr(node, "props", {}) or {}
+            serialized.append(
+                {
+                    "id": int(getattr(node, "id")),
+                    "type": getattr(node, "type"),
+                    "label": getattr(node, "label"),
+                    "props": props,
+                }
+            )
+        return serialized
+
+    def _serialize_edges(self, edges: Iterable) -> List[Dict[str, Any]]:
+        serialized: List[Dict[str, Any]] = []
+        for edge in edges:
+            serialized.append(
+                {
+                    "id": int(getattr(edge, "id")),
+                    "from": int(getattr(edge, "src")),
+                    "to": int(getattr(edge, "dst")),
+                    "type": getattr(edge, "type"),
+                }
+            )
+        return serialized
+
     def shutdown(self) -> None:
         if self._closed:
             return
@@ -606,7 +755,21 @@ class AtlasWebSocketServer:
             self.client.close()
         except Exception:
             pass
+        if self.graph_store:
+            try:
+                self.graph_store.close()
+            except Exception:
+                pass
+        clear_pipeline()
         self._executor.shutdown(wait=False)
+
+
+def _safe_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+        return max(1, parsed)
+    except (TypeError, ValueError):
+        return default
 
 
 def run(host: str = "localhost", port: int = 8765) -> None:

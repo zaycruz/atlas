@@ -20,6 +20,8 @@ from typing import Any, Callable, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from .kg_pipeline import get_pipeline, MemoryPayload
+
 
 EmbedFn = Callable[[str], Optional[Sequence[float]]]
 
@@ -662,6 +664,17 @@ class SemanticMemory:
         self._persist()
         if update_graph and graph_dirty:
             self._apply_graph_links()
+        pipeline = get_pipeline()
+        if pipeline:
+            payload = MemoryPayload(
+                id=str(entry.get("id")),
+                kind="semantic",
+                text=entry.get("text", ""),
+                tags=entry.get("tags", []),
+                ts=float(entry.get("ts", time.time())),
+                source=str(entry.get("source", "")) or None,
+            )
+            pipeline.submit_memory(payload)
         return entry
 
     def extend_facts(
@@ -1043,6 +1056,17 @@ class ReflectionMemory:
         entry["tags"] = self._normalize_tags(tags)
         lessons.append(entry)
         self._write_lessons(lessons)
+        pipeline = get_pipeline()
+        if pipeline:
+            payload = MemoryPayload(
+                id=str(entry.get("id")),
+                kind="reflection",
+                text=entry.get("text", ""),
+                tags=entry.get("tags", []),
+                ts=float(entry.get("ts", time.time())),
+                source=None,
+            )
+            pipeline.submit_memory(payload)
         return True
 
     def update(
