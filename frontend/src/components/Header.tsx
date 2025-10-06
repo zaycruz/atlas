@@ -1,19 +1,23 @@
 import React from 'react';
+import { User } from 'lucide-react';
 import { ConnectionStatus } from './ConnectionStatus';
 import { ModelToggler, type AIModel } from './ModelToggler';
+import { Tooltip } from './Tooltip';
 
 interface HeaderProps {
   time: Date;
   isConnected: boolean;
   currentModel: AIModel;
   onModelChange: (model: AIModel) => void;
+  onOpenProfile: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
   time,
   isConnected,
   currentModel,
-  onModelChange
+  onModelChange,
+  onOpenProfile
 }) => {
   return (
     <div className="px-4 py-3 border-b border-atlas-green-900 flex justify-between items-center">
@@ -27,6 +31,15 @@ export const Header: React.FC<HeaderProps> = ({
       </div>
 
       <div className="flex items-center gap-4">
+        <Tooltip content="User Profile & Preferences" position="bottom">
+          <button
+            onClick={onOpenProfile}
+            className="flex items-center gap-2 px-3 py-1.5 bg-atlas-green-950/30 border border-atlas-green-900 rounded-md hover:border-atlas-cyan-400 transition-colors"
+          >
+            <User size={14} className="text-atlas-green-500" />
+            <span className="text-xs font-semibold text-atlas-green-500">Profile</span>
+          </button>
+        </Tooltip>
         <ModelToggler currentModel={currentModel} onModelChange={onModelChange} />
         <ConnectionStatus isConnected={isConnected} />
         <div className="text-right">

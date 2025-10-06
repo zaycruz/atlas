@@ -7,6 +7,7 @@ import { AnalyticsTab } from './components/AnalyticsTab';
 import { NetworkTab } from './components/NetworkTab';
 import { SystemTab } from './components/SystemTab';
 import { ModelToggler, type AIModel } from './components/ModelToggler';
+import { UserProfile, type UserProfileData } from './components/UserProfile';
 import { useWebSocket } from './hooks/useWebSocket';
 import { useSystemMetrics } from './hooks/useSystemMetrics';
 import type {
@@ -109,6 +110,19 @@ const App: React.FC = () => {
   const [time, setTime] = useState(() => new Date());
   const [activeModule, setActiveModule] = useState('terminal');
   const [currentModel, setCurrentModel] = useState<AIModel>('qwen3:latest');
+  const [isProfileOpen, setIsProfileOpen] = useState(false);
+  const [userProfile, setUserProfile] = useState<UserProfileData>({
+    name: '',
+    role: '',
+    expertise: [],
+    workingStyle: 'balanced',
+    preferences: {
+      codeComments: true,
+      stepByStep: false,
+      askBeforeAction: true
+    }
+  });
+
   const systemMetrics = useSystemMetrics();
   const { isConnected, messages, clearMessages, sendMessage } = useWebSocket(WS_URL);
 
@@ -319,6 +333,29 @@ const App: React.FC = () => {
     }
   };
 
+  const handleProfileSave = (profile: UserProfileData) => {
+    console.log('[App] User profile saved:', profile);
+    setUserProfile(profile);
+    // Send profile to backend
+    if (isConnected) {
+      sendMessage({ type: 'update_profile', payload: profile });
+    }
+    // Save to localStorage for persistence
+    localStorage.setItem('atlas_user_profile', JSON.stringify(profile));
+  };
+
+  // Load profile from localStorage on mount
+  useEffect(() => {
+    const savedProfile = localStorage.getItem('atlas_user_profile');
+    if (savedProfile) {
+      try {
+        setUserProfile(JSON.parse(savedProfile));
+      } catch (error) {
+        console.error('Failed to load user profile:', error);
+      }
+    }
+  }, []);
+
   return (
     <div className="min-h-screen bg-atlas-black text-atlas-green-500 flex flex-col">
       <Header
@@ -326,6 +363,7 @@ const App: React.FC = () => {
         isConnected={isConnected}
         currentModel={currentModel}
         onModelChange={handleModelChange}
+        onOpenProfile={() => setIsProfileOpen(true)}
       />
       <div className="flex-1 grid grid-cols-12">
         <LeftSidebar
@@ -370,6 +408,13 @@ const App: React.FC = () => {
         <span>WS: {isConnected ? 'CONNECTED' : 'DISCONNECTED'}</span>
         <span>© ATLAS Systems</span>
       </footer>
+
+      <UserProfile
+        isOpen={isProfileOpen}
+        onClose={() => setIsProfileOpen(false)}
+        profile={userProfile}
+        onSave={handleProfileSave}
+      />
     </div>
   );
 };
