@@ -94,8 +94,16 @@ def main() -> None:
                     break
 
                 if stripped.startswith("/"):
-                    if _handle_command(agent, stripped, runtime):
-                        continue
+                    # Prefer rendering command handling inside the chat UI
+                    ui_obj: Optional[ConversationShell] = runtime.get("ui")
+                    if ui_obj:
+                        turn = ui_obj.add_turn(stripped)
+                        handled = _handle_command_in_chat(agent, stripped, runtime, turn)
+                        if handled:
+                            continue
+                    else:
+                        if _handle_command(agent, stripped, runtime):
+                            continue
 
                 _run_agent_turn(agent, runtime, user_text)
     finally:
@@ -221,6 +229,174 @@ def _print_help() -> None:
     table.add_row("  /adjust <style>", "request quick tweak of the next reply tone")
     table.add_row("  /quit", "exit the chat")
     console.print(table)
+
+
+def _get_help_text() -> str:
+    """Return help text for instant display in chat."""
+    return (
+        "Commands:\n"
+        "• /model <name> - switch the active Ollama model\n"
+        "• /model list - list available models  \n"
+        "• /thinking <on|off> - show or hide model thinking content\n"
+        "• /log <off|error|warn|info|debug> - adjust logging level\n"
+        "• /voice <on|off|ptt> - control voice input (always-on or push-to-talk)\n"
+        "• /objective [clear|set ...] - manage conversation objective\n"
+        "• /memory ... - inspect episodic, semantic, or reflection memory\n"
+        "• /test <on|off> - toggle test mode (disables memory logging)\n"
+        "• /scroll <up|down|top|bottom|#> - navigate conversation history\n"
+        "• /up / /down / /top / /bottom - scroll conversation shortcuts\n"
+        "• /expand <id> / /collapse <id> - toggle detail trays for a turn\n"
+        "• /pin <id> / /unpin <id> - manage pinned turns\n"
+        "• /focus <mode> - switch between focus and autopilot tool usage\n"
+        "• /tool ... - sandbox, run, or favorite tools\n"
+        "• /rerun <id> - replay a previous prompt\n"
+        "• /memory_demo - add demo memory events (testing)\n"
+        "• /feedback <works|issue> - quick thumbs-up/down feedback\n"
+        "• /adjust <style> - request quick tweak of the next reply tone\n"
+        "• /quit - exit the chat"
+    )
+
+
+def _handle_objective_in_chat(agent: AtlasAgent, args: list[str], runtime: Dict[str, Any]) -> str:
+    """Handle objective commands and return response text for chat."""
+    if not args:
+        current = getattr(agent, "_current_objective", None) or getattr(agent, "_last_objective", None)
+        return f"Current objective: {current}" if current else "No active objective"
+
+    action = args[0].lower()
+    if action == "clear":
+        agent.clear_objective()
+        ui_obj = runtime.get("ui")
+        if ui_obj:
+            # Prefer explicit clear if implemented; otherwise set to None
+            clear_fn = getattr(ui_obj, "clear_objective", None)
+            if callable(clear_fn):
+                clear_fn()
+            else:
+                ui_obj.set_objective(None, [])
+        return "Objective cleared"
+
+    if action == "set":
+        if len(args) < 2:
+            return "Usage: /objective set <description>"
+        objective_text = " ".join(args[1:])
+        agent.set_manual_objective(objective_text)
+        ui_obj = runtime.get("ui")
+        if ui_obj:
+            ui_obj.set_objective(objective_text, [])
+        return f"Objective set to: {objective_text}"
+
+    return (
+        "Usage: /objective [clear|set <description>]\n"
+        "• /objective - Show current objective\n"
+        "• /objective clear - Clear current objective  \n"
+        "• /objective set ... - Manually set objective"
+    )
+
+
+def _handle_command_in_chat(agent: AtlasAgent, command_line: str, runtime: Dict[str, Any], turn: Any) -> bool:
+    """Handle instant commands and render responses inside the chat UI."""
+    parts = command_line[1:].strip().split()
+    if not parts:
+        turn.assistant_text = "Empty command."
+        turn.status = "done"
+        ui_obj = runtime.get("ui")
+        if ui_obj:
+            ui_obj.refresh()
+        return True
+
+    cmd, *rest = parts
+
+    if cmd == "help":
+        turn.assistant_text = _get_help_text()
+        turn.status = "done"
+        ui_obj = runtime.get("ui")
+        if ui_obj:
+            ui_obj.refresh()
+        return True
+
+    if cmd == "model":
+        if not rest:
+            turn.assistant_text = f"Current model: {agent.chat_model}"
+        elif rest[0] == "list":
+            try:
+                models = agent.client.list_models()
+                if models:
+                    model_list = "\n".join([f"• {m}" for m in models])
+                    turn.assistant_text = f"Available models:\n{model_list}"
+                else:
+                    turn.assistant_text = "No models available."
+            except Exception as exc:
+                turn.assistant_text = f"Error listing models: {exc}"
+        else:
+            model_name = rest[0]
+            try:
+                agent.chat_model = model_name
+                turn.assistant_text = f"Switched to model: {model_name}"
+            except Exception as exc:
+                turn.assistant_text = f"Error switching model: {exc}"
+        turn.status = "done"
+        ui_obj = runtime.get("ui")
+        if ui_obj:
+            ui_obj.refresh()
+        return True
+
+    if cmd == "objective":
+        turn.assistant_text = _handle_objective_in_chat(agent, rest, runtime)
+        turn.status = "done"
+        ui_obj = runtime.get("ui")
+        if ui_obj:
+            ui_obj.refresh()
+        return True
+
+    if cmd == "thinking":
+        if not rest or rest[0].lower() not in {"on", "off"}:
+            turn.assistant_text = "Usage: /thinking <on|off>"
+        else:
+            agent.show_thinking = (rest[0].lower() == "on")
+            status = "enabled" if agent.show_thinking else "disabled"
+            turn.assistant_text = f"Thinking display {status}."
+        turn.status = "done"
+        ui_obj = runtime.get("ui")
+        if ui_obj:
+            ui_obj.refresh()
+        return True
+
+    if cmd == "test":
+        if not rest:
+            mode = "ON" if agent.test_mode else "OFF"
+            turn.assistant_text = f"Test mode: {mode}\n"
+            turn.assistant_text += (
+                "Memory logging is DISABLED - no memories will be saved"
+                if agent.test_mode
+                else "Memory logging is ENABLED - memories will be saved normally"
+            )
+            turn.assistant_text += "\nUsage: /test <on|off>"
+        elif rest[0].lower() in {"on", "off"}:
+            new_mode = rest[0].lower() == "on"
+            agent.test_mode = new_mode
+            mode = "ON" if new_mode else "OFF"
+            turn.assistant_text = f"Test mode: {mode}\n"
+            turn.assistant_text += (
+                "Memory logging is now DISABLED - no memories will be saved"
+                if new_mode
+                else "Memory logging is now ENABLED - memories will be saved normally"
+            )
+        else:
+            turn.assistant_text = "Usage: /test <on|off>"
+        turn.status = "done"
+        ui_obj = runtime.get("ui")
+        if ui_obj:
+            ui_obj.refresh()
+        return True
+
+    # Unknown command fallback
+    turn.assistant_text = f"Unknown command: {cmd}. Type /help for options."
+    turn.status = "done"
+    ui_obj = runtime.get("ui")
+    if ui_obj:
+        ui_obj.refresh()
+    return True
 
 
 def _handle_log(args: list[str]) -> None:
