@@ -5,6 +5,23 @@ Atlas is a terminal-first companion for local Ollama models, pairing a streaming
 - Working memory buffer for recent turns
 - Tool registry with iterative calls (file read/write, shell, web search via Crawl4AI)
 
+## Desktop bridge (experimental)
+
+The repository now ships with a Tauri desktop shell that mirrors the terminal experience while polling live metrics from the agent:
+
+1. Launch the FastAPI bridge so the UI can talk to Atlas:
+   ```bash
+   python -m atlas_main.desktop_server --port 5175
+   ```
+2. In another terminal boot the desktop UI (first run installs dependencies):
+   ```bash
+   cd atlas-desktop
+   npm install
+   npm run tauri dev
+   ```
+
+The React layer talks to `http://127.0.0.1:5175` by default. Set `VITE_ATLAS_API` in `atlas-desktop/.env` if you expose the bridge elsewhere. The guide in [`docs/tauri_setup.md`](docs/tauri_setup.md) covers the full build and packaging workflow.
+
 ## Quick start
 
 1. Install Python 3.9+ and ensure a local Ollama daemon is running at `http://localhost:11434`.
