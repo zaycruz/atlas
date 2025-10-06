@@ -1,6 +1,7 @@
 import React, { useRef, useCallback, useEffect, useState } from 'react';
-import { Terminal, User, Bot } from 'lucide-react';
+import { Terminal, User, Bot, Trash2, Copy, Download } from 'lucide-react';
 import type { TerminalEntry } from '../types';
+import { Tooltip } from './Tooltip';
 
 interface TerminalTabProps {
   history: TerminalEntry[];
@@ -9,6 +10,7 @@ interface TerminalTabProps {
   onCommand: () => void;
   streamingText?: string;
   onNavigateHistory?: (direction: 'up' | 'down') => string | null;
+  onClear?: () => void;
 }
 
 export const TerminalTab: React.FC<TerminalTabProps> = ({
@@ -17,7 +19,8 @@ export const TerminalTab: React.FC<TerminalTabProps> = ({
   setInput,
   onCommand,
   streamingText = '',
-  onNavigateHistory
+  onNavigateHistory,
+  onClear
 }) => {
   const historyRef = useRef<HTMLDivElement | null>(null);
   const [autoScroll, setAutoScroll] = useState(true);
@@ -47,6 +50,30 @@ export const TerminalTab: React.FC<TerminalTabProps> = ({
     checkScrollPosition();
   }, [checkScrollPosition]);
 
+  // Copy terminal content to clipboard
+  const handleCopy = useCallback(() => {
+    const content = history.map((entry) => entry.text).join('\n');
+    navigator.clipboard.writeText(content).then(() => {
+      console.log('[Terminal] Copied to clipboard');
+    }).catch((err) => {
+      console.error('[Terminal] Failed to copy:', err);
+    });
+  }, [history]);
+
+  // Export terminal content as text file
+  const handleExport = useCallback(() => {
+    const content = history.map((entry) => entry.text).join('\n');
+    const blob = new Blob([content], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `atlas-session-${new Date().toISOString().slice(0, 10)}.txt`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  }, [history]);
+
   const getColorClass = (type: TerminalEntry['type']) => {
     switch (type) {
       case 'system':
@@ -66,9 +93,45 @@ export const TerminalTab: React.FC<TerminalTabProps> = ({
 
   return (
     <div className="flex flex-col h-full">
-      <div className="bg-black px-4 py-2 border-b border-atlas-green-900 flex items-center gap-2">
-        <Terminal size={16} className="text-atlas-yellow-400" />
-        <span className="text-sm font-semibold text-atlas-yellow-400">COMMAND TERMINAL</span>
+      <div className="bg-black px-4 py-2 border-b border-atlas-green-900 flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <Terminal size={16} className="text-atlas-yellow-400" />
+          <span className="text-sm font-semibold text-atlas-yellow-400">COMMAND TERMINAL</span>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <Tooltip content="Copy terminal content" position="bottom">
+            <button
+              onClick={handleCopy}
+              className="p-1.5 hover:bg-atlas-green-950 rounded transition-colors"
+              aria-label="Copy"
+            >
+              <Copy size={14} className="text-atlas-green-500" />
+            </button>
+          </Tooltip>
+
+          <Tooltip content="Export as text file" position="bottom">
+            <button
+              onClick={handleExport}
+              className="p-1.5 hover:bg-atlas-green-950 rounded transition-colors"
+              aria-label="Export"
+            >
+              <Download size={14} className="text-atlas-green-500" />
+            </button>
+          </Tooltip>
+
+          {onClear && (
+            <Tooltip content="Clear terminal" position="bottom">
+              <button
+                onClick={onClear}
+                className="p-1.5 hover:bg-red-900/30 rounded transition-colors"
+                aria-label="Clear"
+              >
+                <Trash2 size={14} className="text-atlas-red-400" />
+              </button>
+            </Tooltip>
+          )}
+        </div>
       </div>
 
       <div

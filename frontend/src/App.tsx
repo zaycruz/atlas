@@ -352,6 +352,12 @@ const App: React.FC = () => {
     localStorage.setItem('atlas_user_profile', JSON.stringify(profile));
   };
 
+  const handleClearTerminal = () => {
+    console.log('[App] Clearing terminal');
+    setTerminalHistory(DEFAULT_TERMINAL);
+    setStreamingResponse('');
+  };
+
   // Load profile from localStorage on mount
   useEffect(() => {
     const savedProfile = localStorage.getItem('atlas_user_profile');
@@ -403,6 +409,7 @@ const App: React.FC = () => {
               onCommand={handleCommand}
               streamingText={streamingResponse}
               onNavigateHistory={commandHistory.navigateHistory}
+              onClear={handleClearTerminal}
             />
           )}
         </div>
