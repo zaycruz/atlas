@@ -78,4 +78,58 @@ Atlas is released under the [MIT License](LICENSE).
 
 See [CONTRIBUTING](CONTRIBUTING.md) for guidelines on development workflow.
 
+## Atlas Knowledge Graph Service
+
+Atlas ships with a lightweight Neo4j-backed knowledge graph service implemented in TypeScript under [`kg/`](kg/). It provides a canonical ontology for projects, topics, artifacts, metrics, and agent memories, plus validation, inference jobs, and tool-facing APIs.
+
+### Environment
+
+Set the following environment variables before starting the service:
+
+- `NEO4J_URI`
+- `NEO4J_USER`
+- `NEO4J_PASS`
+- `PORT` (optional, defaults to `4545`)
+
+### Setup
+
+```bash
+cd kg
+npm install
+# Initialize database constraints and indexes once
+cat scripts/ddl.cypher | cypher-shell -u "$NEO4J_USER" -p "$NEO4J_PASS" -a "$NEO4J_URI"
+```
+
+### Run
+
+```bash
+npm run dev   # Fastify dev server (uses tsx)
+# or build + start
+npm run build
+npm start
+```
+
+### Tests
+
+```bash
+npm test
+```
+
+### Inference Jobs
+
+Two inference rules (topic and project inheritance) can be executed on demand via:
+
+- HTTP: `POST /admin/inference`
+- Code: `runInference(driver)` from `kg/src/inference.ts`
+
+### Tooling & Integration
+
+- Tool contract: [`atlas_kg.tool.json`](atlas_kg.tool.json)
+- Python client & hooks: [`kg/kg_client.py`](kg/kg_client.py), [`kg/retriever.py`](kg/retriever.py), [`kg/archiver.py`](kg/archiver.py)
+- TypeScript client: [`kg/kgClient.ts`](kg/kgClient.ts)
+- Retriever policy: [`kg/retriever_policy.md`](kg/retriever_policy.md)
+- Archiver policy: [`kg/archiver_policy.md`](kg/archiver_policy.md)
+
+The retriever should filter on ontology-first parameters before any embedding re-rank. The archiver persists reflections with explicit provenance and temporal context.
+
 Legacy design notes that referenced controller/critic, journaling, and broader tool suites remain under `docs/` for reference.
