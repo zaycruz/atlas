@@ -41,15 +41,15 @@ export const TerminalTab: React.FC<TerminalTabProps> = ({
 
   return (
     <div className="flex flex-col h-full">
-      <div className="bg-black px-3 py-1 border-b border-atlas-green-900 flex items-center gap-2">
-        <Terminal size={12} className="text-atlas-yellow-400" />
-        <span className="text-[11px] text-atlas-yellow-400">COMMAND TERMINAL</span>
+      <div className="bg-black px-4 py-2 border-b border-atlas-green-900 flex items-center gap-2">
+        <Terminal size={16} className="text-atlas-yellow-400" />
+        <span className="text-sm font-semibold text-atlas-yellow-400">COMMAND TERMINAL</span>
       </div>
 
       <div
         ref={historyRef}
         onWheel={handleWheel}
-        className="flex-1 overflow-y-auto px-3 py-2 space-y-0.5 text-[11px]"
+        className="flex-1 overflow-y-auto px-4 py-3 space-y-1 text-sm"
         style={{ overscrollBehavior: 'contain' }}
       >
         {history.map((entry, i) => (
@@ -65,9 +65,9 @@ export const TerminalTab: React.FC<TerminalTabProps> = ({
         )}
       </div>
 
-      <div className="border-t border-atlas-green-900 px-3 py-1">
-        <div className="flex items-center gap-2">
-          <span className="text-atlas-yellow-400 text-[11px]">$</span>
+      <div className="border-t border-atlas-green-900 px-4 py-3">
+        <div className="flex items-center gap-3">
+          <span className="text-atlas-yellow-400 text-sm font-bold">$</span>
           <input
             type="text"
             value={input}
@@ -78,7 +78,7 @@ export const TerminalTab: React.FC<TerminalTabProps> = ({
                 onCommand();
               }
             }}
-            className="flex-1 bg-transparent outline-none text-atlas-green-400 text-[11px]"
+            className="flex-1 bg-transparent outline-none text-atlas-green-400 text-sm"
             placeholder="Enter command..."
           />
         </div>
