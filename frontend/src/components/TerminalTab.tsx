@@ -1,4 +1,4 @@
-import React, { useRef, useCallback } from 'react';
+import React, { useRef, useCallback, useEffect, useState } from 'react';
 import { Terminal, User, Bot } from 'lucide-react';
 import type { TerminalEntry } from '../types';
 
@@ -20,9 +20,32 @@ export const TerminalTab: React.FC<TerminalTabProps> = ({
   onNavigateHistory
 }) => {
   const historyRef = useRef<HTMLDivElement | null>(null);
+  const [autoScroll, setAutoScroll] = useState(true);
+
   const handleWheel = useCallback((event: React.WheelEvent<HTMLDivElement>) => {
     event.stopPropagation();
   }, []);
+
+  // Check if user is at bottom of scroll
+  const checkScrollPosition = useCallback(() => {
+    if (!historyRef.current) return;
+
+    const { scrollTop, scrollHeight, clientHeight } = historyRef.current;
+    const isAtBottom = Math.abs(scrollHeight - clientHeight - scrollTop) < 10;
+    setAutoScroll(isAtBottom);
+  }, []);
+
+  // Auto-scroll to bottom when new messages arrive
+  useEffect(() => {
+    if (autoScroll && historyRef.current) {
+      historyRef.current.scrollTop = historyRef.current.scrollHeight;
+    }
+  }, [history, streamingText, autoScroll]);
+
+  // Monitor scroll position
+  const handleScroll = useCallback(() => {
+    checkScrollPosition();
+  }, [checkScrollPosition]);
 
   const getColorClass = (type: TerminalEntry['type']) => {
     switch (type) {
@@ -51,6 +74,7 @@ export const TerminalTab: React.FC<TerminalTabProps> = ({
       <div
         ref={historyRef}
         onWheel={handleWheel}
+        onScroll={handleScroll}
         className="flex-1 overflow-y-auto px-4 py-3 space-y-2 text-sm"
         style={{ overscrollBehavior: 'contain' }}
       >
