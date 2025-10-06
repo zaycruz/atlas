@@ -1,5 +1,5 @@
 import React, { useRef, useCallback } from 'react';
-import { Terminal } from 'lucide-react';
+import { Terminal, User, Bot } from 'lucide-react';
 import type { TerminalEntry } from '../types';
 
 interface TerminalTabProps {
@@ -49,18 +49,44 @@ export const TerminalTab: React.FC<TerminalTabProps> = ({
       <div
         ref={historyRef}
         onWheel={handleWheel}
-        className="flex-1 overflow-y-auto px-4 py-3 space-y-1 text-sm"
+        className="flex-1 overflow-y-auto px-4 py-3 space-y-2 text-sm"
         style={{ overscrollBehavior: 'contain' }}
       >
-        {history.map((entry, i) => (
-          <div key={i} className={getColorClass(entry.type)}>
-            {entry.text}
-          </div>
-        ))}
+        {history.map((entry, i) => {
+          const isUserCommand = entry.type === 'command';
+          const isAIResponse = entry.type === 'success';
+          const isSystem = entry.type === 'system';
+
+          return (
+            <div
+              key={i}
+              className={`flex gap-3 ${
+                isUserCommand
+                  ? 'bg-atlas-green-950/30 border-l-2 border-atlas-cyan-400 pl-3 py-2'
+                  : isAIResponse
+                  ? 'bg-atlas-green-900/20 border-l-2 border-atlas-yellow-400 pl-3 py-2'
+                  : 'pl-1 py-1'
+              }`}
+            >
+              {isUserCommand && (
+                <User size={16} className="text-atlas-cyan-400 flex-shrink-0 mt-0.5" />
+              )}
+              {isAIResponse && (
+                <Bot size={16} className="text-atlas-yellow-400 flex-shrink-0 mt-0.5" />
+              )}
+              <div className={`flex-1 ${getColorClass(entry.type)}`}>
+                {entry.text}
+              </div>
+            </div>
+          );
+        })}
         {streamingText && (
-          <div className="text-atlas-green-400 opacity-80">
-            {streamingText}
-            <span className="animate-pulse">▋</span>
+          <div className="flex gap-3 bg-atlas-green-900/20 border-l-2 border-atlas-yellow-400 pl-3 py-2">
+            <Bot size={16} className="text-atlas-yellow-400 flex-shrink-0 mt-0.5" />
+            <div className="flex-1 text-atlas-green-400 opacity-80">
+              {streamingText}
+              <span className="animate-pulse">▋</span>
+            </div>
           </div>
         )}
       </div>
