@@ -1,0 +1,10 @@
+{
+  "name": "atlas_kg",
+  "description": "Atlas Knowledge Graph + Ontology",
+  "endpoints": {
+    "entity.upsert": { "method": "POST", "path": "/entity" },
+    "link.create":   { "method": "POST", "path": "/link" },
+    "find":          { "method": "POST", "path": "/find" },
+    "lineage":       { "method": "GET",  "path": "/lineage/:id" }
+  }
+}
