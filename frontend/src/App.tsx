@@ -8,6 +8,7 @@ import { NetworkTab } from './components/NetworkTab';
 import { SystemTab } from './components/SystemTab';
 import { ModelToggler, type AIModel } from './components/ModelToggler';
 import { UserProfile, type UserProfileData } from './components/UserProfile';
+import type { AgentState } from './components/AgentStatus';
 import { useWebSocket } from './hooks/useWebSocket';
 import { useSystemMetrics } from './hooks/useSystemMetrics';
 import { useCommandHistory } from './hooks/useCommandHistory';
@@ -111,6 +112,7 @@ const App: React.FC = () => {
   const [time, setTime] = useState(() => new Date());
   const [activeModule, setActiveModule] = useState('terminal');
   const [currentModel, setCurrentModel] = useState<AIModel>('qwen3:latest');
+  const [agentStatus, setAgentStatus] = useState<AgentState>('idle');
   const [isProfileOpen, setIsProfileOpen] = useState(false);
   const [userProfile, setUserProfile] = useState<UserProfileData>({
     name: '',
@@ -195,7 +197,9 @@ const App: React.FC = () => {
           }
           setStreamingResponse('');
           streamingResponseRef.current = '';
+          setAgentStatus('idle');
         } else {
+          setAgentStatus('responding');
           setStreamingResponse((prev) => {
             const next = prev + chunk;
             streamingResponseRef.current = next;
@@ -319,6 +323,7 @@ const App: React.FC = () => {
     if (isConnected) {
       const message = { type: 'command', payload: trimmedInput };
       console.log('[App] Sending WebSocket message:', message);
+      setAgentStatus('processing');
       sendMessage(message);
     } else {
       console.log('[App] WebSocket not connected, showing error');
@@ -326,6 +331,7 @@ const App: React.FC = () => {
         ...prev,
         { type: 'error', text: 'WebSocket disconnected. Unable to send command.' }
       ]);
+      setAgentStatus('idle');
     }
 
     setTerminalInput('');
@@ -378,6 +384,7 @@ const App: React.FC = () => {
         currentModel={currentModel}
         onModelChange={handleModelChange}
         onOpenProfile={() => setIsProfileOpen(true)}
+        agentStatus={agentStatus}
       />
       <div className="flex-1 grid grid-cols-12">
         <LeftSidebar

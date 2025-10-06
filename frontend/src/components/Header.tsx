@@ -2,6 +2,7 @@ import React from 'react';
 import { User } from 'lucide-react';
 import { ConnectionStatus } from './ConnectionStatus';
 import { ModelToggler, type AIModel } from './ModelToggler';
+import { AgentStatus, type AgentState } from './AgentStatus';
 import { Tooltip } from './Tooltip';
 
 interface HeaderProps {
@@ -10,6 +11,7 @@ interface HeaderProps {
   currentModel: AIModel;
   onModelChange: (model: AIModel) => void;
   onOpenProfile: () => void;
+  agentStatus: AgentState;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -17,7 +19,8 @@ export const Header: React.FC<HeaderProps> = ({
   isConnected,
   currentModel,
   onModelChange,
-  onOpenProfile
+  onOpenProfile,
+  agentStatus
 }) => {
   return (
     <div className="px-4 py-3 border-b border-atlas-green-900 flex justify-between items-center">
@@ -31,6 +34,7 @@ export const Header: React.FC<HeaderProps> = ({
       </div>
 
       <div className="flex items-center gap-4">
+        <AgentStatus status={agentStatus} />
         <Tooltip content="User Profile & Preferences" position="bottom">
           <button
             onClick={onOpenProfile}
