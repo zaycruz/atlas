@@ -1,12 +1,20 @@
 import React from 'react';
 import { ConnectionStatus } from './ConnectionStatus';
+import { ModelToggler, type AIModel } from './ModelToggler';
 
 interface HeaderProps {
   time: Date;
   isConnected: boolean;
+  currentModel: AIModel;
+  onModelChange: (model: AIModel) => void;
 }
 
-export const Header: React.FC<HeaderProps> = ({ time, isConnected }) => {
+export const Header: React.FC<HeaderProps> = ({
+  time,
+  isConnected,
+  currentModel,
+  onModelChange
+}) => {
   return (
     <div className="px-4 py-3 border-b border-atlas-green-900 flex justify-between items-center">
       <div>
@@ -19,6 +27,7 @@ export const Header: React.FC<HeaderProps> = ({ time, isConnected }) => {
       </div>
 
       <div className="flex items-center gap-4">
+        <ModelToggler currentModel={currentModel} onModelChange={onModelChange} />
         <ConnectionStatus isConnected={isConnected} />
         <div className="text-right">
           <div className="text-xl text-atlas-yellow-400 leading-tight">

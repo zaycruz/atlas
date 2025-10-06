@@ -6,6 +6,7 @@ import { TerminalTab } from './components/TerminalTab';
 import { AnalyticsTab } from './components/AnalyticsTab';
 import { NetworkTab } from './components/NetworkTab';
 import { SystemTab } from './components/SystemTab';
+import { ModelToggler, type AIModel } from './components/ModelToggler';
 import { useWebSocket } from './hooks/useWebSocket';
 import { useSystemMetrics } from './hooks/useSystemMetrics';
 import type {
@@ -107,6 +108,7 @@ const buildGraphEdges = (rawEdges: KnowledgeGraphEdge[]): GraphEdge[] =>
 const App: React.FC = () => {
   const [time, setTime] = useState(() => new Date());
   const [activeModule, setActiveModule] = useState('terminal');
+  const [currentModel, setCurrentModel] = useState<AIModel>('sonnet');
   const systemMetrics = useSystemMetrics();
   const { isConnected, messages, clearMessages, sendMessage } = useWebSocket(WS_URL);
 
@@ -308,9 +310,23 @@ const App: React.FC = () => {
     setTerminalInput('');
   };
 
+  const handleModelChange = (model: AIModel) => {
+    console.log('[App] Model changed to:', model);
+    setCurrentModel(model);
+    // Send model change to backend
+    if (isConnected) {
+      sendMessage({ type: 'set_model', payload: { model } });
+    }
+  };
+
   return (
     <div className="min-h-screen bg-atlas-black text-atlas-green-500 flex flex-col">
-      <Header time={time} isConnected={isConnected} />
+      <Header
+        time={time}
+        isConnected={isConnected}
+        currentModel={currentModel}
+        onModelChange={handleModelChange}
+      />
       <div className="flex-1 grid grid-cols-12">
         <LeftSidebar
           activeModule={activeModule}
