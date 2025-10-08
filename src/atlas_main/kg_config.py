@@ -22,6 +22,14 @@ class KnowledgeGraphConfig:
     batch_size: int = 64
     fts_enabled: bool = True
 
+    # Graph backend selection
+    backend: str = "neo4j"  # "sqlite" or "neo4j"
+
+    # Neo4j connection settings
+    neo4j_uri: str = "bolt://localhost:7687"
+    neo4j_username: str = "neo4j"
+    neo4j_password: str = "atlas123"
+
     @classmethod
     def from_env(cls) -> "KnowledgeGraphConfig":
         enabled = os.getenv("ATLAS_KG_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
@@ -29,6 +37,12 @@ class KnowledgeGraphConfig:
         queue_override = os.getenv("ATLAS_KG_QUEUE")
         batch_override = os.getenv("ATLAS_KG_BATCH")
         fts_override = os.getenv("ATLAS_KG_FTS")
+        backend_override = os.getenv("ATLAS_KG_BACKEND", "neo4j")
+
+        # Neo4j connection settings from environment
+        neo4j_uri = os.getenv("ATLAS_NEO4J_URI", "bolt://localhost:7687")
+        neo4j_username = os.getenv("ATLAS_NEO4J_USERNAME", "neo4j")
+        neo4j_password = os.getenv("ATLAS_NEO4J_PASSWORD", "atlas123")
 
         db_path: Path = _DEFAULT_GRAPH_PATH
         if db_override:
@@ -60,6 +74,10 @@ class KnowledgeGraphConfig:
             max_queue=max_queue,
             batch_size=batch_size,
             fts_enabled=fts_enabled,
+            backend=backend_override,
+            neo4j_uri=neo4j_uri,
+            neo4j_username=neo4j_username,
+            neo4j_password=neo4j_password,
         )
 
 

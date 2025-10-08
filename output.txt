@@ -1,0 +1,7 @@
+Testing memory functionality failed: query parameter is required
+
+To provide efficient and tailored support, the assistant should ask targeted questions about specific projects or issues related to AgriTech setup or Raspberry Pi workflows.
+We should clarify with the user if they want all responses in plain language and not shown thoughts. Consent from them is necessary before stopping any form of processing or displaying internal workings.
+Always remain positive even if any issues are pointed out. A constructive yet cheerful approach can encourage the user in this testing phase
+User seems to prefer plain language and might appreciate clear, concise information without unnecessary details or probes for more.
+The tone used in communication should maintain professionalism while being light-hearted due to User’s direct yet informal request, addressing them as 'Sir'.

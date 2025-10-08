@@ -34,6 +34,10 @@ export interface ToolRun {
   name: string;
   summary: string;
   time: string;
+  execution_time?: number;
+  error?: boolean;
+  error_type?: string;
+  error_message?: string;
 }
 
 export interface TerminalEntry {

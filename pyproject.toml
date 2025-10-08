@@ -7,12 +7,13 @@ readme = "README.md"
 packages = [{include = "atlas_main", from = "src"}]
 
 [tool.poetry.dependencies]
-python = "^3.9"
+python = "^3.10"
 numpy = "^1.26"
 requests = "^2.32"
 rich = "^13.7"
 crawl4ai = "^0.4.0"
 websockets = "^13.1"
+neo4j = "^6.0.2"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3"

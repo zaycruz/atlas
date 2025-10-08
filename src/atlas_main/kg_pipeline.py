@@ -6,7 +6,7 @@ import logging
 from typing import Callable, Optional
 
 from .kg_config import KnowledgeGraphConfig
-from .knowledge_graph import SQLiteGraphStore
+from .knowledge_graph import GraphStore
 from .kg_extractor import ExtractionResult, MemoryGraphExtractor, MemoryPayload
 
 LOGGER = logging.getLogger(__name__)
@@ -21,7 +21,7 @@ class KnowledgeGraphPipeline:
         *,
         loop: asyncio.AbstractEventLoop,
         config: KnowledgeGraphConfig,
-        store: SQLiteGraphStore,
+        store: GraphStore,
         extractor: MemoryGraphExtractor,
         event_callback: Optional[Callable[[dict], None]] = None,
     ) -> None:

@@ -32,6 +32,12 @@ from .tools import (
     BrowserFindTool,
 )
 from .tools_browser import BrowserSession
+from .tools_memory import (
+    SearchMemoriesTool,
+    RecallReflectionsTool,
+    SearchKGTool,
+    ExploreKGTool,
+)
 
 DEFAULT_CHAT_MODEL = os.getenv("ATLAS_CHAT_MODEL", "qwen2.5:latest")
 DEFAULT_MAX_TOOL_CALLS = 10
@@ -118,6 +124,16 @@ class AtlasAgent:
             self.tools.register(BrowserFindTool(resolver))
         else:
             self.tools.register(WebSearchTool())
+
+        # Register memory tools
+        self.tools.register(SearchMemoriesTool())
+        self.tools.register(RecallReflectionsTool())
+        self.tools.register(SearchKGTool())
+        self.tools.register(ExploreKGTool())
+
+        # Graph store reference (set by websocket server)
+        self._graph_store: Optional[Any] = None
+
         self._debug_log_path = os.getenv("ATLAS_AGENT_LOG")
         self._cancel_event = threading.Event()
         self.focus_mode: str = "autopilot"
@@ -604,16 +620,24 @@ class AtlasAgent:
                         )
                     if stream_callback:
                         stream_callback(f"\n[tool:{request['name']}] {tool_output}\n")
+                    # Include execution metadata from _run_tool_request
+                    payload = {
+                        "name": request["name"],
+                        "arguments": request.get("arguments", {}),
+                        "output": tool_output,
+                        "call_id": tool_call_id,
+                        "source": request.get("source"),
+                    }
+                    # Add execution time and error details if available
+                    if "_execution_time" in request:
+                        payload["execution_time"] = request["_execution_time"]
+                    if "_error_details" in request and request["_error_details"]:
+                        payload["error_details"] = request["_error_details"]
+
                     self._emit_event(
                         event_callback,
                         "tool_result",
-                        {
-                            "name": request["name"],
-                            "arguments": request.get("arguments", {}),
-                            "output": tool_output,
-                            "call_id": tool_call_id,
-                            "source": request.get("source"),
-                        },
+                        payload,
                     )
                 continue
 
@@ -823,10 +847,26 @@ class AtlasAgent:
     def _run_tool_request(self, request: dict) -> str:
         name = request.get("name", "")
         arguments = request.get("arguments") or {}
+        import time
+        start_time = time.time()
+        error_details = None
+
         try:
             result = self.tools.run(name, agent=self, arguments=arguments)
+            execution_time = time.time() - start_time
         except ToolError as exc:
+            execution_time = time.time() - start_time
+            # Store error details for the event emission
+            error_details = {
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+                "execution_time": execution_time,
+            }
             result = f"Tool {name} failed: {exc}"
+
+        # Store execution metadata on request object for event emission
+        request["_execution_time"] = execution_time
+        request["_error_details"] = error_details
 
         result = result.strip()
         if len(result) > 2000:

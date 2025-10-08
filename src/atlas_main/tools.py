@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import logging
 import os
 import pty
 import re
@@ -11,6 +12,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import traceback
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +21,8 @@ from typing import Any, Dict, Iterable, List, Optional
 import requests
 
 from .tools_browser import BrowserSession, DEFAULT_BUDGET, DEFAULT_TOPN
+
+logger = logging.getLogger(__name__)
 
 
 USER_AGENT = "AtlasLite/1.0 (+https://github.com)"
@@ -91,13 +95,36 @@ class ToolRegistry:
         tool = self._tools.get(name)
         if not tool:
             raise ToolError(f"Unknown tool: {name}")
+
         args = arguments or {}
+        start_time = time.time()
+
+        logger.info(f"Tool '{name}' starting with args: {args}")
+
         try:
-            return tool.run(agent=agent, **args)
-        except ToolError:
+            result = tool.run(agent=agent, **args)
+            execution_time = time.time() - start_time
+            logger.info(f"Tool '{name}' completed successfully in {execution_time:.3f}s")
+            return result
+        except ToolError as exc:
+            execution_time = time.time() - start_time
+            logger.error(
+                f"Tool '{name}' failed with ToolError in {execution_time:.3f}s: {exc}\n"
+                f"Arguments: {args}\n"
+                f"Traceback:\n{traceback.format_exc()}"
+            )
             raise
         except Exception as exc:  # pragma: no cover - defensive
-            raise ToolError(f"Tool '{name}' failed: {exc}") from exc
+            execution_time = time.time() - start_time
+            tb_str = traceback.format_exc()
+            logger.error(
+                f"Tool '{name}' failed with unexpected exception in {execution_time:.3f}s: {type(exc).__name__}: {exc}\n"
+                f"Arguments: {args}\n"
+                f"Traceback:\n{tb_str}"
+            )
+            # Include more context in the error message
+            error_msg = f"Tool '{name}' failed: {type(exc).__name__}: {exc}"
+            raise ToolError(error_msg) from exc
 
     def list_names(self) -> Iterable[str]:
         return list(self._tools.keys())

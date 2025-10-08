@@ -19,7 +19,8 @@ import websockets
 from websockets.server import WebSocketServerProtocol
 
 from .kg_config import KnowledgeGraphConfig
-from .knowledge_graph import SQLiteGraphStore
+from .knowledge_graph import SQLiteGraphStore, GraphStore
+from .neo4j_graph_store import Neo4jGraphStore
 from .kg_pipeline import KnowledgeGraphPipeline, set_pipeline, clear_pipeline
 from .kg_extractor import MemoryGraphExtractor
 
@@ -44,7 +45,8 @@ else:  # pragma: no cover - support `python websocket_server.py`
     from atlas_main.agent import AtlasAgent
     from atlas_main.ollama import OllamaClient
     from atlas_main.kg_config import KnowledgeGraphConfig
-    from atlas_main.knowledge_graph import SQLiteGraphStore
+    from atlas_main.knowledge_graph import SQLiteGraphStore, GraphStore
+    from atlas_main.neo4j_graph_store import Neo4jGraphStore
     from atlas_main.kg_pipeline import KnowledgeGraphPipeline, set_pipeline, clear_pipeline
     from atlas_main.kg_extractor import MemoryGraphExtractor
 
@@ -120,7 +122,12 @@ class AtlasMetricsCollector:
                 tool_name = str(payload.get("name", "tool")).strip() or "tool"
                 arguments = payload.get("arguments") or {}
                 output = str(payload.get("output", "")).strip()
-                self._record_tool_usage(tool_name, output, timestamp, arguments)
+                execution_time = payload.get("execution_time")
+                error_details = payload.get("error_details")
+                self._record_tool_usage(
+                    tool_name, output, timestamp, arguments,
+                    execution_time=execution_time, error_details=error_details
+                )
             elif event == "tool_limit":
                 pass
             elif event == "tool_deferred":
@@ -314,6 +321,8 @@ class AtlasMetricsCollector:
         output: str,
         timestamp: str,
         arguments: Dict[str, Any],
+        execution_time: Optional[float] = None,
+        error_details: Optional[Dict[str, Any]] = None,
     ) -> None:
         clean_name = tool_name.strip() or "tool"
         self.tool_usage_counter[clean_name] += 1
@@ -321,14 +330,25 @@ class AtlasMetricsCollector:
         summary = output.splitlines()[0] if output else "(tool returned no output)"
         summary = summary[:160]
         label = clean_name.replace("_", " ").title()
-        self.tool_runs.appendleft(
-            {
-                "id": f"tool-{self._next_tool_id}",
-                "name": label,
-                "summary": summary,
-                "time": timestamp,
-            }
-        )
+
+        tool_run_entry = {
+            "id": f"tool-{self._next_tool_id}",
+            "name": label,
+            "summary": summary,
+            "time": timestamp,
+        }
+
+        # Add execution time if available
+        if execution_time is not None:
+            tool_run_entry["execution_time"] = round(execution_time, 3)
+
+        # Add error details if available
+        if error_details:
+            tool_run_entry["error"] = True
+            tool_run_entry["error_type"] = error_details.get("error_type", "Error")
+            tool_run_entry["error_message"] = error_details.get("error_message", "Unknown error")
+
+        self.tool_runs.appendleft(tool_run_entry)
         self._maybe_record_file_access(clean_name, arguments, timestamp)
 
     def _maybe_record_file_access(self, tool_name: str, arguments: Dict[str, Any], timestamp: str) -> None:
@@ -425,7 +445,7 @@ class AtlasWebSocketServer:
         self._subscribers: set[asyncio.Queue] = set()
         self.collector = AtlasMetricsCollector(self.agent, event_emitter=self._queue_event)
         self.graph_config = KnowledgeGraphConfig.from_env()
-        self.graph_store: Optional[SQLiteGraphStore] = None
+        self.graph_store: Optional[GraphStore] = None
         self.graph_pipeline: Optional[KnowledgeGraphPipeline] = None
         self.graph_extractor = MemoryGraphExtractor()
         self._executor = ThreadPoolExecutor(max_workers=2)
@@ -935,7 +955,17 @@ class AtlasWebSocketServer:
         if self._graph_started or not self.graph_config.enabled or self._loop is None:
             return
         try:
-            self.graph_store = SQLiteGraphStore(self.graph_config)
+            # Choose backend based on config
+            backend = self.graph_config.backend.lower()
+            if backend == "neo4j":
+                logger.info("Initializing Neo4j graph store")
+                self.graph_store = Neo4jGraphStore(self.graph_config)
+            elif backend == "sqlite":
+                logger.info("Initializing SQLite graph store")
+                self.graph_store = SQLiteGraphStore(self.graph_config)
+            else:
+                raise ValueError(f"Unknown graph backend: {backend}")
+
             self.graph_pipeline = KnowledgeGraphPipeline(
                 loop=self._loop,
                 config=self.graph_config,
@@ -945,6 +975,11 @@ class AtlasWebSocketServer:
             )
             set_pipeline(self.graph_pipeline)
             self._graph_started = True
+
+            # Provide graph store access to agent for memory tools
+            self.agent._graph_store = self.graph_store
+
+            logger.info(f"Knowledge graph pipeline started with {backend} backend")
         except Exception:
             logger.exception("Failed to initialize knowledge graph pipeline")
             self.graph_store = None

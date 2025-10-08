@@ -927,12 +927,14 @@ class SemanticMemory:
 class ReflectionMemory:
     """Lessons learned stored in a JSON lines or list file."""
 
-    def __init__(self, skills_path: Path) -> None:
+    def __init__(self, skills_path: Path, embed_fn: Optional[EmbedFn] = None) -> None:
         self.skills_path = Path(skills_path).expanduser()
+        self.embed_fn = embed_fn
         self.skills_path.parent.mkdir(parents=True, exist_ok=True)
         if not self.skills_path.exists():
             self.skills_path.write_text(json.dumps({"lessons": []}, indent=2))
         self._last_recent: List[dict[str, Any]] = []
+        self._last_recalled: List[dict[str, Any]] = []
 
     @staticmethod
     def _normalize_tags(tags: Any) -> list[str]:
@@ -991,6 +993,17 @@ class ReflectionMemory:
             else:
                 entry["quality"] = _quality_features(text)[0]
             entry["tags"] = self._normalize_tags(item.get("tags"))
+
+            # Load embedding if available
+            embedding = item.get("embedding")
+            if embedding is not None:
+                try:
+                    entry["embedding"] = list(embedding)
+                except (TypeError, ValueError):
+                    entry["embedding"] = None
+            else:
+                entry["embedding"] = None
+
             lessons.append(entry)
         return lessons
 
@@ -1032,6 +1045,14 @@ class ReflectionMemory:
                         lesson["quality"] = max(float(quality), lesson.get("quality", 0.0))
                     except (TypeError, ValueError):
                         pass
+                # Recompute embedding if embed_fn is available and embedding is missing
+                if self.embed_fn and not lesson.get("embedding"):
+                    try:
+                        embedding = self.embed_fn(lesson["text"])
+                        if embedding:
+                            lesson["embedding"] = list(embedding)
+                    except Exception:
+                        pass
                 self._write_lessons(lessons)
                 return False
         entry: dict[str, Any] = {
@@ -1054,6 +1075,16 @@ class ReflectionMemory:
             entry["quality"] = _quality_features(normalized)[0]
         entry["last_access_ts"] = entry["ts"]
         entry["tags"] = self._normalize_tags(tags)
+
+        # Compute embedding for new reflection
+        if self.embed_fn:
+            try:
+                embedding = self.embed_fn(normalized)
+                if embedding:
+                    entry["embedding"] = list(embedding)
+            except Exception:
+                pass
+
         lessons.append(entry)
         self._write_lessons(lessons)
         pipeline = get_pipeline()
@@ -1142,6 +1173,119 @@ class ReflectionMemory:
     @property
     def last_recent(self) -> List[dict[str, Any]]:
         return [dict(item) for item in self._last_recent]
+
+    @property
+    def last_recalled(self) -> List[dict[str, Any]]:
+        return [dict(item) for item in self._last_recalled]
+
+    def recall(self, query: str, top_k: int = 5) -> List[Tuple[float, dict]]:
+        """Retrieve reflections using semantic similarity with priority boosting."""
+        if top_k <= 0:
+            return []
+
+        lessons = self._read_lessons()
+        if not lessons or not self.embed_fn:
+            # Fallback to recent() if no embed function
+            recent_lessons = self.recent(top_k)
+            self._last_recalled = recent_lessons
+            return [(1.0, lesson) for lesson in recent_lessons]
+
+        # Compute query embedding
+        try:
+            query_vec = self.embed_fn(query)
+            if not query_vec:
+                recent_lessons = self.recent(top_k)
+                self._last_recalled = recent_lessons
+                return [(1.0, lesson) for lesson in recent_lessons]
+            query_vec = np.array(query_vec, dtype=np.float32)
+        except Exception:
+            recent_lessons = self.recent(top_k)
+            self._last_recalled = recent_lessons
+            return [(1.0, lesson) for lesson in recent_lessons]
+
+        # Compute similarity scores with priority boosting
+        now = time.time()
+        scored: List[Tuple[float, int, dict]] = []
+
+        for idx, lesson in enumerate(lessons):
+            embedding = lesson.get("embedding")
+
+            # Generate embedding if missing
+            if not embedding and self.embed_fn:
+                try:
+                    text = lesson.get("text", "")
+                    if text:
+                        embedding = self.embed_fn(text)
+                        if embedding:
+                            lesson["embedding"] = list(embedding)
+                            # Note: We don't persist here to avoid I/O in hot path
+                except Exception:
+                    pass
+
+            if not embedding:
+                continue
+
+            try:
+                emb_vec = np.array(embedding, dtype=np.float32)
+                base_score = _cosine(query_vec, emb_vec)
+            except Exception:
+                continue
+
+            # Apply priority boost (up to 0.2 additional score)
+            priority = self._lesson_priority(lesson, now)
+            priority_boost = min(0.2, priority * 0.1)  # Scale priority to 0-0.2 range
+
+            # Apply tag matching bonus
+            query_tokens = self._extract_query_tokens(query)
+            tag_bonus = self._tag_bonus(query_tokens, lesson.get("tags", []))
+
+            final_score = base_score + priority_boost + tag_bonus
+            scored.append((final_score, idx, lesson))
+
+        if not scored:
+            # No valid embeddings, fallback to recent()
+            recent_lessons = self.recent(top_k)
+            self._last_recalled = recent_lessons
+            return [(1.0, lesson) for lesson in recent_lessons]
+
+        # Sort by score descending
+        scored.sort(key=lambda x: x[0], reverse=True)
+        top_results = scored[:top_k]
+
+        # Update usage stats for retrieved reflections
+        lessons_copy = list(lessons)
+        dirty = False
+        for _, idx, _ in top_results:
+            try:
+                lessons_copy[idx]["uses"] = int(lessons_copy[idx].get("uses", 0)) + 1
+                lessons_copy[idx]["last_access_ts"] = now
+                dirty = True
+            except (IndexError, KeyError, TypeError, ValueError):
+                pass
+
+        if dirty:
+            self._write_lessons(lessons_copy)
+
+        self._last_recalled = [dict(lesson) for _, _, lesson in top_results]
+        return [(score, dict(lesson)) for score, _, lesson in top_results]
+
+    @staticmethod
+    def _extract_query_tokens(query: str) -> set[str]:
+        """Extract meaningful tokens from query for tag matching."""
+        return {token for token in re.findall(r"[A-Za-z0-9']+", query.lower()) if len(token) > 2}
+
+    @staticmethod
+    def _tag_bonus(query_tokens: set[str], tags: Iterable[str]) -> float:
+        """Compute bonus score for tag matches."""
+        if not tags or not query_tokens:
+            return 0.0
+        matches = 0
+        for tag in tags:
+            pieces = tag.split(":", 1)
+            raw = pieces[-1]
+            if any(part in query_tokens for part in raw.split()):
+                matches += 1
+        return min(0.15, matches * 0.05)
 
     def prune(self, max_items: int, *, keep_tail: Optional[int] = None) -> int:
         lessons = self._read_lessons()
@@ -1337,7 +1481,10 @@ class LayeredMemoryManager:
             embed_fn=embed_fn,
             graph_path=self.config.graph_path,
         )
-        self.reflections = ReflectionMemory(self.config.reflections_path)
+        self.reflections = ReflectionMemory(
+            self.config.reflections_path,
+            embed_fn=embed_fn,
+        )
         self.assembler = ContextAssembler(
             episodic=self.episodic,
             semantic=self.semantic,
@@ -1440,7 +1587,7 @@ class LayeredMemoryManager:
             k_lessons=self.config.k_reflections,
         )
         self._register_retrieval_feedback("fact", self.semantic.last_recalled)
-        self._register_retrieval_feedback("reflection", self.reflections.last_recent)
+        self._register_retrieval_feedback("reflection", self.reflections.last_recalled)
         meta = self.assembler.last_metadata
         episodic_meta = meta.get("episodic", [])
         semantic_meta = meta.get("semantic", [])
@@ -2447,7 +2594,7 @@ class ContextAssembler:
         lesson_snips: List[str] = []
         lesson_meta: List[dict[str, Any]] = []
         if self.reflections:
-            for item in self.reflections.recent(k_lessons):
+            for score, item in self.reflections.recall(query, top_k=k_lessons):
                 text = str(item.get("text", "")).strip().replace("\n", " ")
                 if text:
                     descriptor = text[:200]
@@ -2456,6 +2603,7 @@ class ContextAssembler:
                         descriptor += " (tags: " + ", ".join(tags[:3]) + ")"
                     lesson_snips.append(f"- {descriptor}")
                     lesson_meta.append({
+                        "score": float(score),
                         "text": text[:120],
                         "tags": tags,
                     })
