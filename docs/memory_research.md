@@ -36,7 +36,7 @@ Across these systems, the recurring ideas are:
 
 ## 5. Next Steps & Research Directions
 1. **LLM critic in the loop**: adopt a lightweight reviewer (similar to Letta’s critic) to validate or revise candidate facts before they enter long-term storage.
-2. **Task-linked memories**: tag facts/reflections with originating objectives or tool invocations, enabling targeted recall during similar tasks.
+2. **Task-linked memories**: tag facts/reflections with recent topics or tool invocations, enabling targeted recall during similar tasks.
 3. **Adaptive thresholds**: learn quality cutoffs per user or domain by monitoring retrieval success—mirroring MemGPT’s adaptive gating.
 4. **Memory audits**: schedule periodic reflective summaries where the agent revalidates stored knowledge against fresh conversations.
 5. **Graph structuring**: experiment with linking facts into a lightweight knowledge graph to support reasoning over dependencies and contradictions.

@@ -12,13 +12,13 @@ numpy = "^1.26"
 requests = "^2.32"
 rich = "^13.7"
 crawl4ai = "^0.4.0"
-websockets = "^13.1"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3"
 
 [tool.poetry.scripts]
 atlas-chat = "atlas_main.cli:main"
+atlas-rpc = "atlas_main.rpc:main"
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import json
 import os
 import pty
 import re
@@ -12,12 +13,17 @@ import tempfile
 import threading
 import time
 import shutil
+import sys
 from dataclasses import dataclass
+from datetime import datetime
+from hashlib import sha256
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
 
+from .safety import redact_mapping, redact_text
+from .telemetry import Telemetry
 from .tools_browser import BrowserSession, DEFAULT_BUDGET, DEFAULT_TOPN
 
 
@@ -53,6 +59,7 @@ class Tool:
     name: str = ""
     description: str = ""
     args_hint: str = ""
+    capabilities: frozenset[str] = frozenset()
     parameters_schema: Dict[str, Any] = {
         "type": "object",
         "properties": {},
@@ -68,12 +75,175 @@ class Tool:
     def function_parameters(self) -> Dict[str, Any]:
         return self.parameters_schema
 
+    def capability_summary(self) -> str:
+        if not self.capabilities:
+            return "none"
+        return ", ".join(sorted(self.capabilities))
+
+
+class ToolPolicyManager:
+    """Persisted allow/deny policy for tools."""
+
+    def __init__(self) -> None:
+        self.mode = os.getenv("ATLAS_TOOL_POLICY", "allow").strip().lower() or "allow"
+        self.policy_path = Path(os.getenv("ATLAS_POLICY_PATH", "~/.atlas/policy.json")).expanduser()
+        self.noninteractive_fallback = (
+            os.getenv("ATLAS_TOOL_POLICY_NONINTERACTIVE", "allow").strip().lower() or "allow"
+        )
+        self._lock = threading.Lock()
+        self._decisions: Dict[str, str] = self._load()
+
+    def evaluate(self, tool: Tool, arguments: Dict[str, Any]) -> Tuple[bool, str]:
+        """Return (allowed, decision_label)."""
+        mode = self.mode
+        if mode not in {"allow", "deny", "ask"}:
+            mode = "allow"
+        if mode == "allow":
+            return True, "allow_default"
+        if mode == "deny":
+            return False, "deny_default"
+
+        with self._lock:
+            cached = self._decisions.get(tool.name)
+        if cached == "allow":
+            return True, "allow_cached"
+        if cached == "deny":
+            return False, "deny_cached"
+
+        if not sys.stdin.isatty():
+            fallback = "allow" if self.noninteractive_fallback != "deny" else "deny"
+            return (fallback == "allow", f"{fallback}_noninteractive")
+
+        decision = self._prompt(tool, arguments)
+        if decision == "allow_always":
+            self._set_decision(tool.name, "allow")
+            return True, "allow_always"
+        if decision == "deny_always":
+            self._set_decision(tool.name, "deny")
+            return False, "deny_always"
+        if decision == "allow_once":
+            return True, "allow_once"
+        return False, "deny_once"
+
+    def _prompt(self, tool: Tool, arguments: Dict[str, Any]) -> str:
+        caps = tool.capability_summary()
+        description = redact_text(tool.description or "(no description)")
+        message = (
+            f"\nTool '{tool.name}' requested.\n"
+            f"Description: {description}\n"
+            f"Capabilities: {caps}\n"
+            f"Arguments: {self._summarize_arguments(arguments)}\n"
+            "Allow this tool? [y]es once / [a]lways allow / [n]o once / [d]eny always: "
+        )
+        while True:
+            try:
+                choice = input(message).strip().lower()
+            except EOFError:
+                return "deny_once"
+            if choice in {"y", "yes"}:
+                return "allow_once"
+            if choice in {"a", "always"}:
+                return "allow_always"
+            if choice in {"n", "no"}:
+                return "deny_once"
+            if choice in {"d", "deny"}:
+                return "deny_always"
+            print("Please respond with y/yes, a/always, n/no, or d/deny.")
+
+    def _summarize_arguments(self, arguments: Dict[str, Any]) -> str:
+        if not arguments:
+            return "(none)"
+        parts: List[str] = []
+        for key, value in arguments.items():
+            text = redact_text(str(value))
+            if len(text) > 120:
+                text = text[:117] + "..."
+            parts.append(f"{key}={text}")
+        return ", ".join(parts)
+
+    def _set_decision(self, tool_name: str, decision: str) -> None:
+        with self._lock:
+            self._decisions[tool_name] = decision
+            self._save()
+
+    def _load(self) -> Dict[str, str]:
+        if not self.policy_path.exists():
+            return {}
+        try:
+            data = json.loads(self.policy_path.read_text())
+            if isinstance(data, dict):
+                return {str(k): str(v) for k, v in data.items()}
+        except Exception:
+            return {}
+        return {}
+
+    def _save(self) -> None:
+        try:
+            self.policy_path.parent.mkdir(parents=True, exist_ok=True)
+            self.policy_path.write_text(json.dumps(self._decisions, indent=2))
+        except Exception:
+            pass
+
+
+class ToolAuditLogger:
+    """Append-only JSON lines audit log for tool executions."""
+
+    def __init__(self) -> None:
+        raw_path = os.getenv("ATLAS_AUDIT_LOG", "~/.atlas/audit.jsonl")
+        self.log_path = Path(raw_path).expanduser()
+        self.enabled = bool(raw_path)
+        self._lock = threading.Lock()
+
+    def log(
+        self,
+        *,
+        tool: str,
+        capabilities: Iterable[str],
+        decision: str,
+        status: str,
+        duration: float,
+        arguments: Dict[str, Any],
+        args_digest: str,
+        error: Optional[str] = None,
+    ) -> None:
+        if not self.enabled:
+            return
+        record = {
+            "ts": datetime.utcnow().isoformat() + "Z",
+            "tool": tool,
+            "capabilities": sorted(set(capabilities)),
+            "decision": decision,
+            "status": status,
+            "duration": round(duration, 3),
+            "arguments": redact_mapping(arguments),
+            "args_digest": args_digest,
+        }
+        if error:
+            record["error"] = redact_text(error)
+        try:
+            line = json.dumps(record, ensure_ascii=False)
+        except Exception:
+            line = json.dumps(
+                {key: str(value) for key, value in record.items()},
+                ensure_ascii=False,
+            )
+        with self._lock:
+            try:
+                self.log_path.parent.mkdir(parents=True, exist_ok=True)
+                with self.log_path.open("a", encoding="utf-8") as handle:
+                    handle.write(line + "\n")
+            except Exception:
+                pass
+
+
 
 class ToolRegistry:
     """Maintains available tools and executes them safely."""
 
     def __init__(self) -> None:
         self._tools: Dict[str, Tool] = {}
+        self._policy = ToolPolicyManager()
+        self._audit = ToolAuditLogger()
 
     def register(self, tool: Tool) -> None:
         self._tools[tool.name] = tool
@@ -85,6 +255,8 @@ class ToolRegistry:
             lines.append(f"- {desc.name}: {desc.description}")
             if desc.args_hint:
                 lines.append(f"  args: {desc.args_hint}")
+            if tool.capabilities:
+                lines.append(f"  capabilities: {', '.join(sorted(tool.capabilities))}")
         return "\n".join(lines) if lines else "(no tools available)"
 
     def run(self, name: str, *, agent=None, arguments: Optional[Dict[str, Any]] = None) -> str:
@@ -92,12 +264,49 @@ class ToolRegistry:
         if not tool:
             raise ToolError(f"Unknown tool: {name}")
         args = arguments or {}
+        allow, decision = self._policy.evaluate(tool, args)
+        args_summary = self._safe_arguments(args)
+        args_digest = self._arguments_digest(args)
+        if not allow:
+            self._audit.log(
+                tool=tool.name,
+                capabilities=tool.capabilities,
+                decision=decision,
+                status="denied",
+                duration=0.0,
+                arguments=args_summary,
+                args_digest=args_digest,
+                error="policy_denied",
+            )
+            raise ToolError(f"Tool '{name}' denied by policy")
+        start_time = time.time()
+        status = "success"
+        error_message: Optional[str] = None
+        result = ""
         try:
-            return tool.run(agent=agent, **args)
-        except ToolError:
+            result = tool.run(agent=agent, **args)
+        except ToolError as exc:
+            status = "error"
+            error_message = str(exc)
             raise
         except Exception as exc:  # pragma: no cover - defensive
+            status = "error"
+            error_message = f"{type(exc).__name__}: {exc}"
             raise ToolError(f"Tool '{name}' failed: {exc}") from exc
+        finally:
+            duration = time.time() - start_time
+            self._audit.log(
+                tool=tool.name,
+                capabilities=tool.capabilities,
+                decision=decision,
+                status=status,
+                duration=duration,
+                arguments=args_summary,
+                args_digest=args_digest,
+                error=error_message,
+            )
+            Telemetry.instance().observe_tool(tool.name, duration, status)
+        return result
 
     def list_names(self) -> Iterable[str]:
         return list(self._tools.keys())
@@ -113,10 +322,29 @@ class ToolRegistry:
                         "name": tool.name,
                         "description": tool.description,
                         "parameters": tool.function_parameters(),
+                        "capabilities": sorted(tool.capabilities),
                     },
                 }
             )
         return specs
+
+    @staticmethod
+    def _safe_arguments(arguments: Dict[str, Any]) -> Dict[str, Any]:
+        safe: Dict[str, Any] = {}
+        for key, value in arguments.items():
+            text = redact_text(str(value))
+            if len(text) > 120:
+                text = text[:117] + "..."
+            safe[key] = text
+        return safe
+
+    @staticmethod
+    def _arguments_digest(arguments: Dict[str, Any]) -> str:
+        try:
+            payload = json.dumps(arguments, sort_keys=True, default=str)
+        except Exception:
+            payload = repr(arguments)
+        return sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
 class WebSearchTool(Tool):
@@ -128,6 +356,7 @@ class WebSearchTool(Tool):
         "query (str, required); max_results (int, optional, default 3); domain (str, optional); "
         "titles_only (bool, optional); include_meta (bool, optional)"
     )
+    capabilities = frozenset({"net:http", "net:crawl"})
 
     def __init__(self, *, session: Optional[requests.Session] = None) -> None:
         self._session = session or requests.Session()
@@ -572,6 +801,7 @@ class ReadFileTool(Tool):
         "path (str, required); offset (int, optional); length (int, optional); "
         "max_lines (int, optional); pattern (str, optional); case_sensitive (bool, optional)"
     )
+    capabilities = frozenset({"fs:read"})
 
     def __init__(self, *, max_chars: int = DEFAULT_FILE_CHUNK) -> None:
         self._max_chars = max_chars
@@ -651,6 +881,7 @@ class WriteFileTool(Tool):
         "append (bool, optional); create_dirs (bool, optional); atomic (bool, optional); "
         "preserve_times (bool, optional); show_diff (bool, optional)"
     )
+    capabilities = frozenset({"fs:write"})
 
     def run(
         self,
@@ -779,6 +1010,7 @@ class ShellCommandTool(Tool):
         "command (str, required); timeout (int, optional); cwd (str, optional); "
         "sudo (bool, optional); interactive (bool, optional); retries (int, optional)"
     )
+    capabilities = frozenset({"process:exec"})
 
     def run(
         self,
@@ -926,6 +1158,7 @@ class ListDirectoryTool(Tool):
         "path (str, optional, default '.'); show_hidden (bool, optional); max_entries (int, optional); "
         "recursive (bool, optional); depth (int, optional); human (bool, optional)"
     )
+    capabilities = frozenset({"fs:read"})
 
     def run(
         self,
@@ -1007,6 +1240,8 @@ class ListDirectoryTool(Tool):
 
 
 class _BrowserToolBase(Tool):
+    capabilities = frozenset({"net:http", "browser:automation"})
+
     def __init__(self, session_resolver):
         self._session_resolver = session_resolver
 

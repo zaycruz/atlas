@@ -278,3 +278,20 @@ def test_debug_logging_when_enabled(tmp_path: Path):
             agent.close()
     finally:
         os.environ.pop("ATLAS_AGENT_LOG", None)
+
+
+def test_prepare_tool_output_compacts(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("ATLAS_MEMORY_DIR", str(tmp_path / "memory"))
+    monkeypatch.setenv("ATLAS_TOOL_OUTPUT_DIR", str(tmp_path / "tool_outputs"))
+    monkeypatch.setenv("ATLAS_TOOL_OUTPUT_MAX", "50")
+    agent = AtlasAgent(_FakeClient())
+    try:
+        payload = "This is a long output." * 10
+        summary, saved_path = agent._prepare_tool_output("demo", payload)
+        assert saved_path is not None
+        assert Path(saved_path).exists()
+        assert "full output saved" in summary
+    finally:
+        agent.close()
+    monkeypatch.delenv("ATLAS_TOOL_OUTPUT_DIR", raising=False)
+    monkeypatch.delenv("ATLAS_TOOL_OUTPUT_MAX", raising=False)

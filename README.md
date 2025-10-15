@@ -46,6 +46,7 @@ python scripts/visualize_summarizer.py
 - `/log <off|error|warn|info|debug>` — adjust logging
 - `/memory stats` — inspect harvest/prune counters for the layered memory stack
 - `/memory prune <semantic|reflections|all> [limit] [--review]` — trim long-term stores, optionally consulting the active model before deletions
+- `/stats` — display runtime metrics (latency, tool durations, compactions)
 - `/quit` — exit the chat
 
 ### Tooling
@@ -53,19 +54,39 @@ python scripts/visualize_summarizer.py
 Atlas can request tools while reasoning. The available set is announced in the system prompt and currently includes:
 
 - `web_search`: Uses DuckDuckGo for search results and Crawl4AI for clean content extraction from web pages.
+- `memory.search_episodes`: Retrieve prior conversation turns relevant to a query.
+- `memory.search_facts`: Lookup semantic facts with knowledge-graph context.
+- `memory.explore_graph`: Inspect neighbouring facts in the knowledge graph.
 
-The model triggers a tool with a directive like `<<tool:web_search|{"query": "topic"}>>`. Tool outputs are fed back into the conversation so the model can continue looping until it reaches an answer.
-
-#### Content Extraction with Crawl4AI
-
-Atlas uses [Crawl4AI](https://github.com/unclecode/crawl4ai) for intelligent web content extraction:
-
-- **Clean Content**: Extracts readable text from web pages, removing ads and navigation
-- **LLM-Optimized**: Designed specifically for AI applications
-- **Fast & Reliable**: Handles modern web pages with JavaScript
-- **Automatic Fallback**: Falls back to simple HTTP requests if Crawl4AI fails
+The model can invoke these with directives like `<<tool:web_search|{"query": "topic"}>>` or `<<tool:memory.search_facts|{"query": "tailscale"}>>`. Tool outputs are summarized before being re-ingested so the conversation stays within the model’s context budget.
 
 No additional setup required — Crawl4AI ships as a dependency.
+
+## Security & Permissions
+
+- Tools now declare capabilities (filesystem, process execution, network).
+- The policy engine consults `ATLAS_TOOL_POLICY` (`allow`, `deny`, `ask`).
+- Decisions are persisted in `~/.atlas/policy.json` and an audit log is written to `ATLAS_AUDIT_LOG` (default `~/.atlas/audit.jsonl`).
+- Redaction is enabled by default (`ATLAS_REDACT=1`) to scrub obvious secrets from logs.
+
+## Metrics & Observability
+
+- `/stats` prints recent latency percentiles, snapshot savings, and per-tool success/error counts.
+- Metrics can be toggled with `ATLAS_METRICS` (on by default).
+- Memory packing is budget-aware; adjust `ATLAS_CONTEXT_WINDOW`, `ATLAS_CONTEXT_SAFETY`, and compaction thresholds (`ATLAS_COMPACT_THRESHOLD`, `ATLAS_COMPACT_TARGET`).
+- Large tool outputs are summarized automatically; full payloads are persisted under `ATLAS_TOOL_OUTPUT_DIR` (default `~/.atlas/tool_outputs`).
+
+## Background Watchers (optional)
+
+- File watcher: set `ATLAS_WATCH_DIRS="~/Documents,~/Projects"` to log edits to episodic memory. Configure extensions via `ATLAS_WATCH_EXT` and poll interval via `ATLAS_WATCH_INTERVAL`.
+- Clipboard watcher: enable with `ATLAS_CLIPBOARD=1` (requires `pyperclip`). Minimum snippet length and interval can be tuned with `ATLAS_CLIPBOARD_MIN` and `ATLAS_CLIPBOARD_INTERVAL`.
+- Watchers run only when layered memory is active and can be disabled by unsetting the variables.
+
+## Programmatic access
+
+- `poetry run atlas-rpc` (or `python -m atlas_main.rpc`) launches a JSON-RPC loop on stdin/stdout.
+- Supported methods: `chat`, `tools.list`, `tools.run`, `memory.snapshot`, `stats.get`, `shutdown`.
+- Responses follow a simple `{"id": ..., "result": ..., "error": ...}` schema for easy scripting.
 
 ## Development notes
 

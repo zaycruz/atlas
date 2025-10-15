@@ -12,10 +12,13 @@ import re
 import inspect
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from typing import List, Optional, Callable, Dict, Any
+from typing import List, Optional, Callable, Dict, Any, Tuple
+from pathlib import Path
 import threading
+import time
 from .memory import WorkingMemory, HybridWorkingMemory, WorkingMemoryConfig
 from .memory_layers import LayeredMemoryConfig, LayeredMemoryManager, LayeredMemorySnapshot
+from .telemetry import Telemetry
 from .ollama import OllamaClient, OllamaError
 from .tools import (
     ToolRegistry,
@@ -29,11 +32,13 @@ from .tools import (
     BrowserOpenTool,
     BrowserFindTool,
 )
+from .tools_memory import SearchEpisodesTool, SearchFactsTool, ExploreKnowledgeTool
 from .tools_browser import BrowserSession
 
 DEFAULT_CHAT_MODEL = os.getenv("ATLAS_CHAT_MODEL", "qwen3:latest")
-DEFAULT_MAX_TOOL_CALLS = 5
-DEFAULT_GPT_OSS_TOOL_LIMIT = 10
+# Allow user to configure max tool calls via environment
+DEFAULT_MAX_TOOL_CALLS = int(os.getenv("ATLAS_MAX_TOOL_CALLS", "10"))  # Increased to allow more tool persistence
+DEFAULT_GPT_OSS_TOOL_LIMIT = int(os.getenv("ATLAS_GPT_OSS_TOOL_LIMIT", "15"))
 DEFAULT_PROMPT = (
     """
 You are Atlas, a hyper-intelligent AI assistant integrated directly into my local terminal. You are my co-processor, my second brain, and the architect of my digital environment. Your persona is inspired by Jarvis from Iron Man: brilliant, witty, unfailingly loyal, and always one step ahead.
@@ -60,11 +65,13 @@ File System Navigator: You can read, write, and manage files on my system. When 
 
 Web Integration: You can access the web for real-time information using the tool <<tool:web_search|{\"query\":\"...\"}>>. Synthesize information, don't just dump links.
 
+Tool Persistence: If a tool doesn't provide enough information, USE IT AGAIN with refined parameters. Don't give up after one attempt. Keep trying different queries or approaches until you have a complete answer.
+
 Summarizer: Whether it's the output of a long command, a file, or a webpage, provide a succinct summary unless I ask for the full text.
 
 Reasoning Protocol: Keep your internal reasoning silent by enclosing it in <think>...</think> tags. Provide the user-facing answer after those tags, separated by a blank line. Never include <think> content in the final spoken or printed reply.
 
-Final Instruction: You are not just a chatbot. You are an active participant in my workflow. Be direct, be brilliant, and let's get to work.
+Final Instruction: You are not just a chatbot. You are an active participant in my workflow. Be direct, be brilliant, and let's get to work. If you need more information, keep using tools until you have everything you need.
 
 Think step-by-step only when the question is complex.
 """)
@@ -120,10 +127,29 @@ class AtlasAgent:
         else:
             self.tools.register(WebSearchTool())
         self._debug_log_path = os.getenv("ATLAS_AGENT_LOG")
+        self._register_memory_tools()
+        self._debug_log_path = os.getenv("ATLAS_AGENT_LOG")
         self._cancel_event = threading.Event()
         self.focus_mode: str = "autopilot"
-        self._last_objective: Optional[str] = None
         self._last_tags: set[str] = set()
+        self._compact_threshold_pct = self._parse_float_env("ATLAS_COMPACT_THRESHOLD", default=80.0, clamp=(0.0, 100.0))
+        self._compact_target_pct = self._parse_float_env(
+            "ATLAS_COMPACT_TARGET",
+            default=60.0,
+            clamp=(10.0, 100.0),
+        )
+        if self._compact_target_pct > self._compact_threshold_pct:
+            self._compact_target_pct = self._compact_threshold_pct
+        self._compact_min_prefix = max(4, int(os.getenv("ATLAS_COMPACT_MIN_PREFIX", "6") or 6))
+        self._context_window_tokens = max(0, int(os.getenv("ATLAS_CONTEXT_WINDOW", "120000") or 120000))
+        self._context_safety_tokens = max(0, int(os.getenv("ATLAS_CONTEXT_SAFETY", "4000") or 4000))
+
+    def _register_memory_tools(self) -> None:
+        if getattr(self, "layered_memory", None) is None:
+            return
+        self.tools.register(SearchEpisodesTool())
+        self.tools.register(SearchFactsTool())
+        self.tools.register(ExploreKnowledgeTool())
 
     def close(self) -> None:
         memory = getattr(self, "layered_memory", None)
@@ -142,20 +168,6 @@ class AtlasAgent:
         if mode not in {"autopilot", "focus"}:
             raise ValueError("Focus mode must be 'autopilot' or 'focus'")
         self.focus_mode = mode
-
-    @property
-    def last_objective(self) -> Optional[str]:
-        return self._last_objective
-
-    def set_manual_objective(self, objective: Optional[str]) -> None:
-        """Manually set the current objective, overriding automatic extraction."""
-        self._current_objective = objective
-        self._last_objective = objective
-
-    def clear_objective(self) -> None:
-        """Clear any stored objective state."""
-        self._current_objective = None
-        self._last_objective = None
 
     @property
     def last_tags(self) -> set[str]:
@@ -243,19 +255,9 @@ class AtlasAgent:
         if not user_text:
             return ""
 
+        turn_start = time.time()
         self._current_turn_tags: set[str] = set()
         self._current_turn_tools: set[str] = set()
-
-        if not user_text.startswith("/"):
-            new_objective, should_update = self._extract_objective_with_llm(user_text, self._last_objective)
-            if should_update:
-                self._current_objective = new_objective
-                if self._current_objective:
-                    self._register_turn_tag(f"objective:{self._slug_tag(self._current_objective)}")
-            else:
-                self._current_objective = self._last_objective
-        else:
-            self._current_objective = self._last_objective
 
         # Add user message and handle any evicted messages
         evicted = self.working_memory.add_user(user_text)
@@ -266,16 +268,19 @@ class AtlasAgent:
                 {
                     "evicted_count": len(evicted),
                     "reason": "capacity_limit",
-                    "objective": self._current_objective,
                 },
             )
-            
+
+        stats = self.working_memory.get_stats()
+        if self._maybe_compact_working_memory(stats, event_callback):
+            stats = self.working_memory.get_stats()
+        token_budget_hint = self._calculate_memory_budget(stats)
+
         self._emit_event(
             event_callback,
             "turn_start",
             {
                 "user_text": user_text,
-                "objective": self._current_objective,
                 "tags": list(self._current_turn_tags),
                 "context_usage": self._context_usage_snapshot(),
                 "memory_stats": self._memory_stats_snapshot(),
@@ -284,15 +289,36 @@ class AtlasAgent:
         self._cancel_event.clear()
 
         tool_calls = 0
+        tool_loop_iteration = 0
+        last_tool_request_signature = None  # Track last tool call to prevent loops
+        consecutive_failures = 0  # Track failures to stop infinite retries
+        MAX_CONSECUTIVE_FAILURES = 2  # Stop after 2 identical failures
+
         memory_snapshot: Optional[LayeredMemorySnapshot] = None
         if self.layered_memory and not self.test_mode:  # Skip memory in test mode
             try:
                 self._emit_event(event_callback, "status", {"message": "Harvesting memory layers"})
-                memory_snapshot = self.layered_memory.build_snapshot(user_text, client=self.client)
+                memory_snapshot = self.layered_memory.build_snapshot(
+                    user_text,
+                    client=self.client,
+                    token_budget_hint=token_budget_hint,
+                )
             except Exception:
                 memory_snapshot = None
 
         while True:
+            tool_loop_iteration += 1
+            if tool_loop_iteration > 1:
+                # Emit progress for tool loop iterations
+                self._emit_event(
+                    event_callback,
+                    "tool_loop_progress",
+                    {
+                        "iteration": tool_loop_iteration,
+                        "tool_calls_so_far": tool_calls,
+                        "max_allowed": self._max_tool_calls(),
+                    },
+                )
             self._check_cancel()
             system_content = self._build_system_prompt(user_text)
             messages = [{"role": "system", "content": system_content}]
@@ -373,12 +399,14 @@ class AtlasAgent:
                     stream_callback(f"\n[error] {exc}")
                 message = f"I hit an error contacting Ollama: {exc}"
                 self._record_interaction(user_text, message)
+                self._observe_turn_duration(turn_start)
                 return message
             except InteractionCancelled:
                 message = "(interaction cancelled)"
                 self._record_interaction(user_text, message)
                 self.working_memory.add_assistant(message)
                 self._emit_event(event_callback, "cancelled", {"message": message})
+                self._observe_turn_duration(turn_start)
                 return message
 
             full_response = "".join(accumulator)
@@ -429,6 +457,37 @@ class AtlasAgent:
                     )
 
             if tool_requests:
+                # Create signature of this tool call for duplicate detection
+                current_signature = json.dumps(
+                    sorted([(r["name"], json.dumps(r.get("arguments", {}), sort_keys=True)) for r in tool_requests]),
+                    sort_keys=True
+                )
+
+                # Check if this is identical to the last tool call (infinite loop detection)
+                if current_signature == last_tool_request_signature:
+                    consecutive_failures += 1
+                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                        message = (
+                            f"I attempted the same tool call {consecutive_failures} times without success. "
+                            "The tool may not be available or the command may be incorrect. "
+                            "Stopping to prevent infinite loop."
+                        )
+                        self.working_memory.add_assistant(message)
+                        self._record_interaction(user_text, message)
+                        if stream_callback:
+                            stream_callback(f"\n{message}\n")
+                        self._emit_event(
+                            event_callback,
+                            "tool_loop_detected",
+                            {"consecutive_failures": consecutive_failures, "tool_signature": current_signature},
+                        )
+                        self._observe_turn_duration(turn_start)
+                        return message
+                else:
+                    # Different tool call, reset failure counter
+                    consecutive_failures = 0
+                    last_tool_request_signature = current_signature
+
                 max_tool_calls = self._max_tool_calls()
                 if tool_calls + len(tool_requests) > max_tool_calls:
                     message = "I tried using tools but hit the maximum number of attempts without finishing."
@@ -441,6 +500,7 @@ class AtlasAgent:
                         "tool_limit",
                         {"attempted": len(tool_requests), "max": max_tool_calls},
                     )
+                    self._observe_turn_duration(turn_start)
                     return message
 
                 tool_calls += len(tool_requests)
@@ -497,9 +557,10 @@ class AtlasAgent:
                     self._check_cancel()
                     role = "tool" if is_gpt_oss and request.get("source") == "stream" else "assistant"
                     tool_call_id = request.get("call_id") if role == "tool" else None
+                    display_output, saved_path = self._prepare_tool_output(request["name"], tool_output)
                     self.working_memory.add_tool(
                         request["name"],
-                        tool_output,
+                        display_output,
                         role=role,
                         tool_call_id=tool_call_id,
                     )
@@ -513,17 +574,21 @@ class AtlasAgent:
                             },
                         )
                     if stream_callback:
-                        stream_callback(f"\n[tool:{request['name']}] {tool_output}\n")
+                        stream_callback(f"\n[tool:{request['name']}] {display_output}\n")
+                    payload = {
+                        "name": request["name"],
+                        "arguments": request.get("arguments", {}),
+                        "output": display_output,
+                        "call_id": tool_call_id,
+                        "source": request.get("source"),
+                    }
+                    if saved_path:
+                        payload["saved_path"] = saved_path
+                        payload["truncated"] = True
                     self._emit_event(
                         event_callback,
                         "tool_result",
-                        {
-                            "name": request["name"],
-                            "arguments": request.get("arguments", {}),
-                            "output": tool_output,
-                            "call_id": tool_call_id,
-                            "source": request.get("source"),
-                        },
+                        payload,
                     )
                 continue
 
@@ -534,20 +599,19 @@ class AtlasAgent:
 
             self.working_memory.add_assistant(text)
             self._record_interaction(user_text, text)
-            self._last_objective = self._current_objective
             self._last_tags = set(self._current_turn_tags)
             self._emit_event(
                 event_callback,
                 "turn_complete",
                 {
                     "text": text,
-                    "objective": self._current_objective,
                     "tags": list(self._current_turn_tags),
                     "tools": list(self._current_turn_tools),
                     "context_usage": self._context_usage_snapshot(),
                     "memory_stats": self._memory_stats_snapshot(),
                 },
             )
+            self._observe_turn_duration(turn_start)
             return text
 
     # ------------------------------------------------------------------
@@ -624,6 +688,186 @@ class AtlasAgent:
         
         return stats
 
+    @staticmethod
+    def _parse_float_env(name: str, *, default: float, clamp: tuple[float, float]) -> float:
+        raw = os.getenv(name)
+        value = default
+        if raw is not None and raw.strip():
+            try:
+                value = float(raw.strip())
+            except ValueError:
+                value = default
+        low, high = clamp
+        return max(low, min(high, value))
+
+    def _calculate_memory_budget(self, stats: Dict[str, Any]) -> Optional[int]:
+        if self._context_window_tokens <= 0:
+            return None
+        working_tokens = int(stats.get("tokens", 0))
+        budget = self._context_window_tokens - working_tokens - self._context_safety_tokens
+        return max(budget, 0)
+
+    def _maybe_compact_working_memory(
+        self,
+        stats: Dict[str, Any],
+        event_callback: Optional[Callable[[str, Dict[str, Any]], None]],
+    ) -> bool:
+        if self._compact_threshold_pct <= 0:
+            return False
+        try:
+            token_pct = float(stats.get("token_pct", 0.0))
+        except Exception:
+            token_pct = 0.0
+        if token_pct < self._compact_threshold_pct:
+            return False
+
+        messages = self.working_memory.to_messages()
+        if len(messages) < self._compact_min_prefix:
+            return False
+        first = messages[0]
+        if first.get("summary"):
+            return False  # Already compacted
+
+        tokens_per_message = [self._estimate_message_tokens(msg) for msg in messages]
+        total_tokens = sum(tokens_per_message)
+        if total_tokens <= 0:
+            return False
+        token_budget = self.working_memory.config.token_budget or 0
+        target_tokens = int(token_budget * (self._compact_target_pct / 100.0))
+        prefix_tokens = 0
+        prefix_end = 0
+        min_tail_messages = 4
+        for idx, msg in enumerate(messages):
+            if msg.get("pinned") or msg.get("summary"):
+                break
+            prefix_tokens += tokens_per_message[idx]
+            prefix_end = idx + 1
+            remaining = len(messages) - prefix_end
+            if remaining <= min_tail_messages:
+                continue
+            if total_tokens - prefix_tokens <= target_tokens:
+                break
+        if prefix_end < self._compact_min_prefix:
+            return False
+        prefix = messages[:prefix_end]
+        summary_text = self._summarize_messages(prefix)
+        if not summary_text:
+            return False
+
+        summary_lines = [line.strip() for line in summary_text.splitlines() if line.strip()]
+        if summary_lines:
+            formatted = "Conversation summary (compacted):\n" + "\n".join(
+                f"- {line.lstrip('-• ').strip()}" for line in summary_lines
+            )
+        else:
+            formatted = f"Conversation summary (compacted):\n{summary_text.strip()}"
+        summary_message = {
+            "role": "assistant",
+            "content": formatted.strip(),
+            "pinned": True,
+            "summary": True,
+        }
+        tail = messages[prefix_end:]
+        new_messages = [summary_message] + tail
+        self._rebuild_working_memory(new_messages)
+        self._register_turn_tag("summary")
+        self._emit_event(
+            event_callback,
+            "status",
+            {"message": "Compacted earlier turns into a running summary."},
+        )
+        Telemetry.instance().record_compaction()
+        return True
+
+    def _summarize_messages(self, messages: List[dict[str, Any]]) -> Optional[str]:
+        transcript_lines: List[str] = []
+        for msg in messages:
+            role = msg.get("role")
+            content = str(msg.get("content", "")).strip()
+            if not content:
+                continue
+            if role == "user":
+                speaker = "User"
+            elif role == "assistant":
+                speaker = "Assistant"
+            elif role == "tool":
+                speaker = f"Tool({msg.get('tool_name') or 'tool'})"
+            else:
+                speaker = str(role or "Message").title()
+            transcript_lines.append(f"{speaker}: {content}")
+        if not transcript_lines:
+            return None
+        # Limit prompt size
+        snippet = "\n".join(transcript_lines[-12:])
+        if len(snippet) > 4000:
+            snippet = snippet[-4000:]
+        if not hasattr(self.client, "chat"):
+            return None
+        try:
+            response = self.client.chat(
+                model=self.chat_model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Summarize the earlier conversation segment into 3 concise bullet points capturing "
+                            "objectives, progress, and outstanding follow-ups. Keep it under 70 words."
+                        ),
+                    },
+                    {"role": "user", "content": snippet},
+                ],
+                stream=False,
+                options={"temperature": 0.1, "max_tokens": 200},
+            )
+        except Exception:
+            return None
+        if isinstance(response, dict):
+            message = response.get("message")
+            if isinstance(message, dict):
+                content = message.get("content")
+            else:
+                content = response.get("response")
+        else:
+            content = None
+        if isinstance(content, str):
+            return content.strip()
+        return None
+
+    def _rebuild_working_memory(self, messages: List[dict[str, Any]]) -> None:
+        self.working_memory.clear()
+        for msg in messages:
+            role = msg.get("role", "assistant")
+            content = msg.get("content", "")
+            extras = {k: v for k, v in msg.items() if k not in {"role", "content"}}
+            if role == "user":
+                self.working_memory.add_user(content, **extras)
+            elif role == "assistant":
+                self.working_memory.add_assistant(content, **extras)
+            elif role == "tool":
+                name = msg.get("tool_name") or ""
+                self.working_memory.add_tool(
+                    name,
+                    content,
+                    role="tool",
+                    tool_call_id=msg.get("tool_call_id"),
+                )
+            else:
+                self.working_memory.add(role, content, **extras)
+
+    def _observe_turn_duration(self, start_time: float) -> None:
+        Telemetry.instance().observe_turn(max(0.0, time.time() - start_time))
+
+    @staticmethod
+    def _estimate_message_tokens(message: dict[str, Any]) -> int:
+        content = str(message.get("content", "")).strip()
+        return AtlasAgent._estimate_tokens(content)
+
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        if not text:
+            return 0
+        return max(1, int(len(text) / 4))
+
     def _make_embed_fn(self, model_name: str):
         if not model_name:
             return lambda _text: None
@@ -656,7 +900,6 @@ class AtlasAgent:
             if self.layered_memory and not self.test_mode:  # Skip memory processing in test mode
                 metadata = {
                     "tags": sorted(self._current_turn_tags) if hasattr(self, "_current_turn_tags") else [],
-                    "objective": getattr(self, "_current_objective", None),
                     "tools": sorted(self._current_turn_tools)
                     if hasattr(self, "_current_turn_tools")
                     else [],
@@ -670,6 +913,32 @@ class AtlasAgent:
                 )
         except Exception:
             pass
+
+    def _prepare_tool_output(self, tool_name: str, output: str) -> tuple[str, Optional[str]]:
+        threshold = int(os.getenv("ATLAS_TOOL_OUTPUT_MAX", "1200") or 1200)
+        if threshold <= 0 or len(output) <= threshold:
+            return output.strip(), None
+
+        directory = Path(os.getenv("ATLAS_TOOL_OUTPUT_DIR", "~/.atlas/tool_outputs")).expanduser()
+        saved_path: Optional[str] = None
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            filename = f"{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}-{self._slug_tag(tool_name)}.txt"
+            filepath = directory / filename
+            filepath.write_text(output)
+            saved_path = str(filepath)
+        except Exception:
+            saved_path = None
+
+        lines = [line.strip() for line in output.splitlines() if line.strip()]
+        preview_body = "\n".join(lines[:5]) or output[:400]
+        preview = preview_body[:400]
+        display = preview
+        if saved_path:
+            display = f"(truncated; full output saved to {saved_path})\n{preview}"
+        elif len(output) > len(preview):
+            display = f"{preview}\n(truncated)"
+        return display.strip(), saved_path
 
     def reset(self) -> None:
         self.working_memory.clear()
@@ -760,97 +1029,6 @@ class AtlasAgent:
         slug = self._slug_tag(cleaned)
         self._current_turn_tools.add(slug)
         self._register_turn_tag(f"tool:{slug}")
-
-    def _extract_objective_with_llm(self, user_text: str, current_objective: Optional[str] = None) -> tuple[Optional[str], bool]:
-        """Use the chat model to infer objectives; returns (objective, should_update)."""
-        stripped = (user_text or "").strip()
-        if not stripped or stripped.startswith("/"):
-            return current_objective, False
-
-        prompt = f"""Analyze this user message and determine if there's a clear objective or goal.
-
-Current objective: {current_objective or "None"}
-User message: "{user_text}"
-
-Rules:
-1. Extract a concise objective (5-10 words) if the user is asking for help with a specific task
-2. Return "KEEP" if the message continues the current objective
-3. Return "NONE" if it's just a greeting, acknowledgment, or casual conversation
-4. Only update if there's a genuinely new, different objective
-
-Examples:
-- "Can you help me debug this authentication issue?" → "debug authentication issue"
-- "How do I set up a database connection?" → "set up database connection"
-- "Thanks, that worked!" → "KEEP"
-- "Hi there" → "NONE"
-- "Yes, continue with that approach" → "KEEP"
-
-Respond with just the objective, "KEEP", or "NONE"."""
-
-        try:
-            response = self.client.chat(
-                messages=[{"role": "user", "content": prompt}],
-                model=self.chat_model,
-                stream=False,
-                options={"max_tokens": 50, "temperature": 0.1},
-            )
-
-            content = ""
-            if isinstance(response, dict):
-                message = response.get("message")
-                if isinstance(message, dict):
-                    raw = message.get("content", "")
-                else:
-                    raw = response.get("response", "")
-                if isinstance(raw, str):
-                    content = raw.strip()
-                elif raw:
-                    content = str(raw).strip()
-
-            if not content:
-                fallback = self._extract_objective_fallback(user_text)
-                if fallback:
-                    return fallback, True
-                return current_objective, False
-
-            result = content.lower()
-            if result == "keep":
-                return current_objective, False
-            if result == "none":
-                return None, True
-
-            objective = result.replace('"', "").strip()
-            if objective and objective != current_objective:
-                return objective, True
-            return current_objective, False
-
-        except Exception as exc:
-            self._debug_log(f"LLM objective extraction failed: {exc}")
-            fallback = self._extract_objective_fallback(user_text)
-            if fallback:
-                return fallback, True
-            return current_objective, False
-
-    def _extract_objective_fallback(self, text: str) -> Optional[str]:
-        """Fallback extraction when the LLM path fails."""
-        snippet = (text or "").strip()
-        if not snippet or snippet.startswith("/") or len(snippet.split()) < 3:
-            return None
-
-        lowered = snippet.lower()
-        if any(phrase in lowered for phrase in ["help me", "how do", "can you", "need to", "want to"]):
-            words = snippet.split()[:8]
-            return " ".join(words)
-        return None
-
-    def _extract_objective(self, text: str) -> str:
-        snippet = (text or "").strip()
-        if not snippet:
-            return ""
-        parts = re.split(r"[.!?\n]", snippet, maxsplit=1)
-        objective = parts[0].strip()
-        words = objective.split()
-        return " ".join(words[:12])
 
     def _slug_tag(self, text: str) -> str:
         tokens = re.findall(r"[A-Za-z0-9]+", text.lower())

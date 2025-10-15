@@ -146,6 +146,41 @@ class ConversationShell:
         # Test mode tracking
         self.test_mode = False             # Whether test mode is active
 
+        # Current streaming state for direct terminal output
+        self._current_stream_buffer: List[str] = []
+        self._is_streaming = False
+
+    # ------------------------------------------------------------------
+    # Direct terminal output methods (for hybrid mode)
+    # ------------------------------------------------------------------
+    def print_user_message(self, text: str) -> None:
+        """Print user message directly to terminal (outside Live)."""
+        self.console.print(f"\n[bold green]You[/bold green] › {text}")
+
+    def start_assistant_stream(self) -> None:
+        """Start streaming assistant response."""
+        self._is_streaming = True
+        self._current_stream_buffer = []
+        self.console.print("[bold cyan]Atlas[/bold cyan] › ", end="")
+
+    def stream_assistant_chunk(self, chunk: str) -> None:
+        """Stream a chunk of assistant response."""
+        if self._is_streaming:
+            self._current_stream_buffer.append(chunk)
+            self.console.print(chunk, end="", highlight=False)
+
+    def end_assistant_stream(self) -> None:
+        """End streaming assistant response."""
+        if self._is_streaming:
+            self.console.print("")  # Newline
+            self._is_streaming = False
+
+    def print_tool_use(self, name: str, output: str) -> None:
+        """Print tool usage directly to terminal."""
+        # Truncate long output
+        display_output = output[:200] + "..." if len(output) > 200 else output
+        self.console.print(f"[dim]  [tool:{name}] {display_output}[/dim]")
+
     # ------------------------------------------------------------------
     # State helpers
     # ------------------------------------------------------------------
@@ -277,6 +312,10 @@ class ConversationShell:
         self.status_message = f"Focus mode: {mode}"
         self.refresh()
 
+    def set_session_tags(self, tags: List[str]) -> None:
+        self.tags = tags
+        self.refresh()
+
     def set_objective(self, objective: Optional[str], tags: List[str]) -> None:
         self.objective = objective
         self.tags = tags
@@ -285,7 +324,7 @@ class ConversationShell:
     def set_context_usage(self, usage: Dict[str, Any]) -> None:
         self.context_usage = usage
         self.refresh()
-    
+
     def add_memory_event(self, event_type: str, content: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         """Track memory operations for the UI display."""
         event = {
@@ -357,24 +396,69 @@ class ConversationShell:
     # Rendering helpers
     # ------------------------------------------------------------------
     def render(self) -> RenderableType:
+        """Render only the status bar - conversation is printed directly to terminal."""
         layout = Layout()
-        layout.split_column(
-            Layout(self._render_header(), size=4),
-            Layout(name="main", ratio=1),
-        )
-        layout["main"].split_row(
-            Layout(self._render_chat_with_input(), ratio=3),
-            Layout(self._render_side_panel(), ratio=1),
+        layout.split_row(
+            Layout(self._render_status_bar(), ratio=2),
+            Layout(self._render_compact_stats(), ratio=1),
         )
         return layout
+
+    def _render_status_bar(self) -> RenderableType:
+        """Compact status bar showing current state."""
+        table = Table.grid(expand=True, padding=(0, 1))
+        table.add_column(justify="left", ratio=1)
+        table.add_column(justify="right")
+
+        # # Current objective or status
+        # if self.objective:
+        #     left = Text(f"Objective: {self.objective}", style="bold cyan")
+        # else:
+        left = Text(self.status_message, style="white")
+
+        # Context usage
+        right_parts = []
+        if self._active_tool_chip:
+            right_parts.append(Text(self._active_tool_chip, style="yellow"))
+
+        turns = self.context_usage.get("turns", 0)
+        capacity = max(1, self.context_usage.get("capacity", 1))
+        ratio = min(1.0, turns / capacity)
+        filled = int(ratio * 10)
+        bar = "█" * filled + "░" * (10 - filled)
+        context_style = "red" if ratio > 0.85 else "yellow" if ratio > 0.6 else "green"
+        right_parts.append(Text(f" Context: [{bar}] {turns}/{capacity}", style=context_style))
+
+        right = Text.assemble(*right_parts)
+        table.add_row(left, right)
+
+        return Panel(table, border_style="cyan", box=box.ROUNDED, height=3)
+
+    def _render_compact_stats(self) -> RenderableType:
+        """Compact stats showing memory and focus mode."""
+        table = Table.grid(padding=(0, 1))
+
+        # Test mode warning
+        if self.test_mode:
+            table.add_row(Text("⚠️  TEST MODE", style="bold yellow"))
+
+        # Memory counts
+        stats = self.memory_stats
+        episodic = stats.get('episodic_count', 0)
+        semantic = stats.get('semantic_count', 0)
+        reflections = stats.get('reflections_count', 0)
+
+        table.add_row(Text(f"Memory: E:{episodic} S:{semantic} R:{reflections}", style="dim"))
+        table.add_row(Text(f"Focus: {self.focus_mode}", style="dim"))
+
+        return Panel(table, title="Stats", border_style="magenta", box=box.ROUNDED, height=3)
 
     def _render_header(self) -> RenderableType:
         table = Table.grid(expand=True)
         table.add_column(justify="left")
         table.add_column(justify="right")
-        objective = self.objective or "No active objective"
         tags = ", ".join(self.tags) if self.tags else "no tags"
-        left = Text(f"Objective: {objective}\nTags: {tags}", style="bold white")
+        left = Text(f"Tags: {tags}", style="bold white")
         chips = Text(f"Focus: {self.focus_mode}", style="cyan")
         if self.pinned_turns:
             chip_text = ", ".join(f"#{tid}" for tid in self.pinned_turns)
@@ -405,15 +489,46 @@ class ConversationShell:
                 border_style="blue",
                 box=box.ROUNDED
             )
-        
+
+        # Calculate which turns to show based on scroll position
+        total_turns = len(self.turns)
+
+        # Determine the slice of turns to display
+        if total_turns <= self.max_visible_turns:
+            # Show all turns if we have fewer than max
+            visible_turns = self.turns
+            show_scroll_up = False
+            show_scroll_down = False
+            hidden_above = 0
+            hidden_below = 0
+        else:
+            # Calculate the window of visible turns
+            # scroll_offset of 0 means show the most recent messages
+            # scroll_offset > 0 means we've scrolled up to see older messages
+            end_idx = total_turns - self.scroll_offset
+            start_idx = max(0, end_idx - self.max_visible_turns)
+
+            visible_turns = self.turns[start_idx:end_idx]
+            hidden_above = start_idx
+            hidden_below = self.scroll_offset
+            show_scroll_up = hidden_above > 0
+            show_scroll_down = hidden_below > 0
+
         # Create flowing chat messages
         chat_messages = []
-        
-        for turn in self.turns:
+
+        # Add scroll up indicator if needed
+        if show_scroll_up:
+            scroll_up = Text(f"↑ {hidden_above} earlier messages (use /up to scroll)", style="dim", justify="center")
+            chat_messages.append(scroll_up)
+            chat_messages.append(Text(""))
+
+        # Render visible turns
+        for turn in visible_turns:
             # User message
             user_text = Text(f"You: {turn.user_text.strip()}", style="bold green")
             chat_messages.append(user_text)
-            
+
             # Assistant response
             if turn.assistant_text.strip():
                 if turn.status == "streaming":
@@ -434,27 +549,16 @@ class ConversationShell:
                 pending_text = Text("Atlas: ", style="cyan")
                 pending_text.append("▊", style="cyan")
                 chat_messages.append(pending_text)
-            
+
             # Add spacing between conversations
             chat_messages.append(Text(""))
-        
-        # Create scrollable view
-        total_turns = len(self.turns)
-        if total_turns > self.max_visible_turns:
-            # Show scroll indicators
-            start_idx = max(0, total_turns - self.max_visible_turns - self.scroll_offset)
-            end_idx = total_turns - self.scroll_offset
-            
-            if start_idx > 0:
-                scroll_up = Text(f"↑ {start_idx} earlier messages", style="dim", justify="center")
-                chat_messages.insert(0, scroll_up)
-                chat_messages.insert(1, Text(""))
-            
-            if self.scroll_offset > 0:
-                scroll_down = Text(f"↓ {self.scroll_offset} newer messages", style="dim", justify="center") 
-                chat_messages.append(Text(""))
-                chat_messages.append(scroll_down)
-        
+
+        # Add scroll down indicator if needed
+        if show_scroll_down:
+            scroll_down = Text(f"↓ {hidden_below} newer messages (use /down to scroll)", style="dim", justify="center")
+            chat_messages.append(Text(""))
+            chat_messages.append(scroll_down)
+
         return Panel(
             Group(*chat_messages),
             title="Chat",
@@ -611,7 +715,16 @@ class ConversationShell:
     def _render_tool_drawer(self) -> RenderableType:
         if not self.tool_drawer:
             return Text("No tool runs yet.", style="dim")
-        return Group(*[card.render() for card in self.tool_drawer])
+        # Render tool cards in a compact format (not nested panels)
+        cards = []
+        for card in list(self.tool_drawer)[:3]:  # Show only last 3 tools
+            table = Table.grid(padding=0)
+            table.add_row(Text(f"• {card.name}", style="bold cyan"))
+            if card.summary:
+                summary_text = card.summary[:50] + "..." if len(card.summary) > 50 else card.summary
+                table.add_row(Text(f"  {summary_text}", style="dim"))
+            cards.append(table)
+        return Group(*cards)
 
     def _render_timeline(self) -> RenderableType:
         if not self.timeline_snapshots:
@@ -641,4 +754,3 @@ class ConversationShell:
             return
         summary = (turn.user_text.strip().splitlines()[0])[:80]
         self.timeline_snapshots.append({"turn_id": turn.turn_id, "summary": summary})
-

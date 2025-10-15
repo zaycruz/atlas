@@ -5,6 +5,7 @@ from typing import List
 
 import pytest
 
+from atlas_main.agent import AtlasAgent
 from atlas_main.tools import (
     ToolError,
     WebSearchTool,
@@ -110,6 +111,7 @@ def test_tool_registry_emits_function_specs() -> None:
 
     assert any(item.get("function", {}).get("name") == "read_file" for item in specs)
     assert all(item.get("type") == "function" for item in specs)
+    assert any("capabilities" in item.get("function", {}) for item in specs)
 
 
 def test_parse_markdown_results_skips_media_blocks() -> None:
@@ -265,3 +267,63 @@ def test_shell_command_tool_retries(tmp_path) -> None:
 
     assert "attempts: 3" in result
     assert "exit_code: 1" in result
+
+
+def test_tool_policy_deny(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("ATLAS_TOOL_POLICY", "deny")
+    registry = ToolRegistry()
+    registry.register(ListDirectoryTool())
+    with pytest.raises(ToolError):
+        registry.run("list_dir", arguments={"path": str(tmp_path)})
+    monkeypatch.delenv("ATLAS_TOOL_POLICY", raising=False)
+
+
+def test_tool_policy_allow_noninteractive(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("ATLAS_TOOL_POLICY", "ask")
+    monkeypatch.setenv("ATLAS_TOOL_POLICY_NONINTERACTIVE", "allow")
+    registry = ToolRegistry()
+    registry.register(ListDirectoryTool())
+    # Should not prompt in tests; defaults to allow
+    output = registry.run("list_dir", arguments={"path": str(tmp_path)})
+    assert "Directory" in output
+    monkeypatch.delenv("ATLAS_TOOL_POLICY", raising=False)
+    monkeypatch.delenv("ATLAS_TOOL_POLICY_NONINTERACTIVE", raising=False)
+
+
+class _StubClient:
+    def chat(self, **_):
+        return {"message": {"content": "ok"}}
+
+    def chat_stream(self, **_):
+        return iter([
+            {"content": "done", "tool_calls": []}
+        ])
+
+    def embed(self, model, text):
+        # simple deterministic vector based on hash
+        return [float(len(text) % 7), 0.0, 1.0]
+
+    def close(self):
+        pass
+
+
+def test_memory_tools_return_relevant_results(tmp_path, monkeypatch):
+    monkeypatch.setenv("ATLAS_MEMORY_DIR", str(tmp_path / "memory"))
+    agent = AtlasAgent(_StubClient())
+    try:
+        lm = agent.layered_memory
+        lm.episodic.log("tailscale question", "tailscale answer", metadata={"tags": ["tailscale"]})
+        fact = lm.semantic.add_fact("Tailscale is a mesh VPN service", tags=["tailscale"])
+        other = lm.semantic.add_fact("WireGuard forms encrypted tunnels", tags=["vpn"])
+        if fact and other:
+            lm.semantic.graph.rebuild([fact, other])
+        output_ep = agent.tools.run("memory.search_episodes", agent=agent, arguments={"query": "tailscale", "limit": 3})
+        assert "tailscale" in output_ep.lower()
+        output_fact = agent.tools.run("memory.search_facts", agent=agent, arguments={"query": "tailscale", "limit": 3})
+        assert "mesh vpn" in output_fact.lower()
+        if fact and other:
+            output_graph = agent.tools.run("memory.explore_graph", agent=agent, arguments={"ids": [fact["id"]]})
+            assert fact["id"][:8] in output_graph
+    finally:
+        agent.close()
+    monkeypatch.delenv("ATLAS_MEMORY_DIR", raising=False)

@@ -5,13 +5,14 @@ Supports:
  - switching/listing models
  - toggling thinking visibility
  - adjusting log level
- - managing objectives, memory, and tools
+ - managing memory and tools
 """
 from __future__ import annotations
 import json
 import textwrap
 import time
 import logging
+from pathlib import Path
 import threading
 import os
 
@@ -19,11 +20,13 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.live import Live
+from rich import box
 from typing import Any, Dict, Optional, List, Set
 
 from .agent import AtlasAgent
 from .ollama import OllamaClient
 from .stt import Microphone, VadSegmenter, WhisperTranscriber
+from .watchers import ClipboardWatcher, FileWatcher
 from .ui import ConversationShell
 
 ASCII_ATLAS = r"""
@@ -42,16 +45,29 @@ def main() -> None:
     # Set up logging
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-    console.print(Panel.fit(ASCII_ATLAS, style="cyan"))
-    console.print("[bold cyan]Make of this what you will.[/bold cyan]")
-    console.print(textwrap.fill("Atlas ready. Type your prompt and press Enter. Use Ctrl+D or /quit to exit.", width=72))
-    console.print(textwrap.fill("use /model <model> to switch the active model.", width=72))
-    console.print(textwrap.fill("use /model list to view available models.", width=72))
-    console.print(textwrap.fill("Atlas may call tools automatically (e.g. web_search) when extra information is needed.", width=72))
+    console.print(Panel.fit(ASCII_ATLAS, style="cyan", border_style="bright_cyan"))
+    console.print("[bold cyan]Make of this what you will.[/bold cyan]\n")
+
+    # Quick start info
+    info_table = Table.grid(padding=(0, 2))
+    info_table.add_column(style="dim")
+    info_table.add_column(style="white")
+
+    info_table.add_row("📝", "Type your message and press Enter to chat")
+    info_table.add_row("🔧", "Atlas can automatically use tools like web search")
+    info_table.add_row("⚙️", "Type [cyan]/help[/cyan] to see all available commands")
+    info_table.add_row("🚪", "Press [cyan]Ctrl+D[/cyan] or type [cyan]/quit[/cyan] to exit")
+
+    console.print(Panel(info_table, title="Quick Start", border_style="green", box=box.ROUNDED))
+    console.print("")
 
     client = OllamaClient()
     agent = AtlasAgent(client)
     ui = ConversationShell(console)
+
+    # Show initial context info
+    console.print(f"[dim]Token capacity: {agent.working_memory.config.token_budget} tokens | "
+                  f"Model: {agent.chat_model} | Focus: {agent.focus_mode}[/dim]\n")
     runtime: Dict[str, Any] = {
         "voice_mode": "off",
         "voice_thread": None,
@@ -63,48 +79,85 @@ def main() -> None:
         "favorites": set(),
         "ui": ui,
         "active_turn": None,
+        "watchers": [],
     }
+    runtime["watchers"] = _start_watchers(agent)
 
     try:
-        with Live(ui.render(), refresh_per_second=2, console=console) as live:
-            ui.register_live(live)
-            runtime["live"] = live
-            while True:
-                try:
-                    # Pause live updates during input to improve visibility
-                    live.stop()
-                    user_text = console.input("[dim]> [/dim]")
-                    live.start()
-                except EOFError:
-                    live.start()  # Ensure live is restarted
-                    live.console.print("\n[bold yellow]Goodbye.[/bold yellow]")
-                    break
-                except KeyboardInterrupt:
-                    live.start()  # Ensure live is restarted
-                    live.console.print("\n[bold yellow](Interrupted. Type /quit to exit.)[/bold yellow]")
+        # No Live during normal operation - use it only during agent processing
+        runtime["live"] = None
+        ui.register_live(None)
+
+        while True:
+            try:
+                # Show a clear, unobstructed input prompt
+                user_text = console.input("\n[bold cyan]You[/bold cyan] [dim]›[/dim] ")
+            except EOFError:
+                console.print("\n[bold yellow]Goodbye.[/bold yellow]")
+                break
+            except KeyboardInterrupt:
+                console.print("\n[bold yellow](Interrupted. Type /quit to exit.)[/bold yellow]")
+                continue
+
+            stripped = user_text.strip()
+            if not stripped:
+                continue
+
+            lowered = stripped.lower()
+            if lowered in {"/quit", "/exit"}:
+                console.print("[bold yellow]Exiting.[/bold yellow]")
+                break
+
+            if stripped.startswith("/"):
+                handled = _handle_command(agent, stripped, runtime)
+                if handled:
                     continue
+                # If command wasn't handled, show error message
+                # (already printed by _handle_command)
+                continue
 
-                stripped = user_text.strip()
-                if not stripped:
-                    continue
-
-                lowered = stripped.lower()
-                if lowered in {"/quit", "/exit"}:
-                    live.console.print("[bold yellow]Exiting.[/bold yellow]")
-                    break
-
-                if stripped.startswith("/"):
-                    if _handle_command(agent, stripped, runtime):
-                        continue
-
-                _run_agent_turn(agent, runtime, user_text)
+            # Run normal agent turn for non-command input
+            _run_agent_turn(agent, runtime, user_text)
     finally:
+        for watcher in runtime.get("watchers", []):
+            try:
+                watcher.stop()
+            except Exception:
+                pass
+            try:
+                watcher.join(timeout=1.0)
+            except Exception:
+                pass
         try:
             agent.close()
         except Exception:
             pass
         client.close()
 
+
+def _start_watchers(agent: AtlasAgent) -> List[threading.Thread]:
+    watchers: List[threading.Thread] = []
+    if getattr(agent, "layered_memory", None) is None:
+        return watchers
+    dirs_env = os.getenv("ATLAS_WATCH_DIRS", "")
+    directories = [Path(part.strip()).expanduser() for part in dirs_env.split(",") if part.strip()]
+    if directories:
+        ext_env = os.getenv("ATLAS_WATCH_EXT", "txt,md,py")
+        extensions = [segment.strip() for segment in ext_env.split(",") if segment.strip()]
+        interval = float(os.getenv("ATLAS_WATCH_INTERVAL", "5"))
+        watcher = FileWatcher(agent, directories, interval=interval, extensions=extensions)
+        watcher.start()
+        watchers.append(watcher)
+    if os.getenv("ATLAS_CLIPBOARD", "0").strip().lower() in {"1", "true", "on"}:
+        interval = float(os.getenv("ATLAS_CLIPBOARD_INTERVAL", "4"))
+        minimum = int(os.getenv("ATLAS_CLIPBOARD_MIN", "64"))
+        watcher = ClipboardWatcher(agent, interval=interval, minimum_length=minimum)
+        if getattr(watcher, "available", False):
+            watcher.start()
+            watchers.append(watcher)
+        else:
+            logging.getLogger(__name__).info("Clipboard watcher requested but dependency not available.")
+    return watchers
 
 def _handle_command(agent: AtlasAgent, command_line: str, runtime: Dict[str, Any]) -> bool:
     parts = command_line[1:].strip().split()
@@ -195,32 +248,163 @@ def _handle_command(agent: AtlasAgent, command_line: str, runtime: Dict[str, Any
     if cmd == "adjust":
         _handle_adjust(agent, ui, rest)
         return True
+    if cmd == "status":
+        _handle_status(agent, ui)
+        return True
+    if cmd == "stats":
+        _handle_stats(agent)
+        return True
     console.print(f"Unknown command: {cmd}. Type /help for options.", style="yellow")
     return True
 
 
+def _handle_status(agent: AtlasAgent, ui: Optional[ConversationShell]) -> None:
+    """Show current agent status and context usage."""
+    table = Table(show_header=False, box=box.ROUNDED, border_style="cyan")
+    table.add_column("Property", style="bold")
+    table.add_column("Value")
+
+    # Model info
+    table.add_row("Model", agent.chat_model)
+    table.add_row("Focus Mode", agent.focus_mode)
+
+    # Memory info
+    wm_stats = agent.working_memory.get_stats()
+    turns = wm_stats.get("turns", 0)
+    capacity = agent.working_memory.config.max_turns
+    tokens = wm_stats.get("tokens", 0)
+    token_budget = agent.working_memory.config.token_budget
+
+    table.add_row("Token Usage", f"{tokens}/{token_budget} tokens ({wm_stats.get('token_pct', 0):.0f}%)")
+    table.add_row("Messages Stored", str(turns))
+
+    # Objective
+    if ui and ui.objective:
+        table.add_row("Objective", ui.objective)
+
+    # Memory stats
+    if ui:
+        stats = ui.memory_stats
+        table.add_row("Episodic Memory", str(stats.get("episodic_count", 0)))
+        table.add_row("Semantic Facts", str(stats.get("semantic_count", 0)))
+        table.add_row("Reflections", str(stats.get("reflections_count", 0)))
+        if ui.test_mode:
+            table.add_row("Test Mode", "[yellow]ACTIVE (no memory logging)[/yellow]")
+
+    console.print(Panel(table, title="Atlas Status", border_style="cyan"))
+
+
+def _handle_stats(agent: AtlasAgent) -> None:
+    telemetry = Telemetry.instance().stats()
+    usage = agent._context_usage_snapshot()
+
+    console.print("[bold cyan]Atlas Metrics[/bold cyan]")
+    turn_stats = telemetry["turns"]
+    console.print(
+        f"Turn latency — count: {turn_stats['count']}  avg: {turn_stats['avg']:.2f}s  "
+        f"p50: {turn_stats['p50']:.2f}s  p95: {turn_stats['p95']:.2f}s",
+        style="dim",
+    )
+    console.print(
+        f"Compactions: {telemetry['compactions']['count']}  "
+        f"Snapshot avg saved tokens: {telemetry['snapshots']['avg_saved']:.1f}",
+        style="dim",
+    )
+
+    if telemetry["tools"]:
+        table = Table(box=box.ROUNDED, show_header=True, border_style="green")
+        table.add_column("Tool", style="bold")
+        table.add_column("Runs", justify="right")
+        table.add_column("Errors", justify="right")
+        table.add_column("p50 (s)", justify="right")
+        table.add_column("p95 (s)", justify="right")
+        for name, data in sorted(telemetry["tools"].items()):
+            table.add_row(
+                name,
+                str(data["runs"]),
+                str(data["errors"]),
+                f"{data['p50']:.2f}",
+                f"{data['p95']:.2f}",
+            )
+        console.print(table)
+
+    console.print(
+        f"Working memory tokens: {usage.get('tokens', 0)} / {usage.get('token_budget', 0)} "
+        f"({usage.get('token_pct', 0):.1f}% of budget)",
+        style="dim",
+    )
+
+
 def _print_help() -> None:
-    table = Table(show_header=False, box=None)
-    table.add_row("[bold]Commands:[/bold]")
-    table.add_row("  /model <name>", "switch the active Ollama model")
-    table.add_row("  /model list", "list available models")
-    table.add_row("  /thinking <on|off>", "show or hide model thinking content")
-    table.add_row("  /log <off|error|warn|info|debug>", "adjust logging level")
-    table.add_row("  /voice <on|off|ptt>", "control voice input (always-on or push-to-talk)")
-    table.add_row("  /memory ...", "inspect episodic, semantic, or reflection memory")
-    table.add_row("  /test <on|off>", "toggle test mode (disables memory logging)")
-    table.add_row("  /scroll <up|down|top|bottom|#>", "navigate conversation history")
-    table.add_row("  /up / /down / /top / /bottom", "scroll conversation shortcuts")
-    table.add_row("  /expand <id> / /collapse <id>", "toggle detail trays for a turn")
-    table.add_row("  /pin <id> / /unpin <id>", "manage pinned turns")
-    table.add_row("  /focus <mode>", "switch between focus and autopilot tool usage")
-    table.add_row("  /tool ...", "sandbox, run, or favorite tools")
-    table.add_row("  /rerun <id>", "replay a previous prompt")
-    table.add_row("  /memory_demo", "add demo memory events (testing)")
-    table.add_row("  /feedback <works|issue>", "quick thumbs-up/down feedback")
-    table.add_row("  /adjust <style>", "request quick tweak of the next reply tone")
-    table.add_row("  /quit", "exit the chat")
-    console.print(table)
+    console.print("\n[bold cyan]Atlas CLI Commands[/bold cyan]\n")
+
+    # Core Commands
+    table1 = Table(show_header=True, box=box.ROUNDED, border_style="cyan")
+    table1.add_column("Command", style="bold yellow")
+    table1.add_column("Description", style="white")
+
+    table1.add_row("/status", "Show current agent status and context")
+    table1.add_row("/model <name>", "Switch the active Ollama model")
+    table1.add_row("/model list", "List all available models")
+    table1.add_row("/thinking <on|off>", "Toggle model thinking visibility")
+    table1.add_row("/test <on|off>", "Toggle test mode (disables memory)")
+    table1.add_row("/quit or Ctrl+D", "Exit Atlas")
+
+    console.print(Panel(table1, title="Core Commands", border_style="cyan"))
+
+    # Navigation Commands
+    table2 = Table(show_header=True, box=box.ROUNDED, border_style="blue")
+    table2.add_column("Command", style="bold yellow")
+    table2.add_column("Description", style="white")
+
+    table2.add_row("/scroll <up|down|top|bottom|#>", "Navigate conversation history")
+    table2.add_row("/up / /down", "Quick scroll shortcuts")
+    table2.add_row("/expand <id>", "Show detailed info for a turn")
+    table2.add_row("/collapse <id>", "Hide detailed info for a turn")
+    table2.add_row("/pin <id> / /unpin <id>", "Pin/unpin important turns")
+    table2.add_row("/rerun <id>", "Re-execute a previous prompt")
+
+    console.print(Panel(table2, title="Navigation", border_style="blue"))
+
+    # Memory Commands
+    table3 = Table(show_header=True, box=box.ROUNDED, border_style="magenta")
+    table3.add_column("Command", style="bold yellow")
+    table3.add_column("Description", style="white")
+
+    table3.add_row("/memory episodic [limit]", "Show episodic memories")
+    table3.add_row("/memory semantic [limit]", "Show semantic facts")
+    table3.add_row("/memory reflections [limit]", "Show reflections")
+    table3.add_row("/memory snapshot <query>", "Get memory snapshot for query")
+    table3.add_row("/memory stats", "Show memory statistics")
+    table3.add_row("/memory path", "Show memory storage paths")
+
+    console.print(Panel(table3, title="Memory Management", border_style="magenta"))
+
+    # Tool Commands
+    table4 = Table(show_header=True, box=box.ROUNDED, border_style="green")
+    table4.add_column("Command", style="bold yellow")
+    table4.add_column("Description", style="white")
+
+    table4.add_row("/tool list", "List all available tools")
+    table4.add_row("/tool run <name> [args]", "Execute a tool manually")
+    table4.add_row("/tool sandbox", "Interactive tool testing")
+    table4.add_row("/focus <autopilot|focus>", "Change tool execution mode")
+
+    console.print(Panel(table4, title="Tool Management", border_style="green"))
+
+    # Advanced Commands
+    table5 = Table(show_header=True, box=box.ROUNDED, border_style="yellow")
+    table5.add_column("Command", style="bold yellow")
+    table5.add_column("Description", style="white")
+
+    table5.add_row("/voice <on|off|ptt>", "Voice input control")
+    table5.add_row("/log <level>", "Set logging level (off/error/warn/info/debug)")
+    table5.add_row("/feedback <works|issue>", "Provide feedback on responses")
+    table5.add_row("/adjust <style>", "Adjust response style (shorter/longer/formal/casual)")
+
+    console.print(Panel(table5, title="Advanced", border_style="yellow"))
+
+    console.print("\n[dim]Tip: Use Ctrl+C to cancel the current response[/dim]\n")
 
 
 def _handle_log(args: list[str]) -> None:
@@ -293,17 +477,25 @@ def _handle_scroll(ui: Optional[ConversationShell], args: list[str]) -> None:
     
     if action == "up":
         # Scroll up (show older messages)
-        max_offset = total_turns - ui.max_visible_turns
-        ui.scroll_offset = min(ui.scroll_offset + 3, max_offset)
-        ui.auto_scroll = False
-        console.print(f"Scrolled up (offset: {ui.scroll_offset})", style="cyan")
-        
+        max_offset = max(0, total_turns - ui.max_visible_turns)
+        new_offset = min(ui.scroll_offset + 3, max_offset)
+        if new_offset == ui.scroll_offset:
+            console.print("Already at oldest messages", style="dim")
+        else:
+            ui.scroll_offset = new_offset
+            ui.auto_scroll = False
+            console.print(f"Scrolled up (offset: {ui.scroll_offset}/{max_offset})", style="cyan")
+
     elif action == "down":
         # Scroll down (show newer messages)
-        ui.scroll_offset = max(ui.scroll_offset - 3, 0)
-        if ui.scroll_offset == 0:
-            ui.auto_scroll = True
-        console.print(f"Scrolled down (offset: {ui.scroll_offset})", style="cyan")
+        new_offset = max(ui.scroll_offset - 3, 0)
+        if new_offset == ui.scroll_offset and ui.scroll_offset == 0:
+            console.print("Already at latest messages", style="dim")
+        else:
+            ui.scroll_offset = new_offset
+            if ui.scroll_offset == 0:
+                ui.auto_scroll = True
+            console.print(f"Scrolled down (offset: {ui.scroll_offset})", style="cyan")
         
     elif action == "top":
         # Jump to oldest messages
@@ -646,6 +838,12 @@ def _push_to_talk(agent: AtlasAgent, runtime: Dict[str, Any]) -> None:
 def _process_voice_segment(agent: AtlasAgent, runtime: Dict[str, Any], segment: bytes) -> None:
     if not segment:
         return
+
+    # Don't process voice input while another turn is active
+    if not runtime["agent_lock"].acquire(blocking=False):
+        console.print("(voice input ignored - agent is busy)", style="yellow")
+        return
+
     try:
         transcriber = _ensure_transcriber(runtime)
         result = transcriber.transcribe(segment)
@@ -653,6 +851,12 @@ def _process_voice_segment(agent: AtlasAgent, runtime: Dict[str, Any], segment: 
         console.print(f"(voice error: {exc})", style="red")
         _stop_voice_listener(runtime)
         return
+    except Exception as exc:
+        console.print(f"(unexpected voice error: {exc})", style="red")
+        return
+    finally:
+        runtime["agent_lock"].release()
+
     text = (result.get("text") or "").strip()
     if not text:
         return
@@ -660,81 +864,101 @@ def _process_voice_segment(agent: AtlasAgent, runtime: Dict[str, Any], segment: 
     _run_agent_turn(agent, runtime, text)
 def _run_agent_turn(agent: AtlasAgent, runtime: Dict[str, Any], prompt: str) -> None:
     ui: Optional[ConversationShell] = runtime.get("ui")
-    if not ui:
-        console.print("[bold cyan]atlas:[/bold cyan]")
-        buffer: List[str] = []
 
-        def stream_chunk(chunk: str) -> None:
-            buffer.append(chunk)
-            console.print(chunk, end="", highlight=False, soft_wrap=True)
-
-        with runtime["agent_lock"]:
-            final_text = agent.respond(prompt, stream_callback=stream_chunk)
-        console.print("")
-        return
-
-    turn = ui.add_turn(prompt)
-    ui.start_thinking()
+    # Track turn history
+    turn = ui.add_turn(prompt) if ui else None
     runtime["active_turn"] = turn
     cancelled = False
 
+    # Show objective if one exists
+    if ui and ui.objective:
+        console.print(f"[dim]Objective: {ui.objective}[/dim]")
+
+    # Start streaming directly to terminal
+    console.print("[bold cyan]Atlas[/bold cyan] › ", end="", highlight=False)
+
     def stream_chunk(chunk: str) -> None:
-        ui.append_stream(turn, chunk)
+        # Stream directly to terminal
+        console.print(chunk, end="", highlight=False)
+        # Also update turn for history
+        if turn:
+            turn.assistant_text += chunk
+            turn.raw_stream += chunk
 
     def handle_event(event: str, payload: Dict[str, Any]) -> None:
         nonlocal cancelled
+
         if event == "turn_start":
-            ui.set_objective(payload.get("objective"), payload.get("tags", []))
-            ui.set_context_usage(payload.get("context_usage", {}))
-            ui.set_turn_tags(turn, payload.get("tags", []))
-            # Update memory stats if available
-            memory_stats = payload.get("memory_stats")
-            if memory_stats:
-                ui.update_memory_stats(memory_stats)
+            # Update objective and context silently (for history)
+            if ui:
+                ui.set_objective(payload.get("objective"), payload.get("tags", []))
+                ui.set_context_usage(payload.get("context_usage", {}))
+                if turn:
+                    ui.set_turn_tags(turn, payload.get("tags", []))
+                memory_stats = payload.get("memory_stats")
+                if memory_stats:
+                    ui.update_memory_stats(memory_stats)
+
         elif event == "status":
-            message = payload.get("message") or "Processing..."
-            ui.set_status(message)
-        elif event == "stream":
-            tool_calls = [name for name in payload.get("tool_calls") or [] if name]
-            if tool_calls:
-                ui.set_tool_chip("Awaiting tool: " + ", ".join(tool_calls))
+            # Print status updates inline (Claude Code style)
+            message = payload.get("message")
+            if message:
+                console.print(f"\n[dim cyan]{message}[/dim cyan]")
+
         elif event == "tool_start":
+            # Print tool invocation inline
             names = [tool.get("name") for tool in payload.get("tools", []) if tool.get("name")]
             if names:
-                ui.set_tool_chip("Running tool: " + ", ".join(names))
+                console.print(f"\n[dim]→ Using tool: {', '.join(names)}[/dim]")
+
         elif event == "tool_result":
-            ui.add_tool_detail(
-                turn,
-                name=payload.get("name", "tool"),
-                arguments=payload.get("arguments", {}),
-                output=payload.get("output", ""),
-                call_id=payload.get("call_id"),
-                source=payload.get("source"),
-            )
-            call_id = payload.get("call_id")
-            if call_id:
-                ui.add_cached_ids(turn, [str(call_id)])
-            ui.set_tool_chip(None)
-        elif event == "tool_deferred":
-            tools = payload.get("tools", [])
-            if tools:
-                ui.set_status("Focus mode deferred: " + ", ".join(tools))
+            # Print tool result inline
+            name = payload.get("name", "tool")
+            output = payload.get("output", "")
+            # Truncate long output
+            display_output = output[:150] + "..." if len(output) > 150 else output
+            console.print(f"[dim]  {name}: {display_output}[/dim]")
+            # Store in turn for history
+            if ui and turn:
+                ui.add_tool_detail(
+                    turn,
+                    name=name,
+                    arguments=payload.get("arguments", {}),
+                    output=output,
+                    call_id=payload.get("call_id"),
+                    source=payload.get("source"),
+                )
+
+        elif event == "tool_loop_progress":
+            # Show progress when agent is iterating through tool calls
+            iteration = payload.get("iteration", 0)
+            tool_calls = payload.get("tool_calls_so_far", 0)
+            max_allowed = payload.get("max_allowed", 0)
+            console.print(f"[dim cyan]  ⟳ Iteration {iteration} ({tool_calls}/{max_allowed} tools used)[/dim cyan]")
+
+        elif event == "tool_loop_detected":
+            # Infinite loop detected - same tool called repeatedly
+            failures = payload.get("consecutive_failures", 0)
+            console.print(f"\n[yellow]⚠ Infinite loop detected: same tool called {failures} times. Stopping.[/yellow]")
+
         elif event == "tool_limit":
             attempted = payload.get("attempted", 0)
             max_calls = payload.get("max")
-            ui.set_status(f"Tool limit reached ({attempted}/{max_calls}).")
+            console.print(f"\n[yellow]Tool limit reached ({attempted}/{max_calls})[/yellow]")
+
         elif event == "turn_complete":
-            ui.set_objective(payload.get("objective"), payload.get("tags", []))
-            ui.set_context_usage(payload.get("context_usage", {}))
-            ui.set_turn_tags(turn, payload.get("tags", []))
-            # Update memory stats if available
-            memory_stats = payload.get("memory_stats")
-            if memory_stats:
-                ui.update_memory_stats(memory_stats)
-            ui.set_tool_chip(None)
+            # Update metadata silently
+            if ui:
+                ui.set_objective(payload.get("objective"), payload.get("tags", []))
+                ui.set_context_usage(payload.get("context_usage", {}))
+                if turn:
+                    ui.set_turn_tags(turn, payload.get("tags", []))
+                memory_stats = payload.get("memory_stats")
+                if memory_stats:
+                    ui.update_memory_stats(memory_stats)
+
         elif event == "cancelled":
             cancelled = True
-            ui.set_status(payload.get("message", "Turn cancelled."))
 
     final_text = ""
     try:
@@ -747,52 +971,60 @@ def _run_agent_turn(agent: AtlasAgent, runtime: Dict[str, Any], prompt: str) -> 
     except KeyboardInterrupt:
         agent.cancel_current()
         cancelled = True
+        console.print("\n[yellow](Cancelled)[/yellow]")
     except Exception as exc:
-        console.print(f"Error during turn: {exc}", style="red")
-        ui.set_status(f"Error: {exc}")
+        console.print(f"\n[red]Error: {exc}[/red]")
         cancelled = True
     finally:
         runtime["active_turn"] = None
+        console.print("")  # Newline after response
 
-    if final_text and not turn.assistant_text.strip():
-        ui.append_stream(turn, final_text)
-
-    ui.mark_turn_complete(turn, cancelled=cancelled)
+    # Update turn history
+    if ui and turn:
+        if final_text and not turn.assistant_text.strip():
+            turn.assistant_text = final_text
+            turn.raw_stream = final_text
+        ui.mark_turn_complete(turn, cancelled=cancelled)
     
     # Update memory stats after turn completion
     try:
         memory_stats = {}
-        
+
         # Working memory stats (hybrid)
         if hasattr(agent, 'working_memory') and agent.working_memory:
             wm_stats = agent.working_memory.get_stats()
             memory_stats["working_memory"] = wm_stats
-        
-        # Layered memory stats
+
+        # Layered memory stats - use public API instead of private attributes
         if hasattr(agent, 'layered_memory') and agent.layered_memory:
-            stats = agent.layered_memory.get_statistics()
+            stats = agent.layered_memory.get_stats()
+
+            # Use get_stats() which should provide counts
             memory_stats.update({
-                "episodic_count": len(agent.layered_memory.episodic._records) if hasattr(agent.layered_memory.episodic, '_records') else 0,
-                "semantic_count": len(agent.layered_memory.semantic._facts) if hasattr(agent.layered_memory.semantic, '_facts') else 0,
-                "reflections_count": len(agent.layered_memory.reflections._items) if hasattr(agent.layered_memory.reflections, '_items') else 0,
+                "episodic_count": stats.get("episodic_count", 0),
+                "semantic_count": stats.get("semantic_count", 0),
+                "reflections_count": stats.get("reflections_count", 0),
             })
-            
+
             # Quality gate statistics
             harvest_stats = stats.get("harvest", {})
-            memory_stats["quality_gates"] = {
-                "facts_accepted": harvest_stats.get("accepted_facts", 0),
-                "reflections_accepted": harvest_stats.get("accepted_reflections", 0),
-            }
-            
+            if harvest_stats:
+                memory_stats["quality_gates"] = {
+                    "facts_accepted": harvest_stats.get("accepted_facts", 0),
+                    "reflections_accepted": harvest_stats.get("accepted_reflections", 0),
+                }
+
             # Add memory event if this was a harvest turn (every few turns)
             if harvest_stats.get("attempts", 0) > 0:
                 ui.add_memory_event("harvest", f"Processed turn {turn.turn_id}", harvest_stats)
-        
+
         # Update UI with all memory stats
         ui.update_memory_stats(memory_stats)
-            
-    except Exception:
-        pass  # Don't let memory stats break the UI
+
+    except Exception as e:
+        # Log the error for debugging but don't break the UI
+        import logging
+        logging.debug(f"Failed to update memory stats: {e}")
 
 
 def _handle_memory(agent: AtlasAgent, args: list[str]) -> None:

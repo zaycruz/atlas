@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, List, Optional, Sequence, Tuple
 
+from .telemetry import Telemetry
+
 import numpy as np
 
 
@@ -32,6 +34,13 @@ def _cosine(a: np.ndarray, b: np.ndarray) -> float:
     if denom == 0:
         return 0.0
     return float(np.dot(a, b) / denom)
+
+
+def _estimate_tokens(text: str) -> int:
+    """Rough token estimate (4 chars ~= 1 token)."""
+    if not text:
+        return 0
+    return max(1, int(len(text) / 4))
 
 
 def _quality_features(text: str) -> tuple[float, dict[str, float]]:
@@ -776,6 +785,30 @@ class SemanticMemory:
         chosen = scored[:top_k]
         if not chosen:
             return []
+        if len(chosen) < top_k:
+            seen_ids = {fact.get("id") for _, fact, _ in chosen}
+            base_candidates = list(chosen)
+            for _, fact, _ in base_candidates:
+                fact_id = fact.get("id")
+                if not fact_id:
+                    continue
+                for link in self.graph.links_for(str(fact_id)):
+                    target_id = link.get("target")
+                    if not target_id or target_id in seen_ids:
+                        continue
+                    try:
+                        target_index = next(idx for idx, item in enumerate(self._facts) if item.get("id") == target_id)
+                    except StopIteration:
+                        continue
+                    target_fact = self._facts[target_index]
+                    chosen.append((0.25, target_fact, target_index))
+                    seen_ids.add(target_id)
+                    if len(chosen) >= top_k:
+                        break
+                if len(chosen) >= top_k:
+                    break
+        chosen.sort(key=lambda x: x[0], reverse=True)
+        chosen = chosen[:top_k]
         now = time.time()
         dirty = False
         for _, _fact, idx in chosen:
@@ -1441,7 +1474,7 @@ class LayeredMemoryManager:
         else:
             self._debug("No reflections available")
 
-        if not assembled.episodic:
+        if not assembled.episodic and not query.strip():
             fallback = []
             for item in self.episodic.recent(self.config.k_ep):
                 text = (item.get("assistant") or item.get("user") or "").strip().replace("\n", " ")
@@ -1453,7 +1486,7 @@ class LayeredMemoryManager:
                     len(fallback),
                 )
                 assembled = AssembledContext(episodic=fallback, facts=assembled.facts, reflections=assembled.reflections)
-        if not assembled.facts:
+        if not assembled.facts and not query.strip():
             facts = []
             for fact in self.semantic.head(self.config.k_facts):
                 text = str(fact.get("text", "")).strip().replace("\n", " ")
@@ -1486,8 +1519,20 @@ class LayeredMemoryManager:
             self._debug("Summary generation failed", exc_info=True)
             return ""
 
-    def build_snapshot(self, query: str, *, client: Any) -> LayeredMemorySnapshot:
+    def build_snapshot(
+        self,
+        query: str,
+        *,
+        client: Any,
+        token_budget_hint: Optional[int] = None,
+    ) -> LayeredMemorySnapshot:
         assembled = self.assemble(query)
+        if token_budget_hint is not None:
+            self._constrain_context(
+                assembled,
+                client=client,
+                token_budget_hint=token_budget_hint,
+            )
         rendered = self.render(assembled)
         summary = ""
         if assembled.episodic or assembled.facts or assembled.reflections:
@@ -1495,6 +1540,152 @@ class LayeredMemoryManager:
         else:
             self._debug("No memory content available for snapshot")
         return LayeredMemorySnapshot(summary=summary.strip(), rendered=rendered.strip(), assembled=assembled)
+
+    def _constrain_context(
+        self,
+        assembled: AssembledContext,
+        *,
+        client: Any,
+        token_budget_hint: int,
+    ) -> None:
+        budget = max(0, int(token_budget_hint))
+        if budget <= 0:
+            return
+        budget = max(budget, 200)
+
+        before_tokens = self._estimate_context_tokens(assembled)
+        meta = self.assembler.last_metadata or {}
+        episodic_meta: List[dict[str, Any]] = list(meta.get("episodic", []))
+        fact_meta: List[dict[str, Any]] = list(meta.get("semantic", []))
+        reflection_meta: List[dict[str, Any]] = list(meta.get("reflections", []))
+
+        def total_tokens() -> int:
+            return self._estimate_context_tokens(assembled)
+
+        changed = False
+
+        while total_tokens() > budget and len(assembled.episodic) > 1:
+            idx = self._lowest_score_index(episodic_meta, len(assembled.episodic))
+            assembled.episodic.pop(idx)
+            if idx < len(episodic_meta):
+                episodic_meta.pop(idx)
+            changed = True
+
+        while total_tokens() > budget and assembled.reflections:
+            assembled.reflections.pop()
+            if reflection_meta:
+                reflection_meta.pop()
+            changed = True
+
+        if assembled.facts and total_tokens() > budget:
+            if self._abbreviate_fact_lines(assembled.facts):
+                changed = True
+
+        while total_tokens() > budget and len(assembled.facts) > 1:
+            idx = self._lowest_score_index(fact_meta, len(assembled.facts))
+            assembled.facts.pop(idx)
+            if idx < len(fact_meta):
+                fact_meta.pop(idx)
+            changed = True
+
+        if total_tokens() > budget:
+            summary_lines: List[str] = []
+            summary_text = ""
+            if client is not None:
+                try:
+                    summary_text = summarize_assembled_context_abstractive(
+                        assembled,
+                        client,
+                        model=self.config.summary_model,
+                        style="bullets",
+                    )
+                except Exception:
+                    summary_text = ""
+            if summary_text:
+                for line in summary_text.splitlines():
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    stripped = stripped.lstrip("-• ").strip()
+                    if stripped:
+                        summary_lines.append(f"- {stripped}")
+            if not summary_lines:
+                combined = " ".join(
+                    part.lstrip("- ").strip()
+                    for part in (assembled.facts + assembled.episodic + assembled.reflections)
+                    if part.strip()
+                ).strip()
+                if not combined:
+                    combined = "Context summary unavailable."
+                summary_lines = [f"- {combined[:320]}"]
+            assembled.episodic = []
+            assembled.reflections = []
+            assembled.facts = summary_lines[:4]
+            changed = True
+
+        if changed and total_tokens() > budget:
+            combined: List[str] = []
+            tokens_accum = 0
+            for line in assembled.facts:
+                line_tokens = _estimate_tokens(line)
+                if tokens_accum + line_tokens > budget:
+                    break
+                combined.append(line)
+                tokens_accum += line_tokens
+            if not combined and assembled.facts:
+                combined = [assembled.facts[0][: max(16, budget * 4)]]
+            assembled.episodic = []
+            assembled.reflections = []
+            assembled.facts = combined
+
+        after_tokens = self._estimate_context_tokens(assembled)
+        Telemetry.instance().record_snapshot_tokens(before_tokens, after_tokens)
+    @staticmethod
+    def _lowest_score_index(meta: List[dict[str, Any]], length: int) -> int:
+        if meta and len(meta) == length:
+            try:
+                return min(
+                    range(length),
+                    key=lambda idx: float(meta[idx].get("score", float("inf"))),
+                )
+            except Exception:
+                pass
+        return 0 if length else 0
+
+    @staticmethod
+    def _abbreviate_fact_lines(lines: List[str]) -> bool:
+        changed = False
+        for idx, line in enumerate(list(lines)):
+            text = line
+            prefix = ""
+            if text.startswith("- "):
+                prefix = "- "
+                body = text[2:].strip()
+            else:
+                body = text.strip()
+            if " (" in body and len(body) > 140:
+                body = body.split(" (", 1)[0]
+            if len(body) > 160:
+                body = body[:160].rstrip()
+            new_line = f"{prefix}{body}"
+            if new_line != text:
+                lines[idx] = new_line
+                changed = True
+        return changed
+
+    @staticmethod
+    def _estimate_context_tokens(assembled: AssembledContext) -> int:
+        total = 0
+        if assembled.episodic:
+            total += _estimate_tokens("Relevant episodes:")
+            total += sum(_estimate_tokens(line) for line in assembled.episodic)
+        if assembled.facts:
+            total += _estimate_tokens("Relevant facts:")
+            total += sum(_estimate_tokens(line) for line in assembled.facts)
+        if assembled.reflections:
+            total += _estimate_tokens("Relevant reflections:")
+            total += sum(_estimate_tokens(line) for line in assembled.reflections)
+        return total
 
     def _debug(self, message: str, *args: Any, **kwargs: Any) -> None:
         if self._debug_enabled:
@@ -1788,11 +1979,6 @@ class LayeredMemoryManager:
         metadata: Optional[dict[str, Any]],
     ) -> set[str]:
         tags = set(self._normalize_tags((metadata or {}).get("tags")))
-        objective = (metadata or {}).get("objective")
-        if objective:
-            slug = self._slug_tag(str(objective))
-            if slug:
-                tags.add(f"objective:{slug}")
         for tool_name in self._normalize_tags((metadata or {}).get("tools")):
             tags.add(f"tool:{tool_name}")
         if not tags:
