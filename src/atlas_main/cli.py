@@ -8,6 +8,8 @@ Supports:
  - managing memory and tools
 """
 from __future__ import annotations
+import argparse
+import asyncio
 import json
 import textwrap
 import time
@@ -16,6 +18,8 @@ from pathlib import Path
 import threading
 import os
 import subprocess
+import sys
+import uuid
 
 from rich.console import Console
 from rich.panel import Panel
@@ -25,6 +29,9 @@ from rich import box
 from typing import Any, Dict, Optional, List, Set
 
 from .agent import AtlasAgent
+from .agents import AgentFactory
+from .orchestrator.engine import Orchestrator
+from .orchestrator.types import StepSpec, TaskEvent, TaskResult, TaskSpec
 from .ollama import OllamaClient
 from .stt import Microphone, VadSegmenter, WhisperTranscriber
 from .telemetry import Telemetry
@@ -44,8 +51,161 @@ console = Console()
 
 
 def main() -> None:
-    # Set up logging
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    argv = sys.argv[1:]
+    if argv:
+        cmd = argv[0]
+        if cmd == "orchestrate":
+            _run_orchestrate(argv[1:])
+            return
+        if cmd == "agents":
+            _agents_command(argv[1:])
+            return
+    _run_chat_ui()
+
+
+def _run_orchestrate(argv: List[str]) -> None:
+    parser = argparse.ArgumentParser(
+        prog="atlas orchestrate",
+        description="Delegate a coding task to a configured external agent.",
+    )
+    parser.add_argument("task", nargs="?", help="Human-readable task description")
+    parser.add_argument(
+        "--agent",
+        dest="agents",
+        action="append",
+        help="Agent identifier to execute the task (repeat for sequential steps, use agent:custom description to override)",
+    )
+    parser.add_argument("--context-json", help="Optional JSON object to pass as shared context")
+    parser.add_argument("--task-id", help="Override generated task identifier")
+    parser.add_argument("--list-agents", action="store_true", help="List configured agents and exit")
+    parser.add_argument("--repo", help="Path to the git repository to operate on (defaults to current directory)")
+    parser.add_argument("--allow-dirty", action="store_true", help="Skip clean working tree check")
+    args = parser.parse_args(argv)
+
+    factory = AgentFactory()
+    if args.list_agents:
+        _print_available_agents(factory)
+        return
+
+    if not args.task:
+        parser.error("Task description is required")
+
+    shared_context: Dict[str, Any] = {}
+    if args.context_json:
+        try:
+            parsed = json.loads(args.context_json)
+            if not isinstance(parsed, dict):
+                raise ValueError("Context must be a JSON object")
+            shared_context = parsed
+        except Exception as exc:
+            raise SystemExit(f"Failed to parse context JSON: {exc}") from exc
+
+    task_id = args.task_id or f"task-{uuid.uuid4().hex[:8]}"
+    repo_path = args.repo or os.getcwd()
+    agents = args.agents or ["echo-coder"]
+    steps: List[StepSpec] = []
+    for index, entry in enumerate(agents, start=1):
+        agent_spec = entry
+        description = args.task
+        if ":" in entry:
+            agent_id_raw, custom_desc = entry.split(":", 1)
+            agent_spec = agent_id_raw.strip() or agent_spec
+            if custom_desc.strip():
+                description = custom_desc.strip()
+        step_inputs: Dict[str, Any] = {"repo_path": repo_path}
+        if args.allow_dirty:
+            step_inputs["allow_dirty"] = True
+        steps.append(
+            StepSpec(
+                id=f"{task_id}-step-{index}",
+                description=description,
+                agent_id=agent_spec.strip(),
+                inputs=step_inputs,
+            )
+        )
+    task_spec = TaskSpec(
+        id=task_id,
+        objective=args.task,
+        steps=steps,
+        shared_context=shared_context,
+    )
+
+    orchestrator = Orchestrator(factory, event_callback=_print_orchestrate_event)
+    agent_list = ", ".join(step.agent_id for step in steps)
+    console.print(f"[bold cyan]Delegating task {task_id}[/bold cyan] → {agent_list}")
+    result = asyncio.run(orchestrator.run_task(task_spec))
+    _render_task_result(result)
+
+
+def _agents_command(argv: List[str]) -> None:
+    parser = argparse.ArgumentParser(prog="atlas agents", description="Inspect agent registry")
+    parser.add_argument("action", choices=["list"], nargs="?", default="list")
+    args = parser.parse_args(argv)
+    factory = AgentFactory()
+    if args.action == "list":
+        _print_available_agents(factory)
+
+
+def _print_available_agents(factory: AgentFactory) -> None:
+    agents = factory.list_agents()
+    if not agents:
+        console.print("[yellow]No agents configured. Add entries to config/agents.yaml.[/yellow]")
+        return
+
+    table = Table(box=box.ROUNDED)
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("Type", style="white")
+    table.add_column("Description", style="dim")
+    for agent_id, config in sorted(agents.items()):
+        table.add_row(agent_id, config.get("type", "unknown"), config.get("description", ""))
+    console.print(table)
+
+
+def _print_orchestrate_event(event: TaskEvent) -> None:
+    if event.type == "task.started":
+        console.print(f"[dim]Task started:[/dim] {event.payload.get('objective', '')}")
+    elif event.type == "step.started":
+        payload = event.payload
+        console.print(
+            f"  [cyan]→ step {payload.get('step_id')}[/cyan] "
+            f"(agent: {payload.get('agent_id')}) — {payload.get('description')}"
+        )
+    elif event.type == "step.completed":
+        payload = event.payload
+        status = payload.get("status")
+        color = "green" if status == "succeeded" else "red"
+        console.print(f"    [bold {color}]{status}[/bold {color}] {payload.get('summary')}")
+    elif event.type == "step.skipped":
+        payload = event.payload
+        console.print(f"    [yellow]skipped[/yellow] {payload.get('reason')}")
+    elif event.type == "task.completed":
+        status = event.payload.get("status")
+        color = "green" if status == "succeeded" else "red"
+        console.print(f"[bold {color}]Task {status}[/bold {color}]")
+
+
+def _render_task_result(result: TaskResult) -> None:
+    console.print("")
+    if result.succeeded:
+        console.print(f"[bold green]Task {result.task_id} succeeded[/bold green]")
+    else:
+        console.print(f"[bold red]Task {result.task_id} failed[/bold red]")
+
+    for step in result.step_results:
+        console.print(f"  • {step.step_id} — {step.status}: {step.summary}")
+        if step.artifacts:
+            for artifact in step.artifacts:
+                label = artifact.kind or "artifact"
+                if artifact.content:
+                    console.print(f"      [{label}] {artifact.content}")
+                elif artifact.path:
+                    console.print(f"      [{label}] saved at {artifact.path}")
+        if step.logs:
+            console.print(f"      logs: {len(step.logs)} entries")
+
+
+def _run_chat_ui() -> None:
 
     console.print(Panel.fit(ASCII_ATLAS, style="cyan", border_style="bright_cyan"))
     console.print("[bold cyan]Make of this what you will.[/bold cyan]\n")

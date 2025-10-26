@@ -29,6 +29,7 @@ from .tools import (
     WriteFileTool,
     ListDirectoryTool,
     ShellCommandTool,
+    CurrentTimeTool,
     BrowserSearchTool,
     BrowserOpenTool,
     BrowserFindTool,
@@ -105,6 +106,7 @@ class AtlasAgent:
         self.tools.register(ListDirectoryTool())
         self.tools.register(WriteFileTool())
         self.tools.register(ShellCommandTool())
+        self.tools.register(CurrentTimeTool())
         self.layered_memory_config = layered_memory_config or LayeredMemoryConfig()
         embed_fn = self._make_embed_fn(self.layered_memory_config.embed_model)
         self._embed_fn = embed_fn

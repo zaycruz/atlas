@@ -1,0 +1,19 @@
+[DEBUG] Watching for changes in setting files /Users/master/projects/atlas-main/.claude/settings.local.json...
+[ERROR] Failed to save config with lock: Error: ENOENT: no such file or directory, lstat '/Users/master/projects/atlas-main/.claude.json'
+[DEBUG] Writing to temp file: /Users/master/projects/atlas-main/.claude.json.tmp.73440.1761447569121
+[DEBUG] Setting permissions for new file: 600
+[DEBUG] Temp file written successfully, size: 103 bytes
+[DEBUG] Renaming /Users/master/projects/atlas-main/.claude.json.tmp.73440.1761447569121 to /Users/master/projects/atlas-main/.claude.json
+[DEBUG] File /Users/master/projects/atlas-main/.claude.json written atomically
+[DEBUG] Writing to temp file: /Users/master/projects/atlas-main/.claude.json.tmp.73440.1761447569136
+[DEBUG] Preserving file permissions: 100600
+[DEBUG] Temp file written successfully, size: 183 bytes
+[DEBUG] Applied original permissions to temp file
+[DEBUG] Renaming /Users/master/projects/atlas-main/.claude.json.tmp.73440.1761447569136 to /Users/master/projects/atlas-main/.claude.json
+[DEBUG] File /Users/master/projects/atlas-main/.claude.json written atomically
+[DEBUG] Writing to temp file: /Users/master/projects/atlas-main/.claude.json.tmp.73440.1761447569144
+[DEBUG] Preserving file permissions: 100600
+[DEBUG] Temp file written successfully, size: 220 bytes
+[DEBUG] Applied original permissions to temp file
+[DEBUG] Renaming /Users/master/projects/atlas-main/.claude.json.tmp.73440.1761447569144 to /Users/master/projects/atlas-main/.claude.json
+[DEBUG] File /Users/master/projects/atlas-main/.claude.json written atomically

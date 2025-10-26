@@ -15,7 +15,7 @@ import time
 import shutil
 import sys
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -345,6 +345,26 @@ class ToolRegistry:
         except Exception:
             payload = repr(arguments)
         return sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+class CurrentTimeTool(Tool):
+    """Return the current date and time."""
+
+    name = "current_time"
+    description = "Return the current date and time in both local timezone and UTC."
+    args_hint = "(no arguments)"
+    capabilities = frozenset({"system:time"})
+
+    def run(self, *, agent=None) -> str:  # type: ignore[override]
+        local_now = datetime.now().astimezone()
+        utc_now = datetime.now(timezone.utc)
+        return "\n".join(
+            [
+                "Current time:",
+                f"Local: {local_now.isoformat()}",
+                f"UTC: {utc_now.isoformat()}",
+            ]
+        )
 
 
 class WebSearchTool(Tool):

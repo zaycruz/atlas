@@ -1,6 +1,7 @@
 """Tests for tool registry and web search integration."""
 from __future__ import annotations
 
+from datetime import datetime
 from typing import List
 import re
 
@@ -15,6 +16,7 @@ from atlas_main.tools import (
     WriteFileTool,
     ListDirectoryTool,
     ShellCommandTool,
+    CurrentTimeTool,
     ToolRegistry,
 )
 from atlas_main.tools_memory import FetchFactTool
@@ -116,6 +118,28 @@ def test_tool_registry_emits_function_specs() -> None:
     assert any(item.get("function", {}).get("name") == "read_file" for item in specs)
     assert all(item.get("type") == "function" for item in specs)
     assert any("capabilities" in item.get("function", {}) for item in specs)
+
+
+def test_current_time_tool_outputs_isoformatted_values() -> None:
+    tool = CurrentTimeTool()
+
+    output = tool.run()
+
+    lines = output.splitlines()
+    assert lines[0] == "Current time:"
+
+    parsed = {}
+    for line in lines[1:]:
+        if ": " not in line:
+            continue
+        key, value = line.split(": ", 1)
+        parsed[key] = value
+
+    assert "Local" in parsed
+    assert "UTC" in parsed
+    # fromisoformat validates the timestamps include timezone information
+    datetime.fromisoformat(parsed["Local"])
+    datetime.fromisoformat(parsed["UTC"])
 
 
 def test_parse_markdown_results_skips_media_blocks() -> None:

@@ -17,6 +17,38 @@ Atlas is a terminal-first companion for local Ollama models, pairing a streaming
 
 Type into the REPL to chat. Press `Ctrl+D` to exit, or type `/quit`.
 
+### Multi-agent orchestrator (preview)
+
+Atlas can delegate coding tasks to external agents via the new orchestrator command. A demo echo-agent is included for smoke testing.
+
+```bash
+PYTHONPATH=src python3 -m atlas_main.cli agents list
+PYTHONPATH=src python3 -m atlas_main.cli orchestrate \
+  --repo /path/to/repo \
+  --agent codex \
+  "Add tests for the parser"
+```
+
+The orchestrator streams events as each step is executed and prints a summary when finished. Configure additional agents in `src/atlas_main/config/agents.yaml`.
+
+Available adapters:
+
+- `codex` &mdash; GitHub Codex CLI (`codex exec --json --full-auto`).
+- `claude-code` &mdash; Anthropic Claude Code CLI (`claude --print --output-format stream-json`).
+- `droid` &mdash; Factory Droid CLI (`droid exec --output-format json --auto medium`).
+- `echo-coder` &mdash; local demo agent that simply echoes the task.
+
+Example multi-step flow:
+
+```bash
+PYTHONPATH=src python3 -m atlas_main.cli orchestrate \
+  --repo /path/to/repo \
+  --agent claude-code:"Draft the implementation plan" \
+  --agent codex:"Apply the plan and update the code" \
+  --agent droid:"Run tests and report the results" \
+  "Ship pagination support for the API"
+```
+
 ### Ollama requirements
 
 Atlas expects a local Ollama daemon on `http://localhost:11434`. To use different models, set environment variables before launching:

@@ -1,0 +1,28 @@
+agents:
+  echo-coder:
+    description: Local echo-based coding agent for vertical slice demo
+    type: process
+    command:
+      - "{python}"
+      - -m
+      - atlas_main.agents.examples.echo_agent
+    timeout: 60
+  codex:
+    description: GitHub Codex CLI adapter (requires authenticated codex CLI)
+    type: codex
+    binary: codex
+    timeout: 900
+    args:
+      - --full-auto
+  claude-code:
+    description: Claude Code CLI adapter (requires Claude CLI setup)
+    type: claude
+    binary: claude
+    timeout: 900
+    permission_mode: acceptEdits
+  droid:
+    description: Factory Droid CLI adapter (requires FACTORY_API_KEY)
+    type: droid
+    binary: droid
+    timeout: 900
+    auto_level: medium
