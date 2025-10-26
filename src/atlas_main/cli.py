@@ -15,6 +15,7 @@ import logging
 from pathlib import Path
 import threading
 import os
+import subprocess
 
 from rich.console import Console
 from rich.panel import Panel
@@ -26,6 +27,7 @@ from typing import Any, Dict, Optional, List, Set
 from .agent import AtlasAgent
 from .ollama import OllamaClient
 from .stt import Microphone, VadSegmenter, WhisperTranscriber
+from .telemetry import Telemetry
 from .watchers import ClipboardWatcher, FileWatcher
 from .ui import ConversationShell
 
@@ -56,6 +58,8 @@ def main() -> None:
     info_table.add_row("📝", "Type your message and press Enter to chat")
     info_table.add_row("🔧", "Atlas can automatically use tools like web search")
     info_table.add_row("⚙️", "Type [cyan]/help[/cyan] to see all available commands")
+    info_table.add_row("🔄", "Type [cyan]/new[/cyan] to reset the conversation")
+    info_table.add_row("🛠️", "Prefix with ! to run shell commands (e.g. !ls, !clear)")
     info_table.add_row("🚪", "Press [cyan]Ctrl+D[/cyan] or type [cyan]/quit[/cyan] to exit")
 
     console.print(Panel(info_table, title="Quick Start", border_style="green", box=box.ROUNDED))
@@ -107,6 +111,10 @@ def main() -> None:
             if lowered in {"/quit", "/exit"}:
                 console.print("[bold yellow]Exiting.[/bold yellow]")
                 break
+
+            if stripped.startswith("!"):
+                _run_shell_command(stripped[1:].strip())
+                continue
 
             if stripped.startswith("/"):
                 handled = _handle_command(agent, stripped, runtime)
@@ -160,31 +168,38 @@ def _start_watchers(agent: AtlasAgent) -> List[threading.Thread]:
     return watchers
 
 def _handle_command(agent: AtlasAgent, command_line: str, runtime: Dict[str, Any]) -> bool:
-    parts = command_line[1:].strip().split()
-    if not parts:
+    body = command_line[1:]
+    if not body.strip():
         return True
-    cmd, *rest = parts
+    body = body.lstrip()
+    cmd_token, _, arg_text = body.partition(" ")
+    cmd = cmd_token.lower()
+    args = arg_text.split() if arg_text else []
+
     ui: ConversationShell = runtime.get("ui")
     if cmd == "help":
         _print_help()
         return True
     if cmd == "model":
-        _handle_model(agent, rest)
+        _handle_model(agent, args)
+        return True
+    if cmd == "new":
+        _handle_new_conversation(agent, runtime, args)
         return True
     if cmd == "log":
-        _handle_log(rest)
+        _handle_log(args)
         return True
     if cmd == "thinking":
-        _handle_thinking(agent, rest)
+        _handle_thinking(agent, args)
         return True
     if cmd == "memory":
-        _handle_memory(agent, rest)
+        _handle_memory(agent, args)
         return True
     if cmd == "voice":
-        _handle_voice(agent, rest, runtime)
+        _handle_voice(agent, args, runtime)
         return True
     if cmd == "scroll":
-        _handle_scroll(ui, rest)
+        _handle_scroll(ui, args)
         return True
     if cmd == "up":
         _handle_scroll(ui, ["up"])
@@ -199,19 +214,19 @@ def _handle_command(agent: AtlasAgent, command_line: str, runtime: Dict[str, Any
         _handle_scroll(ui, ["bottom"])
         return True
     if cmd == "test":
-        _handle_test_mode(agent, rest, runtime)
+        _handle_test_mode(agent, args, runtime)
         return True
     if cmd == "expand":
-        _handle_expand(ui, rest, True)
+        _handle_expand(ui, args, True)
         return True
     if cmd == "collapse":
-        _handle_expand(ui, rest, False)
+        _handle_expand(ui, args, False)
         return True
     if cmd == "pin":
-        _handle_pin(ui, rest, pin=True)
+        _handle_pin(ui, args, pin=True)
         return True
     if cmd == "unpin":
-        _handle_pin(ui, rest, pin=False)
+        _handle_pin(ui, args, pin=False)
         return True
     if cmd == "pins":
         pinned = ui.pinned_turns if ui else []
@@ -221,11 +236,11 @@ def _handle_command(agent: AtlasAgent, command_line: str, runtime: Dict[str, Any
             console.print(f"Pinned turns: {', '.join(str(t) for t in pinned)}", style="cyan")
         return True
     if cmd == "focus":
-        _handle_focus(agent, ui, rest)
+        _handle_focus(agent, ui, args)
         return True
     if cmd == "rerun":
-        if ui and rest and rest[0].isdigit():
-            turn_id = int(rest[0])
+        if ui and args and args[0].isdigit():
+            turn_id = int(args[0])
             turn = ui.get_turn(turn_id)
             if turn:
                 console.print(f"Re-running turn {turn_id}", style="cyan")
@@ -240,13 +255,13 @@ def _handle_command(agent: AtlasAgent, command_line: str, runtime: Dict[str, Any
         console.print("Kill switch engaged. Attempting to cancel current turn...", style="yellow")
         return True
     if cmd == "tool":
-        _handle_tool_command(agent, rest, runtime)
+        _handle_tool_command(agent, args, runtime)
         return True
     if cmd == "feedback":
-        _handle_feedback(ui, rest)
+        _handle_feedback(ui, args)
         return True
     if cmd == "adjust":
-        _handle_adjust(agent, ui, rest)
+        _handle_adjust(agent, ui, args)
         return True
     if cmd == "status":
         _handle_status(agent, ui)
@@ -254,8 +269,34 @@ def _handle_command(agent: AtlasAgent, command_line: str, runtime: Dict[str, Any
     if cmd == "stats":
         _handle_stats(agent)
         return True
-    console.print(f"Unknown command: {cmd}. Type /help for options.", style="yellow")
+    if cmd == "context":
+        _handle_context(agent, runtime)
+        return True
+    if cmd == "models":
+        _handle_models(agent)
+        return True
+    if cmd in {"shell", "sh"}:
+        _run_shell_command(arg_text)
+        return True
+    console.print(f"Unknown command: {cmd_token}. Type /help for options.", style="yellow")
     return True
+
+
+def _run_shell_command(command_text: Optional[str]) -> None:
+    command = (command_text or "").strip()
+    if not command:
+        console.print("Usage: !<command> or /shell <command>", style="yellow")
+        return
+    if command.lower() in {"clear", "cls"}:
+        console.clear()
+        return
+    try:
+        result = subprocess.run(command, shell=True)
+    except Exception as exc:
+        console.print(f"Shell command failed: {exc}", style="red")
+        return
+    if result.returncode != 0:
+        console.print(f"Command exited with status {result.returncode}", style="red")
 
 
 def _handle_status(agent: AtlasAgent, ui: Optional[ConversationShell]) -> None:
@@ -265,7 +306,15 @@ def _handle_status(agent: AtlasAgent, ui: Optional[ConversationShell]) -> None:
     table.add_column("Value")
 
     # Model info
-    table.add_row("Model", agent.chat_model)
+    try:
+        from .model_config import get_model_limits
+        model_limits = get_model_limits(agent.chat_model)
+        table.add_row("Model", f"{agent.chat_model}\n({model_limits.description})")
+        table.add_row("Context Window", f"{model_limits.context_window:,} tokens")
+        table.add_row("Working Budget", f"{model_limits.working_budget:,} tokens")
+    except ImportError:
+        table.add_row("Model", agent.chat_model)
+
     table.add_row("Focus Mode", agent.focus_mode)
 
     # Memory info
@@ -292,6 +341,191 @@ def _handle_status(agent: AtlasAgent, ui: Optional[ConversationShell]) -> None:
             table.add_row("Test Mode", "[yellow]ACTIVE (no memory logging)[/yellow]")
 
     console.print(Panel(table, title="Atlas Status", border_style="cyan"))
+
+
+def _handle_context(agent: AtlasAgent, runtime: Dict[str, Any]) -> None:
+    """Show context usage and system information similar to Claude Code's /context."""
+    from rich.text import Text
+
+    # Get telemetry and usage data
+    usage = agent._context_usage_snapshot()
+    memory_stats = agent._memory_stats_snapshot()
+
+    # Get model-specific limits
+    try:
+        from .model_config import get_model_limits
+        model_limits = get_model_limits(agent.chat_model)
+        model_context_window = model_limits.context_window
+        model_working_budget = model_limits.working_budget
+        model_description = model_limits.description
+    except ImportError:
+        # Fallback if model_config is not available
+        model_context_window = usage.get('token_budget', 0)
+        model_working_budget = usage.get('token_budget', 0)
+        model_description = agent.chat_model
+
+    # Header with model information
+    console.print("\n[bold cyan]Context Usage[/bold cyan]")
+    console.print(f"[dim]Model: {model_description}[/dim]")
+
+    # Use real token data from Atlas working memory
+    tokens_used = usage.get('tokens', 0)
+    token_budget = usage.get('token_budget', 0)
+    token_pct = usage.get('token_pct', 0)
+
+    # Calculate bar width and color based on real usage
+    bar_width = 40
+    filled_chars = int(bar_width * token_pct / 100)
+    empty_chars = bar_width - filled_chars
+    main_color = "green" if token_pct < 50 else "yellow" if token_pct < 80 else "red"
+
+    # Format the main usage bar with real data
+    main_bar = Text()
+    main_bar.append("⛁ ", style="dim")
+    main_bar.append("⛀" * filled_chars, style=main_color)
+    main_bar.append("⛶" * empty_chars, style="dim")
+    main_bar.append(f"   {agent.chat_model} · {tokens_used:,}/{token_budget:,} tokens ({token_pct:.0f}%)")
+    console.print(main_bar)
+
+    # System prompt - estimate based on typical system prompt size
+    system_prompt_tokens = 1500  # Rough estimate for system prompt
+    system_pct = (system_prompt_tokens / token_budget) * 100 if token_budget > 0 else 0
+    system_filled = int(bar_width * system_pct / 100)
+
+    system_bar = Text()
+    system_bar.append("⛶ " * system_filled, style="blue")
+    system_bar.append("⛶" * (bar_width - system_filled), style="dim")
+    system_bar.append(f"   ⛁ System prompt: {system_prompt_tokens/1000:.1f}k tokens ({system_pct:.1f}%)")
+    console.print(system_bar)
+
+    # Atlas tools (using real Atlas tool registry)
+    tools = agent.tools.list_names() if hasattr(agent, 'tools') else []
+    tools_tokens = len(tools) * 50  # Rough estimate of 50 tokens per tool description
+    tools_pct = (tools_tokens / token_budget) * 100 if token_budget > 0 else 0
+    tools_filled = int(bar_width * tools_pct / 100)
+
+    tools_bar = Text()
+    tools_bar.append("⛶ " * tools_filled, style="green")
+    tools_bar.append("⛶" * (bar_width - tools_filled), style="dim")
+    tools_bar.append(f"   ⛁ Atlas tools: {tools_tokens} tokens ({tools_pct:.1f}%)")
+    console.print(tools_bar)
+
+    # Memory context (if layered memory is enabled)
+    memory_tokens = 0
+    if hasattr(agent, 'layered_memory') and agent.layered_memory:
+        memory_tokens = memory_stats.get('episodic_count', 0) * 100  # Rough estimate
+    memory_pct = (memory_tokens / token_budget) * 100 if token_budget > 0 else 0
+    memory_filled = int(bar_width * memory_pct / 100)
+
+    memory_bar = Text()
+    memory_bar.append("⛶ " * memory_filled, style="magenta")
+    memory_bar.append("⛶" * (bar_width - memory_filled), style="dim")
+    memory_bar.append(f"   ⛁ Memory context: {memory_tokens} tokens ({memory_pct:.1f}%)")
+    console.print(memory_bar)
+
+    # Messages/Conversation turns
+    turns = usage.get('turns', 0)
+    messages_tokens = turns * 200  # Rough estimate of 200 tokens per turn
+    messages_pct = (messages_tokens / token_budget) * 100 if token_budget > 0 else 0
+    messages_filled = int(bar_width * messages_pct / 100)
+
+    # Show different characters when we approach limits
+    if messages_filled > bar_width * 0.8:
+        messages_char = "⛝"
+    else:
+        messages_char = "⛶"
+
+    messages_bar = Text()
+    messages_bar.append(f"{messages_char} " * messages_filled, style="cyan")
+    messages_bar.append("⛶" * (bar_width - messages_filled), style="dim")
+    messages_bar.append(f"   ⛁ Messages: {messages_tokens} tokens ({messages_pct:.1f}%)")
+    console.print(messages_bar)
+
+    # Free space calculation
+    free_space = max(0, token_budget - tokens_used)
+    free_pct = (free_space / token_budget) * 100 if token_budget > 0 else 0
+    free_filled = int(bar_width * free_pct / 100)
+
+    free_bar = Text()
+    free_bar.append("⛶ " * free_filled, style="white")
+    free_bar.append("⛝" * (bar_width - free_filled), style="dim")
+    free_bar.append(f"   ⛶ Free space: {free_space/1000:.0f}k ({free_pct:.1f}%)")
+    console.print(free_bar)
+
+    # Show real Atlas tools if available
+    if tools:
+        console.print()
+        console.print("[bold]Atlas Tools[/bold]")
+        for tool_name in sorted(tools):
+            console.print(f"└ {tool_name}: available")
+
+    # Working memory statistics
+    console.print()
+    console.print("[bold]Working Memory[/bold]")
+    console.print(f"└ Turns: {turns}/{usage.get('capacity', 0)}")
+    console.print(f"└ Tokens used: {tokens_used:,}/{token_budget:,} ({token_pct:.1f}%)")
+
+    # Model-specific limits
+    if model_context_window != token_budget:
+        console.print(f"└ Model context: {model_context_window:,} tokens total")
+        console.print(f"└ Working budget: {model_working_budget:,} tokens ({model_working_budget/model_context_window*100:.0f}% of context)")
+
+    # Show efficiency indicator
+    if model_working_budget > 0:
+        efficiency = (tokens_used / model_working_budget) * 100
+        if efficiency > 90:
+            efficiency_style = "red"
+        elif efficiency > 75:
+            efficiency_style = "yellow"
+        else:
+            efficiency_style = "green"
+        console.print(f"└ Budget efficiency: [{efficiency_style}]{efficiency:.0f}%[/{efficiency_style}] of working budget used")
+
+    # Layered memory statistics (if available)
+    if hasattr(agent, 'layered_memory') and agent.layered_memory:
+        console.print()
+        console.print("[bold]Layered Memory[/bold]")
+        console.print(f"└ Episodic memories: {memory_stats.get('episodic_count', 0)}")
+        console.print(f"└ Semantic facts: {memory_stats.get('semantic_count', 0)}")
+        console.print(f"└ Reflections: {memory_stats.get('reflections_count', 0)}")
+
+    console.print()
+
+
+def _extract_prior_summary(agent: AtlasAgent) -> Optional[str]:
+    try:
+        messages = agent.working_memory.to_messages()
+    except Exception:
+        return None
+    summary = None
+    for message in messages:
+        if message.get("summary"):
+            content = str(message.get("content", "")).strip()
+            if content:
+                summary = content
+    return summary
+
+
+def _handle_new_conversation(agent: AtlasAgent, runtime: Dict[str, Any], args: list[str]) -> None:
+    if args and args[0] in {"help", "?"}:
+        console.print("Usage: /new", style="yellow")
+        return
+
+    summary = _extract_prior_summary(agent)
+    agent.reset()
+    runtime["active_turn"] = None
+    if runtime.get("voice_mode") == "on":
+        _stop_voice_listener(runtime)
+
+    ui: Optional[ConversationShell] = runtime.get("ui")
+    if ui:
+        ui.reset(status="New conversation ready.")
+
+    console.print("[bold green]Started a new conversation.[/bold green]")
+    if summary:
+        console.print(
+            Panel(summary, title="Prior Session Summary", border_style="cyan"),
+        )
 
 
 def _handle_stats(agent: AtlasAgent) -> None:
@@ -333,6 +567,16 @@ def _handle_stats(agent: AtlasAgent) -> None:
         f"({usage.get('token_pct', 0):.1f}% of budget)",
         style="dim",
     )
+    layer_stats = telemetry.get("memory_layers", {})
+    if layer_stats.get("count"):
+        console.print(
+            "Memory layers avg tokens — episodes: "
+            f"{layer_stats.get('avg_episodic', 0.0):.0f}, facts: {layer_stats.get('avg_facts', 0.0):.0f}, "
+            f"reflections: {layer_stats.get('avg_reflections', 0.0):.0f} "
+            f"(utilization ~{layer_stats.get('avg_budget_utilization_pct', 0.0):.1f}%, "
+            f"trimmed {layer_stats.get('trimmed_ratio', 0.0) * 100:.1f}% of turns)",
+            style="dim",
+        )
 
 
 def _print_help() -> None:
@@ -344,6 +588,9 @@ def _print_help() -> None:
     table1.add_column("Description", style="white")
 
     table1.add_row("/status", "Show current agent status and context")
+    table1.add_row("/context", "Display detailed context usage and system information")
+    table1.add_row("/models", "Show supported models and their context limits")
+    table1.add_row("/new", "Clear working memory and start fresh")
     table1.add_row("/model <name>", "Switch the active Ollama model")
     table1.add_row("/model list", "List all available models")
     table1.add_row("/thinking <on|off>", "Toggle model thinking visibility")
@@ -398,6 +645,7 @@ def _print_help() -> None:
     table5.add_column("Description", style="white")
 
     table5.add_row("/voice <on|off|ptt>", "Voice input control")
+    table5.add_row("/shell <command>", "Run a shell command (shortcut: !command)")
     table5.add_row("/log <level>", "Set logging level (off/error/warn/info/debug)")
     table5.add_row("/feedback <works|issue>", "Provide feedback on responses")
     table5.add_row("/adjust <style>", "Adjust response style (shorter/longer/formal/casual)")
@@ -1214,6 +1462,58 @@ def _run_memory_prune(agent: AtlasAgent, args: list[str]) -> None:
 
 
 # Lite build: no tools, journal, critic, identity, desires, or snapshots.
+
+
+def _handle_models(agent: AtlasAgent) -> None:
+    """Show supported models and their context limits."""
+    try:
+        from .model_config import get_all_supported_models, get_model_limits
+        from rich.table import Table
+
+        table = Table(show_header=True, box=box.ROUNDED, border_style="cyan")
+        table.add_column("Model Family", style="bold")
+        table.add_column("Context Window", justify="right")
+        table.add_column("Working Budget", justify="right")
+        table.add_column("Description")
+
+        models = get_all_supported_models()
+
+        # Group by context window size
+        context_groups = {}
+        for model in models.keys():
+            try:
+                limits = get_model_limits(model)
+                context_key = limits.context_window
+                if context_key not in context_groups:
+                    context_groups[context_key] = []
+                context_groups[context_key].append((model, limits))
+            except:
+                continue
+
+        # Sort by context window size (descending)
+        for context_size in sorted(context_groups.keys(), reverse=True):
+            model_list = context_groups[context_size]
+            for model, limits in sorted(model_list):
+                table.add_row(
+                    model,
+                    f"{limits.context_window:,}",
+                    f"{limits.working_budget:,}",
+                    limits.description
+                )
+
+        console.print(Panel(table, title="Supported Models & Context Limits", border_style="cyan"))
+
+        # Show current model info
+        try:
+            current_limits = get_model_limits(agent.chat_model)
+            console.print(f"\n[dim]Current model: {agent.chat_model}")
+            console.print(f"Context: {current_limits.context_window:,} tokens | "
+                         f"Working: {current_limits.working_budget:,} tokens[/dim]")
+        except:
+            pass
+
+    except ImportError:
+        console.print("Model configuration system not available.", style="yellow")
 
 
 def _handle_model(agent: AtlasAgent, args: list[str]) -> None:

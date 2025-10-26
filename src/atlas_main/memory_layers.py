@@ -167,136 +167,7 @@ def _quality_features(text: str) -> tuple[float, dict[str, float]]:
     return score, features
 
 
-class KnowledgeGraph:
-    """Lightweight adjacency map relating stored facts."""
-
-    def __init__(self, graph_path: Path) -> None:
-        self.graph_path = Path(graph_path).expanduser()
-        self.graph_path.parent.mkdir(parents=True, exist_ok=True)
-        self._edges: dict[str, list[dict[str, str]]] = {}
-        self._load()
-
-    def _load(self) -> None:
-        if not self.graph_path.exists():
-            self._edges = {}
-            return
-        try:
-            data = json.loads(self.graph_path.read_text())
-            edges = data.get("edges", {}) if isinstance(data, dict) else {}
-            normalized: dict[str, list[dict[str, str]]] = {}
-            for node, links in edges.items():
-                if not isinstance(links, list):
-                    continue
-                cleaned: list[dict[str, str]] = []
-                for link in links:
-                    if not isinstance(link, dict):
-                        continue
-                    target = str(link.get("target", "")).strip()
-                    rel = str(link.get("type", "")).strip() or "related"
-                    if not target:
-                        continue
-                    cleaned.append({"target": target, "type": rel})
-                if cleaned:
-                    normalized[str(node)] = cleaned
-            self._edges = normalized
-        except Exception:
-            self._edges = {}
-
-    def _persist(self) -> None:
-        payload = {"edges": self._edges}
-        try:
-            self.graph_path.write_text(json.dumps(payload, indent=2))
-        except Exception:
-            LOGGER.debug("Failed to persist knowledge graph", exc_info=True)
-
-    @staticmethod
-    def _tokenize(text: str) -> set[str]:
-        tokens = {token for token in re.findall(r"[A-Za-z0-9']+", text.lower()) if len(token) > 2}
-        return tokens
-
-    @staticmethod
-    def _detect_negation(text: str) -> bool:
-        lowered = text.lower()
-        return any(word in lowered for word in {" not ", " no ", " never ", " without "})
-
-    @staticmethod
-    def _detect_dependency(text: str) -> bool:
-        lowered = text.lower()
-        return any(keyword in lowered for keyword in {"requires", "depends", "needs", "prerequisite"})
-
-    def _infer_relation(self, text_a: str, text_b: str) -> Optional[str]:
-        tokens_a = self._tokenize(text_a)
-        tokens_b = self._tokenize(text_b)
-        if not tokens_a or not tokens_b:
-            return None
-        overlap = len(tokens_a & tokens_b)
-        union = len(tokens_a | tokens_b)
-        if union == 0:
-            return None
-        jaccard = overlap / union
-        if jaccard < 0.3:
-            return None
-        neg_a = self._detect_negation(text_a)
-        neg_b = self._detect_negation(text_b)
-        if neg_a != neg_b and jaccard >= 0.35:
-            return "contradicts"
-        if self._detect_dependency(text_a) or self._detect_dependency(text_b):
-            return "depends"
-        return "related"
-
-    @staticmethod
-    def _dedupe(edges: Iterable[dict[str, str]]) -> list[dict[str, str]]:
-        seen: set[tuple[str, str]] = set()
-        result: list[dict[str, str]] = []
-        for edge in edges:
-            target = edge.get("target")
-            rel = edge.get("type") or "related"
-            if not target:
-                continue
-            key = (target, rel)
-            if key in seen:
-                continue
-            seen.add(key)
-            result.append({"target": target, "type": rel})
-        return result
-
-    def rebuild(self, facts: Iterable[dict[str, Any]]) -> dict[str, list[dict[str, str]]]:
-        fact_list = [fact for fact in facts if fact.get("id")]
-        adjacency: dict[str, list[dict[str, str]]] = {
-            str(fact["id"]): [] for fact in fact_list
-        }
-        for idx, fact in enumerate(fact_list):
-            text_a = str(fact.get("text", ""))
-            id_a = str(fact.get("id"))
-            for other in fact_list[idx + 1 :]:
-                text_b = str(other.get("text", ""))
-                id_b = str(other.get("id"))
-                relation = self._infer_relation(text_a, text_b)
-                if not relation:
-                    continue
-                adjacency[id_a].append({"target": id_b, "type": relation})
-                adjacency[id_b].append({"target": id_a, "type": relation})
-        for node, edges in adjacency.items():
-            adjacency[node] = self._dedupe(edges)
-        self._edges = adjacency
-        self._persist()
-        return {node: list(edges) for node, edges in adjacency.items()}
-
-    def remove(self, fact_ids: Iterable[str]) -> None:
-        removal = {str(fid) for fid in fact_ids}
-        if not removal:
-            return
-        new_edges: dict[str, list[dict[str, str]]] = {}
-        for node, edges in self._edges.items():
-            if node in removal:
-                continue
-            filtered = [edge for edge in edges if edge.get("target") not in removal]
-            new_edges[node] = filtered
-        self._edges = new_edges
-        self._persist()
-
-    def links_for(self, fact_id: str) -> list[dict[str, str]]:
-        return [dict(edge) for edge in self._edges.get(str(fact_id), [])]
+## Knowledge graph removed: previously lightweight adjacency for facts.
 
 class EpisodicSQLiteMemory:
     """Lightweight episodic memory using SQLite and local embeddings."""
@@ -455,12 +326,9 @@ class SemanticMemory:
         self,
         json_path: Path,
         embed_fn: Optional[EmbedFn] = None,
-        *,
-        graph_path: Optional[Path] = None,
     ) -> None:
         self.json_path = Path(json_path).expanduser()
         self.embed_fn = embed_fn
-        self.graph = KnowledgeGraph(graph_path or (self.json_path.with_name("knowledge_graph.json")))
         self._facts: List[dict] = []
         self._embeddings: List[Optional[np.ndarray]] = []
         self._load()
@@ -515,27 +383,16 @@ class SemanticMemory:
             else:
                 entry["quality"] = _quality_features(text)[0]
             entry["tags"] = self._normalize_tags(fact.get("tags"))
-            entry["links"] = []
             clean_facts.append(entry)
         self._facts = clean_facts
         self._embeddings = [None] * len(self._facts)
-        if self._facts:
-            self._apply_graph_links()
 
     def _persist(self) -> None:
         self.json_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {"facts": self._facts}
         self.json_path.write_text(json.dumps(payload, indent=2))
 
-    def _apply_graph_links(self) -> None:
-        if not self._facts:
-            self.graph.remove([])
-            self._persist()
-            return
-        link_map = self.graph.rebuild(self._facts)
-        for fact in self._facts:
-            fact["links"] = link_map.get(fact["id"], [])
-        self._persist()
+    # Graph link propagation removed.
 
     def _normalize_tags(self, tags: Any) -> list[str]:
         if not tags:
@@ -573,14 +430,12 @@ class SemanticMemory:
         confidence: Optional[float] = None,
         quality: Optional[float] = None,
         tags: Optional[Iterable[str]] = None,
-        update_graph: bool = True,
     ) -> Optional[dict]:
         normalized = (text or "").strip()
         if not normalized:
             return None
         new_tags = self._normalize_tags(tags)
         key = normalized.lower()
-        graph_dirty = False
         for fact in self._facts:
             if str(fact.get("text", "")).strip().lower() == key:
                 now = time.time()
@@ -588,7 +443,6 @@ class SemanticMemory:
                 if new_tags:
                     merged = set(fact.get("tags", [])) | set(new_tags)
                     fact["tags"] = sorted(merged)
-                    graph_dirty = True
                 if confidence is not None:
                     try:
                         fact["confidence"] = float(confidence)
@@ -602,8 +456,6 @@ class SemanticMemory:
                 fact["uses"] = int(fact.get("uses", 0))
                 fact["last_access_ts"] = now
                 self._persist()
-                if update_graph and graph_dirty:
-                    self._apply_graph_links()
                 return fact
 
         entry: dict[str, Any] = {
@@ -612,7 +464,6 @@ class SemanticMemory:
             "ts": time.time(),
             "uses": 0,
             "tags": new_tags,
-            "links": [],
         }
         if source:
             entry["source"] = source
@@ -633,7 +484,6 @@ class SemanticMemory:
         entry["last_access_ts"] = entry["ts"]
         self._facts.append(entry)
         self._embeddings.append(None)
-        graph_dirty = True
         try:
             if self.embed_fn is not None:
                 vec = self.embed_fn(normalized)
@@ -662,15 +512,11 @@ class SemanticMemory:
                         self._facts.pop()
                         self._embeddings.pop()
                         self._persist()
-                        if update_graph and graph_dirty:
-                            self._apply_graph_links()
                         return existing
                     self._embeddings[-1] = new_vec
         except Exception:
             self._embeddings[-1] = None
         self._persist()
-        if update_graph and graph_dirty:
-            self._apply_graph_links()
         return entry
 
     def extend_facts(
@@ -695,21 +541,16 @@ class SemanticMemory:
                     confidence=confidence,
                     quality=quality,
                     tags=merged_tags,
-                    update_graph=False,
                 )
             else:
                 inserted_fact = self.add_fact(
                     str(item),
                     source=source,
                     tags=batch_tags,
-                    update_graph=False,
                 )
             if inserted_fact:
                 inserted.append(inserted_fact)
-        if inserted:
-            self._apply_graph_links()
-        else:
-            self._persist()
+        self._persist()
         return inserted
 
     def update_fact(
@@ -741,7 +582,6 @@ class SemanticMemory:
                 fact["last_access_ts"] = fact["ts"]
                 self._embeddings = [None] * len(self._facts)
                 self._persist()
-                self._apply_graph_links()
                 return fact
         return None
 
@@ -756,10 +596,16 @@ class SemanticMemory:
         self._facts.pop(to_remove)
         self._embeddings = [None] * len(self._facts)
         self._persist()
-        self._apply_graph_links()
         return True
 
-    def recall(self, query: str, top_k: int = 3) -> List[Tuple[float, dict]]:
+    def recall(
+        self,
+        query: str,
+        top_k: int = 3,
+        *,
+        similarity_weight: float = 1.0,
+        freshness_weight: float = 0.0,
+    ) -> List[Tuple[float, dict]]:
         if not self._facts or not self.embed_fn or top_k <= 0:
             return []
         qvec = self.embed_fn(query)
@@ -768,6 +614,9 @@ class SemanticMemory:
         q = np.asarray(qvec, dtype=float)
         query_tokens = self._tokenize_query(query)
         scored: List[Tuple[float, dict, int]] = []
+        similarity_weight = max(0.0, float(similarity_weight))
+        freshness_weight = max(0.0, float(freshness_weight))
+        weight_sum = max(1.0, similarity_weight + freshness_weight)
         for i, fact in enumerate(self._facts):
             if self._embeddings[i] is None:
                 try:
@@ -780,43 +629,34 @@ class SemanticMemory:
                 continue
             base = _cosine(q, v)
             bonus = self._tag_bonus(query_tokens, fact.get("tags", []))
-            scored.append((base + bonus, fact, i))
+            similarity_score = base + bonus
+            freshness_score = self._fact_priority(fact)
+            combined = (
+                similarity_weight * similarity_score + freshness_weight * freshness_score
+            ) / weight_sum
+            fact_copy = dict(fact)
+            fact_copy["_similarity"] = float(similarity_score)
+            fact_copy["_freshness"] = float(freshness_score)
+            fact_copy["_score"] = float(combined)
+            scored.append((combined, fact_copy, i))
         scored.sort(key=lambda x: x[0], reverse=True)
         chosen = scored[:top_k]
         if not chosen:
             return []
-        if len(chosen) < top_k:
-            seen_ids = {fact.get("id") for _, fact, _ in chosen}
-            base_candidates = list(chosen)
-            for _, fact, _ in base_candidates:
-                fact_id = fact.get("id")
-                if not fact_id:
-                    continue
-                for link in self.graph.links_for(str(fact_id)):
-                    target_id = link.get("target")
-                    if not target_id or target_id in seen_ids:
-                        continue
-                    try:
-                        target_index = next(idx for idx, item in enumerate(self._facts) if item.get("id") == target_id)
-                    except StopIteration:
-                        continue
-                    target_fact = self._facts[target_index]
-                    chosen.append((0.25, target_fact, target_index))
-                    seen_ids.add(target_id)
-                    if len(chosen) >= top_k:
-                        break
-                if len(chosen) >= top_k:
-                    break
+        # Graph-based neighbor expansion removed.
         chosen.sort(key=lambda x: x[0], reverse=True)
         chosen = chosen[:top_k]
         now = time.time()
         dirty = False
         for _, _fact, idx in chosen:
             try:
-                self._facts[idx]["uses"] = int(self._facts[idx].get("uses", 0)) + 1
+                updated_uses = int(self._facts[idx].get("uses", 0)) + 1
             except (TypeError, ValueError):
-                self._facts[idx]["uses"] = 1
+                updated_uses = 1
+            self._facts[idx]["uses"] = updated_uses
             self._facts[idx]["last_access_ts"] = now
+            _fact["uses"] = updated_uses
+            _fact["last_access_ts"] = now
             dirty = True
         if dirty:
             self._persist()
@@ -854,8 +694,6 @@ class SemanticMemory:
             self._facts = []
             self._embeddings = []
             self._persist()
-            if removed_ids:
-                self.graph.remove(removed_ids)
             return removed
         if not self._facts or len(self._facts) <= max_items:
             return 0
@@ -873,10 +711,7 @@ class SemanticMemory:
         self._facts = retained
         self._embeddings = [None] * len(self._facts)
         self._persist()
-        if removed_ids:
-            self.graph.remove(removed_ids)
-        if self._facts:
-            self._apply_graph_links()
+        # No graph to update.
         return removed
 
     def get_fact(self, fact_id: str) -> Optional[dict]:
@@ -884,6 +719,41 @@ class SemanticMemory:
             if fact.get("id") == fact_id:
                 return dict(fact)
         return None
+
+    def resolve_fact(self, identifier: str) -> Optional[dict]:
+        token = str(identifier or "").strip()
+        if not token:
+            return None
+        lowered = token.lower()
+        matches: list[tuple[int, dict[str, Any]]] = []
+        for idx, fact in enumerate(self._facts):
+            fid = str(fact.get("id") or "")
+            if not fid:
+                continue
+            fid_lower = fid.lower()
+            if fid_lower == lowered:
+                matches = [(idx, fact)]
+                break
+            if fid_lower.startswith(lowered):
+                matches.append((idx, fact))
+        if not matches:
+            return None
+        if len(matches) > 1:
+            raise ValueError("ambiguous")
+        idx, fact = matches[0]
+        now = time.time()
+        try:
+            updated_uses = int(fact.get("uses", 0)) + 1
+        except (TypeError, ValueError):
+            updated_uses = 1
+        self._facts[idx]["uses"] = updated_uses
+        self._facts[idx]["last_access_ts"] = now
+        self._persist()
+        record = dict(self._facts[idx])
+        record["_score"] = record.get("_score", 0.0)
+        record["_similarity"] = record.get("_similarity", 0.0)
+        record["_freshness"] = record.get("_freshness", self._fact_priority(record))
+        return record
 
     @property
     def last_recalled(self) -> List[dict]:
@@ -1227,7 +1097,6 @@ class LayeredMemoryConfig:
     episodic_filename: str = "episodes.sqlite3"
     semantic_filename: str = "semantic.json"
     reflections_filename: str = "reflections.json"
-    graph_filename: str = "knowledge_graph.json"
     adaptive_filename: str = "adaptive_thresholds.json"
     summary_model: Optional[str] = None
     memory_model: Optional[str] = None
@@ -1248,6 +1117,14 @@ class LayeredMemoryConfig:
     k_facts: int = 5                           # Increased from 3 (+67%)
     k_reflections: int = 4                     # Increased from 3 (+33%)
     
+    # JIT semantics & scoring controls
+    jit_semantics_enabled: bool = False
+    jit_semantics_full_facts: int = 2
+    semantic_similarity_weight: float = 0.7
+    semantic_freshness_weight: float = 0.3
+    # Control whether semantic facts are injected into assembled context
+    include_semantic_in_assembly: bool = True
+    
     summary_style: str = "bullets"
     audit_interval_turns: int = 12
     audit_window: int = 6
@@ -1256,7 +1133,6 @@ class LayeredMemoryConfig:
     episodic_path: Path = field(init=False)
     semantic_path: Path = field(init=False)
     reflections_path: Path = field(init=False)
-    graph_path: Path = field(init=False)
     adaptive_path: Path = field(init=False)
 
     def __post_init__(self) -> None:
@@ -1265,7 +1141,6 @@ class LayeredMemoryConfig:
         self.episodic_path = self.base_dir / self.episodic_filename
         self.semantic_path = self.base_dir / self.semantic_filename
         self.reflections_path = self.base_dir / self.reflections_filename
-        self.graph_path = self.base_dir / self.graph_filename
         self.adaptive_path = self.base_dir / self.adaptive_filename
         if not self.summary_model:
             configured = os.getenv("ATLAS_SUMMARY_MODEL")
@@ -1293,6 +1168,28 @@ class LayeredMemoryConfig:
         self.audit_interval_turns = max(0, int(os.getenv("ATLAS_MEMORY_AUDIT_INTERVAL", self.audit_interval_turns)))
         self.audit_window = max(1, int(os.getenv("ATLAS_MEMORY_AUDIT_WINDOW", self.audit_window)))
         self.audit_sample_size = max(1, int(os.getenv("ATLAS_MEMORY_AUDIT_SAMPLE", self.audit_sample_size)))
+        self.jit_semantics_enabled = self._bool_env("ATLAS_JIT_SEMANTICS", default=self.jit_semantics_enabled)
+        self.jit_semantics_full_facts = max(
+            0,
+            self._int_env("ATLAS_JIT_SEMANTICS_FULL", default=self.jit_semantics_full_facts),
+        )
+        self.semantic_similarity_weight = max(
+            0.0,
+            self._float_env("ATLAS_SEM_SIM_WEIGHT", default=self.semantic_similarity_weight),
+        )
+        self.semantic_freshness_weight = max(
+            0.0,
+            self._float_env("ATLAS_SEM_FRESH_WEIGHT", default=self.semantic_freshness_weight),
+        )
+        if self.semantic_similarity_weight == 0.0 and self.semantic_freshness_weight == 0.0:
+            self.semantic_similarity_weight = 1.0
+        if self.jit_semantics_full_facts > self.k_facts:
+            self.jit_semantics_full_facts = self.k_facts
+        # Whether to include semantic facts in assembled memory context
+        self.include_semantic_in_assembly = self._bool_env(
+            "ATLAS_ASSEMBLY_INCLUDE_SEMANTIC",
+            default=self.include_semantic_in_assembly,
+        )
 
     @staticmethod
     def _float_env(name: str, *, default: float) -> float:
@@ -1301,6 +1198,16 @@ class LayeredMemoryConfig:
             return default
         try:
             return float(raw)
+        except ValueError:
+            return default
+
+    @staticmethod
+    def _int_env(name: str, *, default: int) -> int:
+        raw = os.getenv(name)
+        if raw is None or not raw.strip():
+            return default
+        try:
+            return int(raw)
         except ValueError:
             return default
 
@@ -1344,13 +1251,13 @@ class LayeredMemoryManager:
         self.semantic = SemanticMemory(
             self.config.semantic_path,
             embed_fn=embed_fn,
-            graph_path=self.config.graph_path,
         )
         self.reflections = ReflectionMemory(self.config.reflections_path)
         self.assembler = ContextAssembler(
             episodic=self.episodic,
             semantic=self.semantic,
             reflections=self.reflections,
+            config=self.config,
         )
         self._stats: dict[str, dict[str, float]] = {
             "harvest": {
@@ -1486,9 +1393,14 @@ class LayeredMemoryManager:
                     len(fallback),
                 )
                 assembled = AssembledContext(episodic=fallback, facts=assembled.facts, reflections=assembled.reflections)
-        if not assembled.facts and not query.strip():
+        if (
+            self.config.include_semantic_in_assembly
+            and not assembled.facts
+            and not query.strip()
+        ):
             facts = []
-            for fact in self.semantic.head(self.config.k_facts):
+            fallback_limit = max(1, min(self.config.k_facts, max(1, self.config.k_ep - 2)))
+            for fact in self.semantic.head(fallback_limit):
                 text = str(fact.get("text", "")).strip().replace("\n", " ")
                 if text:
                     facts.append(f"- {text[:200]}")
@@ -1564,13 +1476,6 @@ class LayeredMemoryManager:
 
         changed = False
 
-        while total_tokens() > budget and len(assembled.episodic) > 1:
-            idx = self._lowest_score_index(episodic_meta, len(assembled.episodic))
-            assembled.episodic.pop(idx)
-            if idx < len(episodic_meta):
-                episodic_meta.pop(idx)
-            changed = True
-
         while total_tokens() > budget and assembled.reflections:
             assembled.reflections.pop()
             if reflection_meta:
@@ -1586,6 +1491,13 @@ class LayeredMemoryManager:
             assembled.facts.pop(idx)
             if idx < len(fact_meta):
                 fact_meta.pop(idx)
+            changed = True
+
+        while total_tokens() > budget and len(assembled.episodic) > 1:
+            idx = self._lowest_score_index(episodic_meta, len(assembled.episodic))
+            assembled.episodic.pop(idx)
+            if idx < len(episodic_meta):
+                episodic_meta.pop(idx)
             changed = True
 
         if total_tokens() > budget:
@@ -1638,7 +1550,32 @@ class LayeredMemoryManager:
             assembled.reflections = []
             assembled.facts = combined
 
-        after_tokens = self._estimate_context_tokens(assembled)
+        after_tokens = total_tokens()
+
+        episodic_tokens = 0
+        if assembled.episodic:
+            episodic_tokens += _estimate_tokens("Relevant episodes:")
+            episodic_tokens += sum(_estimate_tokens(line) for line in assembled.episodic)
+
+        fact_tokens = 0
+        if assembled.facts:
+            fact_tokens += _estimate_tokens("Relevant facts:")
+            fact_tokens += sum(_estimate_tokens(line) for line in assembled.facts)
+
+        reflection_tokens = 0
+        if assembled.reflections:
+            reflection_tokens += _estimate_tokens("Relevant reflections:")
+            reflection_tokens += sum(_estimate_tokens(line) for line in assembled.reflections)
+
+        Telemetry.instance().record_memory_layers(
+            before=before_tokens,
+            episodic=episodic_tokens,
+            facts=fact_tokens,
+            reflections=reflection_tokens,
+            total=after_tokens,
+            budget=budget,
+            trimmed=changed or after_tokens < before_tokens or after_tokens > budget,
+        )
         Telemetry.instance().record_snapshot_tokens(before_tokens, after_tokens)
     @staticmethod
     def _lowest_score_index(meta: List[dict[str, Any]], length: int) -> int:
@@ -2373,7 +2310,6 @@ class LayeredMemoryManager:
                     "confidence": fact.get("confidence"),
                     "quality": fact.get("quality"),
                     "tags": fact.get("tags", []),
-                    "links": fact.get("links", []),
                 }
                 for fact in facts
             ],
@@ -2551,10 +2487,12 @@ class ContextAssembler:
         episodic: Optional[EpisodicSQLiteMemory] = None,
         semantic: Optional[SemanticMemory] = None,
         reflections: Optional[ReflectionMemory] = None,
+        config: Optional[LayeredMemoryConfig] = None,
     ) -> None:
         self.episodic = episodic
         self.semantic = semantic
         self.reflections = reflections
+        self.config = config
         self._last_metadata: dict[str, Any] = {}
 
     def assemble(self, query: str, *, k_ep: int = 3, k_facts: int = 3, k_lessons: int = 3) -> AssembledContext:
@@ -2572,8 +2510,28 @@ class ContextAssembler:
 
         fact_snips: List[str] = []
         fact_meta: List[dict[str, Any]] = []
-        if self.semantic:
-            for score, fact in self.semantic.recall(query, top_k=k_facts):
+        include_semantic = bool(self.config and getattr(self.config, "include_semantic_in_assembly", True))
+        if self.semantic and include_semantic:
+            jit_enabled = bool(self.config and self.config.jit_semantics_enabled)
+            similarity_weight = 1.0
+            freshness_weight = 0.0
+            if self.config:
+                similarity_weight = max(0.0, getattr(self.config, "semantic_similarity_weight", 1.0))
+                freshness_weight = max(0.0, getattr(self.config, "semantic_freshness_weight", 0.0))
+                if not jit_enabled and freshness_weight > 0.0:
+                    # Only apply freshness weighting when JIT is enabled to preserve legacy behaviour.
+                    freshness_weight = 0.0
+            results = self.semantic.recall(
+                query,
+                top_k=k_facts,
+                similarity_weight=similarity_weight,
+                freshness_weight=freshness_weight,
+            )
+            full_limit = k_facts
+            if jit_enabled:
+                configured_full = getattr(self.config, "jit_semantics_full_facts", 0)
+                full_limit = max(0, min(k_facts, configured_full))
+            for idx, (score, fact) in enumerate(results):
                 text = str(fact.get("text", "")).strip().replace("\n", " ")
                 if text:
                     descriptor = text[:200]
@@ -2581,29 +2539,30 @@ class ContextAssembler:
                     tags = fact.get("tags", [])
                     if tags:
                         extras.append("tags: " + ", ".join(tags[:3]))
-                    links = fact.get("links", [])
-                    if links and self.semantic:
-                        link_labels: List[str] = []
-                        for link in links[:2]:
-                            target_id = link.get("target")
-                            if not target_id:
-                                continue
-                            target_fact = self.semantic.get_fact(target_id)
-                            if not target_fact:
-                                continue
-                            link_labels.append(
-                                f"{link.get('type', 'related')}→{str(target_fact.get('text', ''))[:40].strip()}"
-                            )
-                        if link_labels:
-                            extras.append("links: " + "; ".join(link_labels))
-                    if extras:
-                        descriptor += " (" + "; ".join(extras) + ")"
-                    fact_snips.append(f"- {descriptor}")
+                    # knowledge-graph links removed
+                    fact_id_full = str(fact.get("id") or "")
+                    fact_id_short = fact_id_full[:8] if fact_id_full else "????"
+                    if jit_enabled and idx >= full_limit:
+                        stub_summary = text[:120]
+                        stub_line = f"(fact {fact_id_short} stub) {stub_summary}"
+                        if tags:
+                            stub_line += f" (tags: {', '.join(tags[:2])})"
+                        if fact_id_full:
+                            stub_line += f" — use /tool run memory.fetch_fact {fact_id_full}"
+                        fact_snips.append(f"- {stub_line}")
+                    else:
+                        if extras:
+                            descriptor += " (" + "; ".join(extras) + ")"
+                        fact_snips.append(f"- (fact {fact_id_short}) {descriptor}")
                     fact_meta.append({
                         "score": float(score),
                         "text": text[:120],
                         "tags": tags,
-                        "links": links,
+                        "links": [],
+                        "id": fact_id_full,
+                        "stub": bool(jit_enabled and idx >= full_limit),
+                        "similarity": float(fact.get("_similarity", score)),
+                        "freshness": float(fact.get("_freshness", 0.0)),
                     })
 
         lesson_snips: List[str] = []

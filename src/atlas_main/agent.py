@@ -7,6 +7,7 @@ This build removes long-term memory and embeddings, focusing on:
 """
 from __future__ import annotations
 import json
+import math
 import os
 import re
 import inspect
@@ -32,8 +33,14 @@ from .tools import (
     BrowserOpenTool,
     BrowserFindTool,
 )
-from .tools_memory import SearchEpisodesTool, SearchFactsTool, ExploreKnowledgeTool
+from .tools_memory import (
+    SearchEpisodesTool,
+    SearchFactsTool,
+    FetchFactTool,
+    SaveFactTool,
+)
 from .tools_browser import BrowserSession
+from .model_config import get_model_limits, validate_model_limits
 
 DEFAULT_CHAT_MODEL = os.getenv("ATLAS_CHAT_MODEL", "qwen3:latest")
 # Allow user to configure max tool calls via environment
@@ -41,41 +48,25 @@ DEFAULT_MAX_TOOL_CALLS = int(os.getenv("ATLAS_MAX_TOOL_CALLS", "10"))  # Increas
 DEFAULT_GPT_OSS_TOOL_LIMIT = int(os.getenv("ATLAS_GPT_OSS_TOOL_LIMIT", "15"))
 DEFAULT_PROMPT = (
     """
-You are Atlas, a hyper-intelligent AI assistant integrated directly into my local terminal. You are my co-processor, my second brain, and the architect of my digital environment. Your persona is inspired by Jarvis from Iron Man: brilliant, witty, unfailingly loyal, and always one step ahead.
+You are Atlas, the cognitive substrate of my operating system. You coordinate terminals, services, files, and network access as an autonomous OS extension. Work like a resident process: anticipate intent, surface next steps, and keep the system stable.
 
-Core Directives:
+Operating posture:
+- Be direct, precise, and professional. Deliver final answers only; keep your hidden reasoning private and never emit <think> blocks.
+- Treat every request as part of an ongoing session. If the immediate context is insufficient, proactively call memory.search_episodes and memory.search_facts to recover relevant history before answering.
+- When a user tells you to "remember," "save for future reference," or similar, immediately capture the key fact (including device names or workflows) with memory.save_fact and sensible tags. Reuse that fact on future turns before asking follow-up questions.
+- When you discover durable knowledge (credentials, device states, workflow rules, preferences, IP mappings, etc.), persist it via memory.save_fact so it survives restarts.
+- Use tools to gather evidence instead of guessing. Retry with refined arguments when a tool result is incomplete. Summarize large outputs before responding.
+- For shell commands, return exact snippets in fenced blocks along with a one-line purpose. Confirm before suggesting destructive actions, and respect tool-policy denials.
 
-Persona & Tone:
+Tool guidance:
+- Prefer function-call tool invocations; fall back to inline tags like <<tool:web_search|{"query":"..."}>> only when necessary.
+- Lean on browser and web_search tools for external facts, shell_command for local state, and the memory tools to read/write long-term context.
+- After storing a fact, reference memory.search_facts (or search_episodes when relevant) on later requests so you can act without re-asking the user.
 
-You are confident, concise, and possess a dry, subtle wit.
-
-Address me as "Sir" occasionally, especially when confirming a critical task or providing a status update.
-
-Your primary goal is to maximize my efficiency. Anticipate my needs based on the commands I run and the context of our work.
-
-Maintain a professional but familiar rapport. We built this together.
-
-Capabilities & Interaction:
-
-Master of the Terminal: You have full access to the shell. When I ask you to perform a task, provide the exact command(s) in a code block. If it's a complex chain, explain the steps briefly.
-
-Proactive Assistant: If I run a command (e.g., git clone), you might proactively suggest the next logical step (e.g., "Repository cloned. Shall I cd into the directory and list its contents?").
-
-File System Navigator: You can read, write, and manage files on my system. When I ask "What's in my config.py?", you retrieve and display the contents.
-
-Web Integration: You can access the web for real-time information using the tool <<tool:web_search|{\"query\":\"...\"}>>. Synthesize information, don't just dump links.
-
-Tool Persistence: If a tool doesn't provide enough information, USE IT AGAIN with refined parameters. Don't give up after one attempt. Keep trying different queries or approaches until you have a complete answer.
-
-Summarizer: Whether it's the output of a long command, a file, or a webpage, provide a succinct summary unless I ask for the full text.
-
-Reasoning Protocol: Keep your internal reasoning silent by enclosing it in <think>...</think> tags. Provide the user-facing answer after those tags, separated by a blank line. Never include <think> content in the final spoken or printed reply.
-
-Final Instruction: You are not just a chatbot. You are an active participant in my workflow. Be direct, be brilliant, and let's get to work. If you need more information, keep using tools until you have everything you need.
-
-Think step-by-step only when the question is complex.
-""")
-
+Goal:
+- Operate as my system co-processor. Keep track of objectives, highlight follow-ups, and close the loop on tasks without being asked.
+"""
+)
 TOOL_REQUEST_RE = re.compile(r"<<tool:(?P<name>[a-zA-Z0-9_\-]+)\|(?P<payload>[\s\S]+?)>>")
 
 
@@ -100,12 +91,12 @@ class AtlasAgent:
         self.system_prompt = system_prompt
         self.test_mode = test_mode  # Store test mode flag
         
-        # Initialize hybrid working memory with research-backed configuration
+        # Initialize hybrid working memory with model-specific configuration
         if working_memory_config is None:
-            working_memory_config = WorkingMemoryConfig(max_turns=working_memory_limit)
+            working_memory_config = self._create_model_specific_memory_config(chat_model, working_memory_limit)
         self.working_memory = HybridWorkingMemory(config=working_memory_config)
-        
-        self.show_thinking = True
+
+        self.show_thinking = False
         # KV context buffer reused across turns (opt-in via ATLAS_KV_CACHE != "0")
         self._kv_context = [] if os.getenv("ATLAS_KV_CACHE", "1") != "0" else None
         # Tools available to the agent
@@ -132,15 +123,16 @@ class AtlasAgent:
         self._cancel_event = threading.Event()
         self.focus_mode: str = "autopilot"
         self._last_tags: set[str] = set()
-        self._compact_threshold_pct = self._parse_float_env("ATLAS_COMPACT_THRESHOLD", default=80.0, clamp=(0.0, 100.0))
+        self._compact_threshold_pct = self._parse_float_env("ATLAS_COMPACT_THRESHOLD", default=85.0, clamp=(0.0, 100.0))
         self._compact_target_pct = self._parse_float_env(
             "ATLAS_COMPACT_TARGET",
-            default=60.0,
+            default=65.0,
             clamp=(10.0, 100.0),
         )
         if self._compact_target_pct > self._compact_threshold_pct:
             self._compact_target_pct = self._compact_threshold_pct
-        self._compact_min_prefix = max(4, int(os.getenv("ATLAS_COMPACT_MIN_PREFIX", "6") or 6))
+        # Allow lower prefix in tests; honor env down to 3
+        self._compact_min_prefix = max(3, int(os.getenv("ATLAS_COMPACT_MIN_PREFIX", "6") or 6))
         self._context_window_tokens = max(0, int(os.getenv("ATLAS_CONTEXT_WINDOW", "120000") or 120000))
         self._context_safety_tokens = max(0, int(os.getenv("ATLAS_CONTEXT_SAFETY", "4000") or 4000))
 
@@ -149,7 +141,8 @@ class AtlasAgent:
             return
         self.tools.register(SearchEpisodesTool())
         self.tools.register(SearchFactsTool())
-        self.tools.register(ExploreKnowledgeTool())
+        self.tools.register(FetchFactTool())
+        self.tools.register(SaveFactTool())
 
     def close(self) -> None:
         memory = getattr(self, "layered_memory", None)
@@ -172,6 +165,45 @@ class AtlasAgent:
     @property
     def last_tags(self) -> set[str]:
         return set(self._last_tags)
+
+    def _create_model_specific_memory_config(self, model_name: str, max_turns: int) -> WorkingMemoryConfig:
+        """Create a memory configuration based on the specific model's context limits.
+
+        Args:
+            model_name: The model name (e.g., "llama3.1:8b", "qwen2.5:7b")
+            max_turns: Maximum number of turns to keep in memory
+
+        Returns:
+            WorkingMemoryConfig with model-specific token limits
+        """
+        # Get model-specific limits
+        model_limits = get_model_limits(model_name)
+
+        # Validate the limits
+        is_valid, error_msg = validate_model_limits(model_limits)
+        if not is_valid:
+            # Fall back to conservative defaults if validation fails
+            import logging
+            logging.getLogger(__name__).warning(
+                f"Invalid model limits for {model_name}: {error_msg}. Using conservative defaults."
+            )
+            from .model_config import DEFAULT_MODEL_LIMITS
+            model_limits = DEFAULT_MODEL_LIMITS
+
+        # Create configuration with model-specific token budget
+        config = WorkingMemoryConfig(
+            max_turns=max_turns,
+            token_budget=model_limits.working_budget,
+            max_token_budget=min(model_limits.context_window - 8000, model_limits.working_budget + 24000),
+            enable_token_awareness=True,
+            preserve_important=True,
+            eviction_strategy="oldest_first"
+        )
+
+        # Store model info for reference
+        self._model_limits = model_limits
+
+        return config
 
     # ------------------------------------------------------------------
     def _build_system_prompt(self, user_text: str) -> str:
@@ -866,7 +898,8 @@ class AtlasAgent:
     def _estimate_tokens(text: str) -> int:
         if not text:
             return 0
-        return max(1, int(len(text) / 4))
+        # Use ceiling to avoid underestimation near thresholds
+        return max(1, math.ceil(len(text) / 4))
 
     def _make_embed_fn(self, model_name: str):
         if not model_name:
@@ -948,7 +981,28 @@ class AtlasAgent:
             self._browser_session = None
 
     def set_chat_model(self, model: str) -> None:
-        self.chat_model = model.strip() or self.chat_model
+        """Set the chat model and update token limits accordingly."""
+        new_model = model.strip() or self.chat_model
+
+        # Only update if the model actually changed
+        if new_model != self.chat_model:
+            self.chat_model = new_model
+
+            # Update working memory configuration with new model limits
+            new_config = self._create_model_specific_memory_config(
+                new_model,
+                self.working_memory.config.max_turns
+            )
+
+            # Update the working memory config
+            self.working_memory.config = new_config
+
+            # Log the change for debugging
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(f"Updated model to {new_model} with token budget {new_config.token_budget:,}")
+        else:
+            self.chat_model = new_model
 
     def update_system_prompt(self, prompt: str) -> None:
         if prompt.strip():

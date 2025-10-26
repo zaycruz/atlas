@@ -55,8 +55,12 @@ Atlas can request tools while reasoning. The available set is announced in the s
 
 - `web_search`: Uses DuckDuckGo for search results and Crawl4AI for clean content extraction from web pages.
 - `memory.search_episodes`: Retrieve prior conversation turns relevant to a query.
-- `memory.search_facts`: Lookup semantic facts with knowledge-graph context.
-- `memory.explore_graph`: Inspect neighbouring facts in the knowledge graph.
+- `memory.search_facts`: Lookup semantic facts from long-term memory.
+- `memory.save_fact`: Persist a semantic fact (with optional tags) into long-term memory.
+### Memory debugging
+
+Set `ATLAS_MEMORY_DEBUG=1` before launching Atlas to stream detailed harvest/save logs (including accepted and rejected facts) to the console. Pairing this with a temporary `ATLAS_MEMORY_DIR` makes it easy to inspect JSON/SQLite artifacts while diagnosing recall issues.
+
 
 The model can invoke these with directives like `<<tool:web_search|{"query": "topic"}>>` or `<<tool:memory.search_facts|{"query": "tailscale"}>>`. Tool outputs are summarized before being re-ingested so the conversation stays within the model’s context budget.
 

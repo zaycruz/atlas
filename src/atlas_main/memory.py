@@ -35,8 +35,15 @@ class WorkingMemoryConfig:
 
 
 def _estimate_tokens(text: str) -> int:
-    """Estimate token count using 4 chars ≈ 1 token (85-90% accuracy)"""
-    return int(len(text) / 4)
+    """Estimate token count using 4 chars ≈ 1 token.
+
+    Uses ceiling to avoid underestimating, which helps trigger compaction
+    near thresholds in a predictable way during tests.
+    """
+    length = len(text or "")
+    if length <= 0:
+        return 0
+    return max(1, math.ceil(length / 4))
 
 
 @dataclass

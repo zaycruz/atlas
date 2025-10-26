@@ -1,8 +1,8 @@
-"""Memory-aware tools for retrieving episodes, facts, and knowledge graph links."""
+"""Memory-aware tools for retrieving episodes and facts."""
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from .tools import Tool, ToolError
 
@@ -58,7 +58,7 @@ class SearchFactsTool(Tool):
     """Retrieve semantic facts from long-term memory."""
 
     name = "memory.search_facts"
-    description = "Search semantic facts and show linked knowledge graph connections."
+    description = "Search semantic facts from long-term memory."
     args_hint = "query (str, required); limit (int, optional)"
     capabilities = frozenset({"memory:read"})
     parameters_schema = {
@@ -84,32 +84,87 @@ class SearchFactsTool(Tool):
             text = str(fact.get("text", "")).strip()
             fact_id = str(fact.get("id") or "")[:8]
             tags = fact.get("tags") or []
-            links = fact.get("links") or []
             tag_part = f" tags: {', '.join(tags[:3])}" if tags else ""
-            link_part = ""
-            if links:
-                linked = ", ".join(str(link.get("target", ""))[:8] for link in links[:3])
-                if linked:
-                    link_part = f" links: {linked}"
-            lines.append(f"- [{score:.3f}] ({fact_id}) {text[:220]}{tag_part}{link_part}")
+            lines.append(f"- [{score:.3f}] ({fact_id}) {text[:220]}{tag_part}")
         return "\n".join(lines)
 
 
-class ExploreKnowledgeTool(Tool):
-    """Explore the knowledge graph around specific fact IDs."""
+class FetchFactTool(Tool):
+    """Retrieve the full contents of a semantic fact by identifier."""
 
-    name = "memory.explore_graph"
-    description = "Show neighbouring facts in the knowledge graph."
-    args_hint = "ids (list[str], required); limit (int, optional); relation (str, optional)"
+    name = "memory.fetch_fact"
+    description = "Fetch a stored semantic fact by ID (accepts UUID prefix)."
+    args_hint = "id (str, required)"
     capabilities = frozenset({"memory:read"})
     parameters_schema = {
         "type": "object",
         "properties": {
-            "ids": {"type": "array", "items": {"type": "string"}, "minItems": 1},
-            "limit": {"type": "integer", "minimum": 1, "maximum": 20},
-            "relation": {"type": "string"},
+            "id": {"type": "string"},
         },
-        "required": ["ids"],
+        "required": ["id"],
+        "additionalProperties": False,
+    }
+
+    def run(self, *, agent=None, id: str) -> str:  # type: ignore[override]
+        identifier = (id or "").strip()
+        if not identifier:
+            raise ToolError("id parameter is required")
+        layered = _require_layered_memory(agent)
+        semantic = getattr(layered, "semantic", None)
+        if semantic is None:
+            raise ToolError("Semantic memory is not available")
+        try:
+            fact = semantic.resolve_fact(identifier)
+        except ValueError:
+            return (
+                "Multiple facts share that prefix. Please provide the full UUID."
+            )
+        if not fact:
+            return f"No fact found matching '{identifier}'."
+        fact_id = str(fact.get("id") or "")
+        text = str(fact.get("text", "")).strip()
+        lines: List[str] = [f"Fact {fact_id}: {text}"]
+        tags = fact.get("tags") or []
+        if tags:
+            lines.append(f"Tags: {', '.join(tags)}")
+        source = fact.get("source")
+        if source:
+            lines.append(f"Source: {source}")
+        confidence = fact.get("confidence")
+        quality = fact.get("quality")
+        uses = fact.get("uses")
+        stats_parts: List[str] = []
+        if quality is not None:
+            stats_parts.append(f"quality={float(quality):.2f}")
+        if confidence is not None:
+            stats_parts.append(f"confidence={float(confidence):.2f}")
+        if uses is not None:
+            stats_parts.append(f"uses={int(uses)}")
+        if stats_parts:
+            lines.append("Stats: " + ", ".join(stats_parts))
+        last_access = fact.get("last_access_ts")
+        if isinstance(last_access, (int, float)) and last_access > 0:
+            lines.append(f"Last accessed: {int(last_access)}")
+        return "\n".join(lines)
+
+
+class SaveFactTool(Tool):
+    """Persist a semantic fact into long-term memory."""
+
+    name = "memory.save_fact"
+    description = "Write a semantic fact with optional tags, quality, confidence, and source."
+    args_hint = "text (str, required); tags (list[str], optional); confidence (float, optional); quality (float, optional); source (str, optional)"
+    capabilities = frozenset({"memory:write"})
+    parameters_schema = {
+        "type": "object",
+        "properties": {
+            "text": {"type": "string"},
+            "tags": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+            "confidence": {"type": "number"},
+            "quality": {"type": "number"},
+            "source": {"type": "string"},
+        },
+        "required": ["text"],
         "additionalProperties": False,
     }
 
@@ -117,43 +172,36 @@ class ExploreKnowledgeTool(Tool):
         self,
         *,
         agent=None,
-        ids: Iterable[str],
-        limit: int = 10,
-        relation: Optional[str] = None,
+        text: str,
+        tags: Optional[Sequence[str]] = None,
+        confidence: Optional[float] = None,
+        quality: Optional[float] = None,
+        source: Optional[str] = None,
     ) -> str:  # type: ignore[override]
+        normalized = (text or "").strip()
+        if not normalized:
+            raise ToolError("text parameter is required")
         layered = _require_layered_memory(agent)
-        ids = [str(item).strip() for item in ids if str(item).strip()]
-        if not ids:
-            raise ToolError("ids must contain at least one fact identifier")
-        relation_filter = (relation or "").strip().lower()
-        limit = max(1, min(int(limit or 0), 20))
-        lines: List[str] = []
-        count = 0
-        for fact_id in ids:
-            fact = layered.semantic.get_fact(fact_id)
-            if not fact:
-                lines.append(f"- Fact {fact_id} not found.")
-                continue
-            title = str(fact.get("text", ""))[:120]
-            lines.append(f"Fact {fact_id}: {title}")
-            neighbors = layered.semantic.graph.links_for(fact_id)
-            if relation_filter:
-                neighbors = [link for link in neighbors if str(link.get("type", "")).lower() == relation_filter]
-            if not neighbors:
-                lines.append("  (no linked facts)")
-                continue
-            for link in neighbors:
-                if count >= limit:
-                    break
-                target = link.get("target")
-                relation_name = link.get("type") or "related"
-                target_fact = layered.semantic.get_fact(target) if target else None
-                summary = (target_fact or {}).get("text", "")
-                lines.append(f"  - {relation_name} → {str(target)[:8]}: {str(summary)[:160]}")
-                count += 1
-            if count >= limit:
-                break
-        return "\n".join(lines) if lines else "No graph links available."
+        clean_tags = [str(tag).strip() for tag in (tags or []) if str(tag).strip()]
+        fact = layered.semantic.add_fact(
+            normalized,
+            source=source.strip() if source and source.strip() else None,
+            confidence=confidence,
+            quality=quality,
+            tags=clean_tags,
+        )
+        if not fact:
+            return "No fact stored (input was empty or rejected)."
+        fact_id = str(fact.get("id") or "")[:8]
+        applied_tags = fact.get("tags") or []
+        tag_part = f" tags: {', '.join(applied_tags[:3])}" if applied_tags else ""
+        status = "updated" if fact.get("uses", 0) else "stored"
+        return f"Fact {status}: ({fact_id}) {fact.get('text', '')[:220]}{tag_part}"
 
 
-__all__ = ["SearchEpisodesTool", "SearchFactsTool", "ExploreKnowledgeTool"]
+__all__ = [
+    "SearchEpisodesTool",
+    "SearchFactsTool",
+    "FetchFactTool",
+    "SaveFactTool",
+]

@@ -191,6 +191,29 @@ class ConversationShell:
         if self._live is not None:
             self._live.update(self.render())
 
+    def reset(self, *, status: str = "Atlas ready.") -> None:
+        """Clear local conversation state."""
+        self.turns.clear()
+        self.tool_drawer.clear()
+        self.pinned_turns.clear()
+        self.quick_actions.clear()
+        self.timeline_snapshots.clear()
+        self.context_usage = {"turns": 0, "capacity": self.context_usage.get("capacity", 1)}
+        self.status_message = status
+        self.objective = None
+        self.tags = []
+        self.scroll_offset = 0
+        self.auto_scroll = True
+        self._active_tool_chip = None
+        self.memory_events.clear()
+        self.memory_stats.update({
+            "episodic_count": 0,
+            "semantic_count": 0,
+            "reflections_count": 0,
+            "last_harvest": None,
+        })
+        self.refresh()
+
     def add_turn(self, user_text: str) -> ConversationTurn:
         turn = ConversationTurn(turn_id=len(self.turns) + 1, user_text=user_text)
         turn.status = "thinking"

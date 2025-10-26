@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 from typing import List
+import re
 
 import pytest
 
 from atlas_main.agent import AtlasAgent
+from atlas_main.memory import WorkingMemoryConfig
 from atlas_main.tools import (
     ToolError,
     WebSearchTool,
@@ -15,6 +17,8 @@ from atlas_main.tools import (
     ShellCommandTool,
     ToolRegistry,
 )
+from atlas_main.tools_memory import FetchFactTool
+from atlas_main.memory_layers import SemanticMemory
 
 
 class _FakeResponse:
@@ -278,6 +282,28 @@ def test_tool_policy_deny(monkeypatch, tmp_path) -> None:
     monkeypatch.delenv("ATLAS_TOOL_POLICY", raising=False)
 
 
+def test_fetch_fact_tool_returns_full_fact(tmp_path) -> None:
+    semantic_path = tmp_path / "semantic.json"
+    semantic = SemanticMemory(semantic_path, embed_fn=None)
+    fact = semantic.add_fact("Atlas remembers shipped features", tags=["release"])
+
+    class _LM:
+        def __init__(self, semantic_memory):
+            self.semantic = semantic_memory
+
+    class _Agent:
+        def __init__(self, layered_memory):
+            self.layered_memory = layered_memory
+
+    agent = _Agent(_LM(semantic))
+    tool = FetchFactTool()
+
+    output = tool.run(agent=agent, id=fact["id"][:8])
+
+    assert "Atlas remembers shipped features" in output
+    assert fact["id"][:8] in output
+
+
 def test_tool_policy_allow_noninteractive(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("ATLAS_TOOL_POLICY", "ask")
     monkeypatch.setenv("ATLAS_TOOL_POLICY_NONINTERACTIVE", "allow")
@@ -315,15 +341,109 @@ def test_memory_tools_return_relevant_results(tmp_path, monkeypatch):
         lm.episodic.log("tailscale question", "tailscale answer", metadata={"tags": ["tailscale"]})
         fact = lm.semantic.add_fact("Tailscale is a mesh VPN service", tags=["tailscale"])
         other = lm.semantic.add_fact("WireGuard forms encrypted tunnels", tags=["vpn"])
-        if fact and other:
-            lm.semantic.graph.rebuild([fact, other])
+        # graph functionality removed; no rebuild step
         output_ep = agent.tools.run("memory.search_episodes", agent=agent, arguments={"query": "tailscale", "limit": 3})
         assert "tailscale" in output_ep.lower()
         output_fact = agent.tools.run("memory.search_facts", agent=agent, arguments={"query": "tailscale", "limit": 3})
         assert "mesh vpn" in output_fact.lower()
-        if fact and other:
-            output_graph = agent.tools.run("memory.explore_graph", agent=agent, arguments={"ids": [fact["id"]]})
-            assert fact["id"][:8] in output_graph
+        # graph exploration removed; skip explore_graph tool
     finally:
         agent.close()
     monkeypatch.delenv("ATLAS_MEMORY_DIR", raising=False)
+
+
+def test_memory_save_fact_tool(tmp_path, monkeypatch):
+    monkeypatch.setenv("ATLAS_MEMORY_DIR", str(tmp_path / "memory"))
+    agent = AtlasAgent(_StubClient())
+    try:
+        arguments = {
+            "text": "Tailscale status must be checked before reporting IPs",
+            "tags": ["tailscale", "workflow"],
+            "confidence": 0.9,
+        }
+        result = agent.tools.run("memory.save_fact", agent=agent, arguments=arguments)
+        assert "Fact" in result
+        follow_up = agent.tools.run(
+            "memory.search_facts",
+            agent=agent,
+            arguments={"query": "tailscale status", "limit": 3},
+        )
+        assert "tailscale status" in follow_up.lower()
+    finally:
+        agent.close()
+    monkeypatch.delenv("ATLAS_MEMORY_DIR", raising=False)
+
+
+def test_memory_fact_persists_across_restart(tmp_path, monkeypatch):
+    monkeypatch.setenv("ATLAS_MEMORY_DIR", str(tmp_path / "memory"))
+    fact_text = "Mac Mini 2 IP addresses come from `tailscale status`."
+    tags = ["mac-mini-2", "tailscale", "ip"]
+
+    agent = AtlasAgent(_StubClient())
+    try:
+        result = agent.tools.run(
+            "memory.save_fact",
+            agent=agent,
+            arguments={"text": fact_text, "tags": tags, "confidence": 0.95},
+        )
+        assert "fact" in result.lower()
+        match = re.search(r"\(([0-9a-fA-F-]{8,})\)", result)
+        assert match, "expected fact id in save_fact output"
+        fact_id = match.group(1)
+    finally:
+        agent.close()
+
+    agent_reloaded = AtlasAgent(_StubClient())
+    try:
+        fetched = agent_reloaded.tools.run(
+            "memory.fetch_fact",
+            agent=agent_reloaded,
+            arguments={"id": fact_id[:8]},
+        )
+        assert fact_text in fetched
+    finally:
+        agent_reloaded.close()
+
+    monkeypatch.delenv("ATLAS_MEMORY_DIR", raising=False)
+
+
+def test_working_memory_compaction_triggers_near_threshold(monkeypatch, tmp_path):
+    monkeypatch.setenv("ATLAS_MEMORY_DIR", str(tmp_path / "memory"))
+    monkeypatch.setenv("ATLAS_KV_CACHE", "0")
+    monkeypatch.setenv("ATLAS_COMPACT_THRESHOLD", "80")
+    monkeypatch.setenv("ATLAS_COMPACT_TARGET", "55")
+    monkeypatch.setenv("ATLAS_COMPACT_MIN_PREFIX", "3")
+    monkeypatch.setenv("ATLAS_CONTEXT_WINDOW", "1200")
+    monkeypatch.setenv("ATLAS_CONTEXT_SAFETY", "0")
+
+    config = WorkingMemoryConfig(max_turns=20, token_budget=120, enable_token_awareness=True)
+    agent = AtlasAgent(_StubClient(), working_memory_config=config)
+    try:
+        payload = "chat turn " + ("ABCD" * 30)  # ~120 chars ≈ 30 tokens
+        for _ in range(6):
+            agent.working_memory.add_user(payload)
+
+        stats = agent.working_memory.get_stats()
+        assert stats["token_pct"] > 80
+
+        compacted = agent._maybe_compact_working_memory(stats, None)
+        assert compacted
+
+        messages = agent.working_memory.to_messages()
+        assert messages
+        first = messages[0]
+        assert first.get("summary") is True
+        assert first.get("pinned") is True
+    finally:
+        agent.close()
+
+    for name in [
+        "ATLAS_MEMORY_DIR",
+        "ATLAS_KV_CACHE",
+        "ATLAS_COMPACT_THRESHOLD",
+        "ATLAS_COMPACT_TARGET",
+        "ATLAS_COMPACT_MIN_PREFIX",
+        "ATLAS_CONTEXT_WINDOW",
+        "ATLAS_CONTEXT_SAFETY",
+    ]:
+        monkeypatch.delenv(name, raising=False)

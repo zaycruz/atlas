@@ -35,6 +35,7 @@ class Telemetry:
         self._tool_metrics: Dict[str, Dict[str, Deque[float] | int]] = {}
         self._compactions = 0
         self._snapshot_records: Deque[Tuple[int, int]] = deque(maxlen=200)
+        self._layer_breakdown: Deque[Tuple[int, int, int, int, int, int, bool]] = deque(maxlen=200)
 
     @classmethod
     def instance(cls) -> "Telemetry":
@@ -81,12 +82,36 @@ class Telemetry:
         with self._data_lock:
             self._snapshot_records.append((before, after))
 
+    def record_memory_layers(
+        self,
+        *,
+        before: int,
+        episodic: int,
+        facts: int,
+        reflections: int,
+        total: int,
+        budget: int,
+        trimmed: bool,
+    ) -> None:
+        if not self.enabled:
+            return
+        before = max(0, int(before))
+        episodic = max(0, int(episodic))
+        facts = max(0, int(facts))
+        reflections = max(0, int(reflections))
+        total = max(0, int(total))
+        budget = max(1, int(budget))
+        trimmed = bool(trimmed)
+        with self._data_lock:
+            self._layer_breakdown.append((before, episodic, facts, reflections, total, budget, trimmed))
+
     def reset(self) -> None:
         with self._data_lock:
             self._turn_durations.clear()
             self._tool_metrics.clear()
             self._compactions = 0
             self._snapshot_records.clear()
+            self._layer_breakdown.clear()
 
     def stats(self) -> Dict[str, Dict]:
         with self._data_lock:
@@ -101,6 +126,7 @@ class Telemetry:
                 }
                 for name, metrics in self._tool_metrics.items()
             }
+            layer_list = list(self._layer_breakdown)
 
         turn_stats = {
             "count": len(turn_list),
@@ -124,9 +150,52 @@ class Telemetry:
         else:
             snapshot_stats.update({"avg_before": 0.0, "avg_after": 0.0, "avg_saved": 0.0})
 
+        layer_stats: Dict[str, float] = {"count": len(layer_list)}
+        if layer_list:
+            episodic_vals = []
+            fact_vals = []
+            reflection_vals = []
+            total_vals = []
+            budget_vals = []
+            saved_vals = []
+            trimmed_count = 0
+            for before, episodic, facts, reflections, total, budget, trimmed in layer_list:
+                episodic_vals.append(float(episodic))
+                fact_vals.append(float(facts))
+                reflection_vals.append(float(reflections))
+                total_vals.append(float(total))
+                budget_vals.append(max(1.0, float(budget)))
+                saved_vals.append(max(float(before) - float(total), 0.0))
+                if trimmed:
+                    trimmed_count += 1
+            layer_stats.update(
+                {
+                    "avg_episodic": mean(episodic_vals),
+                    "avg_facts": mean(fact_vals),
+                    "avg_reflections": mean(reflection_vals),
+                    "avg_total": mean(total_vals),
+                    "avg_saved": mean(saved_vals),
+                    "avg_budget_utilization_pct": mean((total / budget) * 100.0 for total, budget in zip(total_vals, budget_vals)),
+                    "trimmed_ratio": trimmed_count / len(layer_list),
+                }
+            )
+        else:
+            layer_stats.update(
+                {
+                    "avg_episodic": 0.0,
+                    "avg_facts": 0.0,
+                    "avg_reflections": 0.0,
+                    "avg_total": 0.0,
+                    "avg_saved": 0.0,
+                    "avg_budget_utilization_pct": 0.0,
+                    "trimmed_ratio": 0.0,
+                }
+            )
+
         return {
             "turns": turn_stats,
             "tools": tool_snapshot,
             "compactions": {"count": self._compactions},
             "snapshots": snapshot_stats,
+            "memory_layers": layer_stats,
         }
