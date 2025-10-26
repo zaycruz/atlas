@@ -7,6 +7,7 @@ import re
 
 import pytest
 
+import atlas_main.tools as tools_module
 from atlas_main.agent import AtlasAgent
 from atlas_main.memory import WorkingMemoryConfig
 from atlas_main.tools import (
@@ -226,6 +227,31 @@ def test_alpaca_account_tool_fetches_account_snapshot(monkeypatch) -> None:
         "https://example.com/v2/orders",
     ]
     assert session.kwargs[2]["params"]["status"] == "all"
+
+
+def test_alpaca_account_tool_loads_credentials_from_dotenv(tmp_path, monkeypatch) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("APCA_API_KEY_ID=from_env\nAPCA_API_SECRET_KEY=from_secret\n")
+
+    monkeypatch.delenv("APCA_API_KEY_ID", raising=False)
+    monkeypatch.delenv("APCA_API_SECRET_KEY", raising=False)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(tools_module, "_ALPACA_DOTENV_LOADED", False, raising=False)
+
+    session = _FakeSession(
+        [
+            _FakeResponse("", json_data={}),
+            _FakeResponse("", json_data=[]),
+            _FakeResponse("", json_data=[]),
+        ]
+    )
+    tool = AlpacaAccountTool(session=session, base_url="https://example.com")
+
+    tool.run()
+
+    headers = session.kwargs[0]["headers"]
+    assert headers["APCA-API-KEY-ID"] == "from_env"
+    assert headers["APCA-API-SECRET-KEY"] == "from_secret"
 
 
 def test_alpaca_account_tool_requires_credentials(monkeypatch) -> None:

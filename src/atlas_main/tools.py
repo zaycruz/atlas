@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
+from dotenv import find_dotenv, load_dotenv
 
 from .safety import redact_mapping, redact_text
 from .telemetry import Telemetry
@@ -36,6 +37,26 @@ from .agents import AgentFactory
 USER_AGENT = "AtlasLite/1.0 (+https://github.com)"
 DEFAULT_FILE_CHUNK = 6000
 MAX_SHELL_OUTPUT = 4000
+
+
+_ALPACA_DOTENV_LOADED = False
+
+
+def _resolve_alpaca_dotenv_path() -> str:
+    try:
+        return find_dotenv(usecwd=True)
+    except Exception:
+        return ""
+
+
+def _load_alpaca_credentials_from_dotenv() -> None:
+    global _ALPACA_DOTENV_LOADED
+    if _ALPACA_DOTENV_LOADED:
+        return
+    path = _resolve_alpaca_dotenv_path()
+    if path:
+        load_dotenv(path, override=False)
+    _ALPACA_DOTENV_LOADED = True
 
 
 class ToolError(RuntimeError):
@@ -1257,6 +1278,7 @@ class AlpacaAccountTool(Tool):
         order_limit: int = 50,
         order_direction: str = "desc",
     ) -> str:  # type: ignore[override]
+        _load_alpaca_credentials_from_dotenv()
         key_id = (os.getenv("APCA_API_KEY_ID") or "").strip()
         secret_key = (os.getenv("APCA_API_SECRET_KEY") or "").strip()
         if not key_id or not secret_key:

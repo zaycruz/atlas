@@ -30,7 +30,33 @@ class Orchestrator:
         step_results: list[StepResult] = []
         task_failed = False
 
-        for step in task.steps:
+        # Naive DAG execution: run steps in topological order by repeatedly
+        # selecting ready steps (all dependencies satisfied). For now, execute
+        # sequentially even if multiple are ready; easy to parallelize later.
+        executed: set[str] = set()
+        steps_by_id = {s.id: s for s in task.steps}
+        pending = list(task.steps)
+        while pending:
+            # pick next ready step
+            ready_index = None
+            for idx, step in enumerate(pending):
+                deps = set(getattr(step, "depends_on", []) or [])
+                if deps.issubset(executed):
+                    ready_index = idx
+                    break
+            if ready_index is None:
+                # Cycle or missing dependency; fail gracefully
+                for step in pending:
+                    skipped = StepResult(
+                        step_id=step.id,
+                        status="failed",
+                        summary="Dependency cycle or unsatisfied dependency",
+                    )
+                    step_results.append(skipped)
+                task_failed = True
+                break
+
+            step = pending.pop(ready_index)
             if task_failed:
                 skipped = StepResult(
                     step_id=step.id,
@@ -130,6 +156,7 @@ class Orchestrator:
                 shared_updates = result.metadata.get("shared_updates")
                 if isinstance(shared_updates, dict):
                     shared_context.update(shared_updates)
+                executed.add(step.id)
             else:
                 task_failed = True
 

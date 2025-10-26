@@ -27,6 +27,7 @@ class StepSpec:
     agent_id: str
     inputs: Dict[str, Any] = field(default_factory=dict)
     tags: List[str] = field(default_factory=list)
+    depends_on: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -54,6 +55,15 @@ class TaskSpec:
     steps: List[StepSpec]
     shared_context: Dict[str, Any] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class Plan:
+    """High-level plan before execution (DAG)."""
+
+    objective: str
+    steps: List[StepSpec]
+    notes: str = ""
 
 
 @dataclass
