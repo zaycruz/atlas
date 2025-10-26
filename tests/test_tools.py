@@ -19,6 +19,7 @@ from atlas_main.tools import (
     ShellCommandTool,
     CurrentTimeTool,
     AlpacaAccountTool,
+    AlpacaOrderTool,
     ToolRegistry,
 )
 from atlas_main.tools_memory import FetchFactTool
@@ -46,6 +47,13 @@ class _FakeSession:
         self.kwargs: list[dict] = []
 
     def get(self, url: str, *_, **kwargs) -> _FakeResponse:  # pragma: no cover - simple passthrough
+        self.calls.append(url)
+        self.kwargs.append(kwargs)
+        if not self._responses:
+            raise AssertionError("FakeSession received more calls than prepared responses")
+        return self._responses.pop(0)
+
+    def post(self, url: str, *_, **kwargs) -> _FakeResponse:  # pragma: no cover - simple passthrough
         self.calls.append(url)
         self.kwargs.append(kwargs)
         if not self._responses:
@@ -275,6 +283,95 @@ def test_alpaca_account_tool_reports_http_error(monkeypatch) -> None:
         tool.run()
 
     assert "401" in str(exc.value)
+
+
+def test_alpaca_order_tool_submits_limit_order(monkeypatch) -> None:
+    session = _FakeSession(
+        [
+            _FakeResponse(
+                "",
+                json_data={
+                    "id": "order-123",
+                    "symbol": "AAPL",
+                    "qty": "5",
+                    "side": "buy",
+                    "type": "limit",
+                    "status": "accepted",
+                    "time_in_force": "day",
+                    "limit_price": "125",
+                    "submitted_at": "2024-05-01T12:30:00Z",
+                },
+            )
+        ]
+    )
+    tool = AlpacaOrderTool(session=session, base_url="https://example.com")
+    monkeypatch.setenv("APCA_API_KEY_ID", "key")
+    monkeypatch.setenv("APCA_API_SECRET_KEY", "secret")
+
+    output = tool.run(
+        symbol="AAPL",
+        side="buy",
+        qty=5,
+        order_type="limit",
+        limit_price="125",
+        time_in_force="day",
+    )
+
+    assert "Alpaca Order Submission" in output
+    assert "BUY 5 AAPL LIMIT" in output
+    assert "Status: accepted" in output
+    assert session.calls == ["https://example.com/v2/orders"]
+
+    request_kwargs = session.kwargs[0]
+    headers = request_kwargs["headers"]
+    payload = request_kwargs["json"]
+    assert headers["APCA-API-KEY-ID"] == "key"
+    assert headers["APCA-API-SECRET-KEY"] == "secret"
+    assert payload["symbol"] == "AAPL"
+    assert payload["qty"] == "5"
+    assert payload["limit_price"] == "125"
+    assert payload["time_in_force"] == "day"
+
+
+def test_alpaca_order_tool_requires_qty_or_notional(monkeypatch) -> None:
+    tool = AlpacaOrderTool(session=_FakeSession([]))
+    monkeypatch.setenv("APCA_API_KEY_ID", "key")
+    monkeypatch.setenv("APCA_API_SECRET_KEY", "secret")
+
+    with pytest.raises(ToolError):
+        tool.run(symbol="AAPL", side="buy")
+
+
+def test_alpaca_order_tool_requires_limit_price_for_limit(monkeypatch) -> None:
+    tool = AlpacaOrderTool(session=_FakeSession([]))
+    monkeypatch.setenv("APCA_API_KEY_ID", "key")
+    monkeypatch.setenv("APCA_API_SECRET_KEY", "secret")
+
+    with pytest.raises(ToolError):
+        tool.run(symbol="AAPL", side="buy", qty=1, order_type="limit")
+
+
+def test_alpaca_order_tool_requires_credentials(monkeypatch) -> None:
+    monkeypatch.delenv("APCA_API_KEY_ID", raising=False)
+    monkeypatch.delenv("APCA_API_SECRET_KEY", raising=False)
+    tool = AlpacaOrderTool(session=_FakeSession([]))
+
+    with pytest.raises(ToolError):
+        tool.run(symbol="AAPL", side="buy", qty=1)
+
+
+def test_alpaca_order_tool_reports_http_error(monkeypatch) -> None:
+    session = _FakeSession([
+        _FakeResponse("", status_code=422, json_data={"message": "insufficient shares"})
+    ])
+    tool = AlpacaOrderTool(session=session, base_url="https://example.com")
+    monkeypatch.setenv("APCA_API_KEY_ID", "key")
+    monkeypatch.setenv("APCA_API_SECRET_KEY", "secret")
+
+    with pytest.raises(ToolError) as exc:
+        tool.run(symbol="AAPL", side="sell", qty=5)
+
+    assert "422" in str(exc.value)
 
 
 def test_parse_markdown_results_skips_media_blocks() -> None:

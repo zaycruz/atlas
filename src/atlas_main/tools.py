@@ -15,11 +15,11 @@ import time
 import shutil
 import sys
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import requests
 from dotenv import find_dotenv, load_dotenv
@@ -28,7 +28,10 @@ from .safety import redact_mapping, redact_text
 from .telemetry import Telemetry
 from .tools_browser import BrowserSession, DEFAULT_BUDGET, DEFAULT_TOPN
 from .orchestrator.engine import Orchestrator
-from .orchestrator.types import TaskSpec, StepSpec
+from .orchestrator.parallel_engine import ParallelOrchestrator
+from .orchestrator.planner import IntelligentPlanner
+from .orchestrator.branches import BranchStrategy
+from .orchestrator.types import EnhancedPlan, EnhancedStepSpec, TaskSpec, StepSpec
 from .agents.base import ConversationMessage, StreamingAgentSession
 from .agents.common import git_status
 from .agents import AgentFactory
@@ -532,6 +535,137 @@ class DelegateTaskTool(Tool):
                 report_lines.append("Logs:\n" + "\n".join(log_tail))
 
         return "\n".join(report_lines)
+
+
+class PlanAndExecuteTool(Tool):
+    """Plan complex objectives with a reasoning agent and execute them in parallel."""
+
+    name = "plan_and_execute"
+    description = (
+        "Collaborate with a planner agent to decompose a complex objective, then execute the plan "
+        "with parallel coding agents. Use this for multi-step features, refactors, or large changes."
+    )
+    args_hint = (
+        "objective=<text> repo_path=/path/to/repo max_parallel=4 planner_agent_id=planner-deepseek"
+    )
+    capabilities = frozenset({"filesystem", "process"})
+    parameters_schema: Dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "objective": {
+                "type": "string",
+                "description": "High-level description of the desired outcome.",
+            },
+            "repo_path": {
+                "type": "string",
+                "description": "Filesystem path to the git repository (defaults to current directory).",
+            },
+            "max_parallel": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 8,
+                "description": "Maximum number of concurrent steps (default 4).",
+            },
+            "planner_agent_id": {
+                "type": "string",
+                "description": "Reasoning planner agent id (default planner-deepseek).",
+            },
+        },
+        "required": ["objective"],
+        "additionalProperties": False,
+    }
+
+    def __init__(
+        self,
+        agent_factory: Optional[AgentFactory] = None,
+        *,
+        branch_strategy_factory: Optional[Callable[[str], BranchStrategy]] = None,
+        planner_factory: Optional[Callable[[str], IntelligentPlanner]] = None,
+        orchestrator_factory: Optional[Callable[[Optional[BranchStrategy], int], ParallelOrchestrator]] = None,
+    ) -> None:
+        self._agent_factory = agent_factory or AgentFactory()
+        self._branch_strategy_factory = branch_strategy_factory or (lambda path: BranchStrategy(Path(path)))
+        self._planner_factory = planner_factory or self._default_planner_factory
+        self._orchestrator_factory = orchestrator_factory or self._default_orchestrator_factory
+
+    def run(self, *, agent=None, **kwargs: Any) -> str:  # type: ignore[override]
+        objective = kwargs.get("objective")
+        if not objective or not isinstance(objective, str):
+            raise ToolError("'objective' must be provided as a string")
+        repo_raw = kwargs.get("repo_path")
+        repo = Path(repo_raw).expanduser() if isinstance(repo_raw, str) and repo_raw.strip() else Path.cwd()
+        if not repo.exists() or not repo.is_dir():
+            raise ToolError(f"Repository path does not exist: {repo}")
+
+        max_parallel = int(kwargs.get("max_parallel", 4))
+        if max_parallel < 1:
+            raise ToolError("max_parallel must be >= 1")
+        planner_agent_id = str(kwargs.get("planner_agent_id", "planner-deepseek"))
+
+        return asyncio.run(
+            self._execute_plan(
+                objective=objective,
+                repo_path=str(repo),
+                planner_agent_id=planner_agent_id,
+                max_parallel=max_parallel,
+            )
+        )
+
+    async def _execute_plan(
+        self,
+        *,
+        objective: str,
+        repo_path: str,
+        planner_agent_id: str,
+        max_parallel: int,
+    ) -> str:
+        planner = self._planner_factory(planner_agent_id)
+        plan = await planner.plan(objective=objective, repo_path=repo_path)
+
+        branch_strategy = None
+        if self._requires_branching(plan):
+            branch_strategy = self._branch_strategy_factory(repo_path)
+
+        orchestrator = self._orchestrator_factory(branch_strategy, max_parallel)
+        task_spec = TaskSpec(
+            id=f"plan-{uuid.uuid4().hex[:8]}",
+            objective=objective,
+            steps=list(plan.steps),
+            shared_context={"plan": asdict(plan)},
+        )
+
+        result = await orchestrator.run_task(task_spec)
+        if not result.succeeded:
+            failed_steps = [r.step_id for r in result.step_results if r and not r.succeeded]
+            raise ToolError(
+                "Plan execution failed" + (f" for steps: {', '.join(failed_steps)}" if failed_steps else ".")
+            )
+        return f"Plan executed successfully with {len(result.step_results)} steps."
+
+    @staticmethod
+    def _requires_branching(plan: EnhancedPlan) -> bool:
+        for step in plan.steps:
+            cfg = getattr(step, "branch_config", None)
+            if cfg:
+                return True
+        return False
+
+    def _default_planner_factory(self, planner_agent_id: str) -> IntelligentPlanner:
+        return IntelligentPlanner(
+            self._agent_factory,
+            planner_agent_id=planner_agent_id,
+        )
+
+    def _default_orchestrator_factory(
+        self,
+        branch_strategy: Optional[BranchStrategy],
+        max_parallel: int,
+    ) -> ParallelOrchestrator:
+        return ParallelOrchestrator(
+            self._agent_factory,
+            branch_strategy=branch_strategy,
+            max_parallel=max_parallel,
+        )
 
 
 _AGENT_SESSION_REGISTRY: Dict[str, Dict[str, Any]] = {}
@@ -2478,4 +2612,5 @@ __all__ += [
     "AgentSessionTool",
     "AgentSessionViewerTool",
     "AlpacaAccountTool",
+    "AlpacaOrderTool",
 ]
