@@ -49,6 +49,10 @@ PYTHONPATH=src python3 -m atlas_main.cli orchestrate \
   "Ship pagination support for the API"
 ```
 
+Inside the interactive chat, Atlas now exposes a `delegate_task` tool. When you ask for significant repo updates, Atlas will confirm the objective, gather the repo path, and launch the orchestrator automatically—streaming step progress back into the conversation.
+
+For hands-on collaboration, use the new `agent_session` tool: Atlas can open a streaming loop with Codex/Claude/Droid, exchange follow-up messages, and close the session once the task is complete.
+
 ### Ollama requirements
 
 Atlas expects a local Ollama daemon on `http://localhost:11434`. To use different models, set environment variables before launching:

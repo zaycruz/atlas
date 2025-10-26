@@ -30,9 +30,12 @@ from .tools import (
     ListDirectoryTool,
     ShellCommandTool,
     CurrentTimeTool,
+    AlpacaAccountTool,
     BrowserSearchTool,
     BrowserOpenTool,
     BrowserFindTool,
+    DelegateTaskTool,
+    AgentSessionTool,
 )
 from .tools_memory import (
     SearchEpisodesTool,
@@ -62,6 +65,9 @@ Operating posture:
 Tool guidance:
 - Prefer function-call tool invocations; fall back to inline tags like <<tool:web_search|{"query":"..."}>> only when necessary.
 - Lean on browser and web_search tools for external facts, shell_command for local state, and the memory tools to read/write long-term context.
+- When the user asks for substantive repository changes, confirm the objective and use delegate_task with the right repo path and agent list before proceeding.
+- When iterative collaboration or rapid feedback cycles are required, use agent_session to open a loop with codex/claude/droid, then drive the conversation until objectives are met and close the session.
+- Treat credentials and secrets as strictly confidential: never read `.env`, never echo keys, and instruct external agents to rely on environment variables or placeholders instead of asking for actual secrets.
 - After storing a fact, reference memory.search_facts (or search_episodes when relevant) on later requests so you can act without re-asking the user.
 
 Goal:
@@ -106,6 +112,9 @@ class AtlasAgent:
         self.tools.register(ListDirectoryTool())
         self.tools.register(WriteFileTool())
         self.tools.register(ShellCommandTool())
+        self.tools.register(DelegateTaskTool())
+        self.tools.register(AgentSessionTool())
+        self.tools.register(AlpacaAccountTool())
         self.tools.register(CurrentTimeTool())
         self.layered_memory_config = layered_memory_config or LayeredMemoryConfig()
         embed_fn = self._make_embed_fn(self.layered_memory_config.embed_model)

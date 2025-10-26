@@ -17,6 +17,7 @@ from atlas_main.tools import (
     ListDirectoryTool,
     ShellCommandTool,
     CurrentTimeTool,
+    AlpacaAccountTool,
     ToolRegistry,
 )
 from atlas_main.tools_memory import FetchFactTool
@@ -24,9 +25,15 @@ from atlas_main.memory_layers import SemanticMemory
 
 
 class _FakeResponse:
-    def __init__(self, text: str, status_code: int = 200) -> None:
+    def __init__(self, text: str, status_code: int = 200, json_data=None) -> None:
         self.text = text
         self.status_code = status_code
+        self._json = json_data
+
+    def json(self):  # pragma: no cover - trivial accessor
+        if self._json is None:
+            raise ValueError("No JSON payload available")
+        return self._json
 
 
 class _FakeSession:
@@ -35,9 +42,11 @@ class _FakeSession:
     def __init__(self, responses: List[_FakeResponse]) -> None:
         self._responses = list(responses)
         self.calls: list[str] = []
+        self.kwargs: list[dict] = []
 
-    def get(self, url: str, *_, **__) -> _FakeResponse:  # pragma: no cover - simple passthrough
+    def get(self, url: str, *_, **kwargs) -> _FakeResponse:  # pragma: no cover - simple passthrough
         self.calls.append(url)
+        self.kwargs.append(kwargs)
         if not self._responses:
             raise AssertionError("FakeSession received more calls than prepared responses")
         return self._responses.pop(0)
@@ -140,6 +149,106 @@ def test_current_time_tool_outputs_isoformatted_values() -> None:
     # fromisoformat validates the timestamps include timezone information
     datetime.fromisoformat(parsed["Local"])
     datetime.fromisoformat(parsed["UTC"])
+
+
+def test_alpaca_account_tool_fetches_account_snapshot(monkeypatch) -> None:
+    session = _FakeSession(
+        [
+            _FakeResponse(
+                "",
+                json_data={
+                    "status": "ACTIVE",
+                    "account_number": "123456789",
+                    "currency": "USD",
+                    "cash": "10000",
+                    "buying_power": "20000",
+                    "portfolio_value": "12000",
+                    "last_equity": "11800",
+                    "trading_blocked": False,
+                },
+            ),
+            _FakeResponse(
+                "",
+                json_data=[
+                    {
+                        "symbol": "AAPL",
+                        "qty": "10",
+                        "side": "long",
+                        "avg_entry_price": "120.50",
+                        "market_value": "1300",
+                        "unrealized_pl": "95",
+                        "unrealized_plpc": "0.073",
+                        "current_price": "130",
+                    }
+                ],
+            ),
+            _FakeResponse(
+                "",
+                json_data=[
+                    {
+                        "id": "order-1",
+                        "symbol": "AAPL",
+                        "qty": "5",
+                        "side": "buy",
+                        "type": "limit",
+                        "status": "accepted",
+                        "limit_price": "125",
+                        "filled_qty": "0",
+                        "created_at": "2024-05-01T12:30:00Z",
+                    },
+                    {
+                        "id": "order-2",
+                        "symbol": "TSLA",
+                        "qty": "2",
+                        "side": "sell",
+                        "type": "market",
+                        "status": "filled",
+                        "filled_qty": "2",
+                        "created_at": "2024-05-01T10:00:00Z",
+                    },
+                ],
+            ),
+        ]
+    )
+    tool = AlpacaAccountTool(session=session, base_url="https://example.com")
+    monkeypatch.setenv("APCA_API_KEY_ID", "key")
+    monkeypatch.setenv("APCA_API_SECRET_KEY", "secret")
+
+    output = tool.run(order_status="all", order_limit=2, order_direction="asc")
+
+    assert "Alpaca Account Overview:" in output
+    assert "Status: ACTIVE" in output
+    assert "- AAPL: 10 long" in output
+    assert "Recent Orders [status=all, direction=asc, limit=2] (2)" in output
+    assert session.calls == [
+        "https://example.com/v2/account",
+        "https://example.com/v2/positions",
+        "https://example.com/v2/orders",
+    ]
+    assert session.kwargs[2]["params"]["status"] == "all"
+
+
+def test_alpaca_account_tool_requires_credentials(monkeypatch) -> None:
+    monkeypatch.delenv("APCA_API_KEY_ID", raising=False)
+    monkeypatch.delenv("APCA_API_SECRET_KEY", raising=False)
+    tool = AlpacaAccountTool(session=_FakeSession([]))
+
+    with pytest.raises(ToolError):
+        tool.run()
+
+
+def test_alpaca_account_tool_reports_http_error(monkeypatch) -> None:
+    session = _FakeSession([
+        _FakeResponse("", status_code=401, json_data={"message": "Unauthorized"})
+    ])
+    tool = AlpacaAccountTool(session=session, base_url="https://example.com")
+    monkeypatch.setenv("APCA_API_KEY_ID", "key")
+    monkeypatch.setenv("APCA_API_SECRET_KEY", "secret")
+
+    with pytest.raises(ToolError) as exc:
+        tool.run()
+
+    assert "401" in str(exc.value)
 
 
 def test_parse_markdown_results_skips_media_blocks() -> None:

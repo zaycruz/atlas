@@ -14,6 +14,7 @@ import threading
 import time
 import shutil
 import sys
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
@@ -25,6 +26,11 @@ import requests
 from .safety import redact_mapping, redact_text
 from .telemetry import Telemetry
 from .tools_browser import BrowserSession, DEFAULT_BUDGET, DEFAULT_TOPN
+from .orchestrator.engine import Orchestrator
+from .orchestrator.types import TaskSpec, StepSpec
+from .agents.base import ConversationMessage, StreamingAgentSession
+from .agents.common import git_status
+from .agents import AgentFactory
 
 
 USER_AGENT = "AtlasLite/1.0 (+https://github.com)"
@@ -367,6 +373,411 @@ class CurrentTimeTool(Tool):
         )
 
 
+class DelegateTaskTool(Tool):
+    """Bridge to the multi-agent orchestrator."""
+
+    name = "delegate_task"
+    description = (
+        "Delegate a coding objective to external agents (Codex, Claude Code, Droid). "
+        "Use this when the user requests non-trivial repository changes, refactors, test runs, "
+        "or other tasks that benefit from automated coding agents."
+    )
+    args_hint = (
+        "objective=<text> repo_path=/path/to/repo agents=[codex,claude-code] allow_dirty=false "
+        "context={\"notes\":\"...\"}"
+    )
+    capabilities = frozenset({"filesystem", "process"})
+    parameters_schema: Dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "objective": {
+                "type": "string",
+                "description": "High-level description of the desired change.",
+            },
+            "repo_path": {
+                "type": "string",
+                "description": "Filesystem path to the git repository (defaults to current directory).",
+            },
+            "agents": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional ordered list of agent IDs to execute the task (e.g., codex, claude-code, droid).",
+            },
+            "allow_dirty": {
+                "type": "boolean",
+                "description": "Set true to run even when the working tree has local changes.",
+            },
+            "context": {
+                "type": "object",
+                "description": "Optional shared context injected into the orchestrator (JSON object).",
+            },
+        },
+        "required": ["objective"],
+        "additionalProperties": False,
+    }
+
+    def run(
+        self,
+        *,
+        agent=None,
+        objective: str,
+        repo_path: Optional[str] = None,
+        agents: Optional[List[str]] = None,
+        allow_dirty: bool = False,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        repo = Path(repo_path).expanduser() if repo_path else Path.cwd()
+        if not repo.exists() or not repo.is_dir():
+            raise ToolError(f"Repository path does not exist: {repo}")
+
+        agent_ids: List[str] = []
+        if agents:
+            for entry in agents:
+                if isinstance(entry, str) and entry.strip():
+                    agent_ids.append(entry.strip())
+                else:
+                    raise ToolError("agents must be a list of agent IDs (strings)")
+        if not agent_ids:
+            agent_ids = ["codex"]
+
+        task_id = f"chat-{uuid.uuid4().hex[:8]}"
+        steps: List[StepSpec] = []
+        for index, agent_id in enumerate(agent_ids, start=1):
+            step = StepSpec(
+                id=f"{task_id}-step-{index}",
+                description=objective,
+                agent_id=agent_id,
+                inputs={
+                    "repo_path": str(repo),
+                    "allow_dirty": bool(allow_dirty),
+                },
+            )
+            steps.append(step)
+
+        shared_context: Dict[str, Any] = context or {}
+
+        events: List[str] = []
+
+        def _handle_event(event) -> None:
+            etype = event.type
+            payload = event.payload
+            if etype == "task.started":
+                events.append(f"[orchestrator] Task started: {payload.get('objective','')}")
+            elif etype == "step.started":
+                events.append(
+                    f"[orchestrator] Step {payload.get('step_id')} started with agent {payload.get('agent_id')}: "
+                    f"{payload.get('description','')}"
+                )
+            elif etype == "step.completed":
+                events.append(
+                    f"[orchestrator] Step {payload.get('step_id')} completed with status {payload.get('status')}: "
+                    f"{payload.get('summary','')}"
+                )
+            elif etype == "step.skipped":
+                events.append(
+                    f"[orchestrator] Step {payload.get('step_id')} skipped: {payload.get('reason','')}"
+                )
+            elif etype == "task.completed":
+                events.append(f"[orchestrator] Task completed with status {payload.get('status')}")
+
+        orchestrator = Orchestrator(AgentFactory(), event_callback=_handle_event)
+        task_spec = TaskSpec(
+            id=task_id,
+            objective=objective,
+            steps=steps,
+            shared_context=shared_context,
+        )
+
+        try:
+            result = asyncio.run(orchestrator.run_task(task_spec))
+        except Exception as exc:
+            raise ToolError(f"Delegation failed: {exc}") from exc
+
+        report_lines: List[str] = list(events)
+        summary = f"Task {result.task_id} {'succeeded' if result.succeeded else 'failed'}."
+        report_lines.append(summary)
+
+        for step_result in result.step_results:
+            header = f"- {step_result.step_id} ({step_result.status}): {step_result.summary}"
+            report_lines.append(header)
+            for artifact in step_result.artifacts:
+                if artifact.kind == "patch" and artifact.content:
+                    snippet = artifact.content.strip()
+                    if len(snippet) > 2000:
+                        snippet = snippet[:2000] + "\n... (truncated)"
+                    report_lines.append("```diff\n" + snippet + "\n```")
+            if step_result.logs:
+                log_tail = [str(entry) for entry in step_result.logs[-5:]]
+                report_lines.append("Logs:\n" + "\n".join(log_tail))
+
+        return "\n".join(report_lines)
+
+
+_AGENT_SESSION_REGISTRY: Dict[str, Dict[str, Any]] = {}
+
+
+class AgentSessionTool(Tool):
+    """Manage interactive sessions with external coding agents."""
+
+    name = "agent_session"
+    description = (
+        "Start or continue a streaming conversation with a registered coding agent "
+        "(e.g., codex, claude-code, droid). "
+        "Use action=start to open a new session, action=send to continue, and action=close to end."
+    )
+    args_hint = (
+        "action=start|send|close session_id=<id> agent_id=codex repo_path=/path context={} "
+        "message='...' allow_dirty=false max_receive=5 receive_timeout=45"
+    )
+    capabilities = frozenset({"filesystem", "process"})
+    parameters_schema: Dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["start", "send", "close"],
+            },
+            "session_id": {"type": "string"},
+            "agent_id": {
+                "type": "string",
+                "description": "Adapter ID from config/agents.yaml (default codex).",
+            },
+            "repo_path": {
+                "type": "string",
+                "description": "Filesystem path to the git repository (defaults to current directory).",
+            },
+            "message": {
+                "type": "string",
+                "description": "Message to send to the agent.",
+            },
+            "objective": {
+                "type": "string",
+                "description": "High-level goal for the session (used when action=start).",
+            },
+            "allow_dirty": {
+                "type": "boolean",
+                "description": "Allow session to run on a dirty working tree.",
+            },
+            "context": {
+                "type": "object",
+                "description": "Optional JSON context shared with the agent.",
+            },
+            "max_receive": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 20,
+                "description": "Maximum number of agent messages to collect per call.",
+            },
+            "receive_timeout": {
+                "type": "number",
+                "minimum": 5,
+                "maximum": 300,
+                "description": "Per-message receive timeout in seconds.",
+            },
+        },
+        "required": ["action"],
+        "additionalProperties": False,
+    }
+
+    def __init__(self) -> None:
+        self._factory = AgentFactory()
+
+    def run(self, *, agent=None, **kwargs: Any) -> str:  # type: ignore[override]
+        action = (kwargs.get("action") or "").strip().lower()
+        if action not in {"start", "send", "close"}:
+            raise ToolError("action must be start, send, or close")
+        if action == "start":
+            return self._start_session(kwargs)
+        if action == "send":
+            return self._send_message(kwargs)
+        return self._close_session(kwargs)
+
+    def _start_session(self, params: Dict[str, Any]) -> str:
+        agent_id = (params.get("agent_id") or "codex").strip()
+        repo = Path(params.get("repo_path") or Path.cwd()).expanduser()
+        if not repo.exists() or not repo.is_dir():
+            raise ToolError(f"Repository path does not exist: {repo}")
+        allow_dirty = bool(params.get("allow_dirty"))
+        objective = (params.get("objective") or params.get("message") or "").strip()
+        if not objective:
+            raise ToolError("objective or message is required when starting a session")
+        shared_context = params.get("context") if isinstance(params.get("context"), dict) else {}
+        base_message = (params.get("message") or objective).strip()
+        security_notice = (
+            "Security reminder: do not request, read, or echo API keys or secrets. "
+            "Use environment variables (e.g., os.environ['APCA_API_KEY_ID']) or placeholders instead."
+        )
+        message_text = f"{base_message}\n\n{security_notice}"
+        max_receive = int(params.get("max_receive") or 5)
+        receive_timeout = float(params.get("receive_timeout") or 45.0)
+
+        status = asyncio.run(git_status(str(repo)))
+        if status and "\n" in status and not allow_dirty:
+            raise ToolError("Working tree is dirty. Commit/stash changes or set allow_dirty=true.")
+
+        step = StepSpec(
+            id=f"session-{uuid.uuid4().hex[:8]}",
+            description=objective,
+            agent_id=agent_id,
+            inputs={"repo_path": str(repo), "allow_dirty": allow_dirty},
+        )
+
+        async def _start_async() -> tuple[Any, StreamingAgentSession, List[ConversationMessage]]:
+            adapter = await self._factory.create(agent_id)
+            session = await adapter.open_session(
+                task=objective,
+                step=step,
+                shared_context=shared_context,
+            )
+            await session.send(
+                ConversationMessage(
+                    role="user",
+                    content=message_text,
+                    metadata={"kind": "objective"},
+                )
+            )
+            responses = await _drain_agent_messages(
+                session,
+                max_messages=max_receive,
+                timeout=receive_timeout,
+            )
+            return adapter, session, responses
+
+        try:
+            adapter, session, responses = asyncio.run(_start_async())
+        except Exception as exc:
+            raise ToolError(f"Failed to start agent session: {exc}") from exc
+
+        session_id = f"{agent_id}-{uuid.uuid4().hex[:8]}"
+        _AGENT_SESSION_REGISTRY[session_id] = {
+            "adapter": adapter,
+            "session": session,
+            "step": step,
+            "repo_path": str(repo),
+            "context": shared_context,
+        }
+
+        return self._format_response(
+            f"Session {session_id} started with agent {agent_id}.",
+            responses,
+            session_id=session_id,
+        )
+
+    def _send_message(self, params: Dict[str, Any]) -> str:
+        session_id = (params.get("session_id") or "").strip()
+        if not session_id:
+            if len(_AGENT_SESSION_REGISTRY) == 1:
+                session_id = next(iter(_AGENT_SESSION_REGISTRY))
+            else:
+                raise ToolError("session_id is required for action=send (multiple sessions active)")
+        handle = _AGENT_SESSION_REGISTRY.get(session_id)
+        if not handle:
+            raise ToolError(f"No active session with id '{session_id}'")
+        message_text = (params.get("message") or "").strip()
+        if not message_text:
+            raise ToolError("message is required for action=send")
+        max_receive = int(params.get("max_receive") or 5)
+        receive_timeout = float(params.get("receive_timeout") or 45.0)
+
+        session: StreamingAgentSession = handle["session"]
+
+        async def _send_async() -> List[ConversationMessage]:
+            await session.send(
+                ConversationMessage(
+                    role="user",
+                    content=message_text,
+                    metadata={"kind": "follow_up"},
+                )
+            )
+            return await _drain_agent_messages(
+                session,
+                max_messages=max_receive,
+                timeout=receive_timeout,
+            )
+
+        try:
+            responses = asyncio.run(_send_async())
+        except Exception as exc:
+            raise ToolError(f"Failed to exchange messages with session {session_id}: {exc}") from exc
+
+        return self._format_response(
+            f"Session {session_id} responded.",
+            responses,
+            session_id=session_id,
+        )
+
+    def _close_session(self, params: Dict[str, Any]) -> str:
+        session_id = (params.get("session_id") or "").strip()
+        if not session_id:
+            if len(_AGENT_SESSION_REGISTRY) == 1:
+                session_id = next(iter(_AGENT_SESSION_REGISTRY))
+            else:
+                raise ToolError("session_id is required for action=close (multiple sessions active)")
+        handle = _AGENT_SESSION_REGISTRY.pop(session_id, None)
+        if not handle:
+            return f"Session {session_id} was not active."
+        session: StreamingAgentSession = handle["session"]
+        adapter = handle["adapter"]
+
+        async def _close_async() -> None:
+            try:
+                await session.close()
+            finally:
+                close = getattr(adapter, "close", None)
+                if close:
+                    maybe = close()
+                    if asyncio.iscoroutine(maybe):
+                        await maybe  # type: ignore[func-returns-value]
+
+        try:
+            asyncio.run(_close_async())
+        except Exception:
+            pass
+        return f"Session {session_id} closed."
+
+    def _format_response(
+        self,
+        header: str,
+        responses: List[ConversationMessage],
+        *,
+        session_id: Optional[str] = None,
+    ) -> str:
+        lines = [header]
+        if session_id:
+            lines.append(f"session_id={session_id}")
+        if not responses:
+            lines.append("(no response yet)")
+            return "\n".join(lines)
+        for message in responses:
+            role = message.role or "assistant"
+            content = message.content.strip()
+            if not content:
+                continue
+            prefix = f"{role}:"
+            lines.append(f"{prefix} {content}")
+        return "\n".join(lines)
+
+
+async def _drain_agent_messages(
+    session: StreamingAgentSession,
+    *,
+    max_messages: int,
+    timeout: float,
+) -> List[ConversationMessage]:
+    messages: List[ConversationMessage] = []
+    for _ in range(max_messages):
+        message = await session.receive(timeout=timeout)
+        if message is None:
+            break
+        messages.append(message)
+        if message.metadata.get("done") or message.metadata.get("final"):
+            break
+        if message.role == "assistant":
+            # default heuristics: single assistant turn
+            break
+    return messages
+
+
 class WebSearchTool(Tool):
     """Web search with Crawl4AI-powered content extraction."""
 
@@ -606,6 +1017,7 @@ class WebSearchTool(Tool):
         stripped = re.sub(r"\s+", " ", stripped)
         return stripped
 
+
     def _search_duckduckgo(self, query: str) -> List[Dict[str, Any]]:
         """Fallback search using DuckDuckGo via jina.ai."""
         encoded = requests.utils.quote(query, safe="")
@@ -810,6 +1222,268 @@ class WebSearchTool(Tool):
         if trimmed[-1] not in ".!?":
             return trimmed + "."
         return trimmed
+
+
+class AlpacaAccountTool(Tool):
+    """Fetch account, position, and order details from Alpaca Markets."""
+
+    name = "alpaca_account"
+    description = (
+        "Retrieve account status, open positions, and recent orders from the Alpaca Markets trading API."
+    )
+    args_hint = (
+        "order_status (str, optional, default 'open'); order_limit (int, optional, default 50); "
+        "order_direction (str, optional, default 'desc')"
+    )
+    capabilities = frozenset({"net:http"})
+
+    def __init__(
+        self,
+        *,
+        session: Optional[requests.Session] = None,
+        base_url: Optional[str] = None,
+        timeout: float = 10.0,
+    ) -> None:
+        self._session = session or requests.Session()
+        root = base_url or os.getenv("APCA_API_BASE_URL") or "https://paper-api.alpaca.markets"
+        self._base_url = root.rstrip("/")
+        self._timeout = max(timeout, 1.0)
+
+    def run(
+        self,
+        *,
+        agent=None,
+        order_status: str = "open",
+        order_limit: int = 50,
+        order_direction: str = "desc",
+    ) -> str:  # type: ignore[override]
+        key_id = (os.getenv("APCA_API_KEY_ID") or "").strip()
+        secret_key = (os.getenv("APCA_API_SECRET_KEY") or "").strip()
+        if not key_id or not secret_key:
+            raise ToolError("APCA_API_KEY_ID and APCA_API_SECRET_KEY must be set to use this tool")
+
+        status = (order_status or "open").strip().lower()
+        if status not in {"open", "closed", "all"}:
+            raise ToolError("order_status must be one of: open, closed, all")
+
+        direction = (order_direction or "desc").strip().lower()
+        if direction not in {"asc", "desc"}:
+            raise ToolError("order_direction must be 'asc' or 'desc'")
+
+        try:
+            limit = int(order_limit)
+        except (TypeError, ValueError) as exc:
+            raise ToolError("order_limit must be an integer between 1 and 500") from exc
+        if not 1 <= limit <= 500:
+            raise ToolError("order_limit must be between 1 and 500")
+
+        headers = {
+            "APCA-API-KEY-ID": key_id,
+            "APCA-API-SECRET-KEY": secret_key,
+            "Accept": "application/json",
+            "User-Agent": USER_AGENT,
+        }
+
+        account = self._request_json("account", headers=headers)
+        positions = self._request_json("positions", headers=headers)
+        orders = self._request_json(
+            "orders",
+            headers=headers,
+            params={"status": status, "limit": limit, "direction": direction},
+        )
+
+        lines: List[str] = ["Alpaca Account Overview:"]
+        lines.extend(self._summarize_account(account))
+        lines.append("")
+        lines.extend(self._summarize_positions(positions))
+        lines.append("")
+        lines.extend(self._summarize_orders(orders, status, direction, limit))
+
+        return "\n".join(lines).strip()
+
+    def _request_json(
+        self,
+        endpoint: str,
+        *,
+        headers: Dict[str, str],
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        url = f"{self._base_url}/v2/{endpoint.lstrip('/')}"
+        try:
+            response = self._session.get(
+                url,
+                headers=headers,
+                params=params,
+                timeout=self._timeout,
+            )
+        except requests.RequestException as exc:
+            raise ToolError(f"Failed to reach Alpaca API: {exc}") from exc
+        if response.status_code >= 400:
+            detail = self._extract_error_detail(response)
+            raise ToolError(f"Alpaca API error ({response.status_code}): {detail}")
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise ToolError("Alpaca API returned malformed JSON") from exc
+
+    @staticmethod
+    def _extract_error_detail(response: requests.Response) -> str:
+        try:
+            payload = response.json()
+        except ValueError:
+            text = (response.text or "").strip()
+            return text or "no additional details"
+        if isinstance(payload, dict):
+            for key in ("message", "error", "detail"):
+                value = payload.get(key)
+                if value:
+                    return str(value)
+        if isinstance(payload, str):
+            return payload
+        try:
+            return json.dumps(payload)
+        except Exception:
+            return "unrecognized error response"
+
+    @staticmethod
+    def _summarize_account(account: Any) -> List[str]:
+        if not isinstance(account, dict):
+            return ["Status: unavailable"]
+
+        lines: List[str] = []
+        fields = [
+            ("Status", str(account.get("status") or "").upper()),
+            ("Account Number", account.get("account_number")),
+            ("Currency", account.get("currency")),
+            ("Cash", account.get("cash")),
+            ("Buying Power", account.get("buying_power")),
+            ("Portfolio Value", account.get("portfolio_value")),
+            ("Last Equity", account.get("last_equity")),
+        ]
+        for label, value in fields:
+            if value in (None, ""):
+                continue
+            lines.append(f"{label}: {value}")
+
+        blocks: List[str] = []
+        if account.get("trading_blocked"):
+            blocks.append("trading")
+        if account.get("transfers_blocked"):
+            blocks.append("transfers")
+        if account.get("account_blocked"):
+            blocks.append("account")
+        if blocks:
+            lines.append(f"Blocks: {', '.join(blocks)}")
+        return lines or ["Status: unknown"]
+
+    @staticmethod
+    def _summarize_positions(positions: Any) -> List[str]:
+        items = positions if isinstance(positions, list) else []
+        lines: List[str] = [f"Open Positions ({len(items)}):"]
+        if not items:
+            lines.append("  (none)")
+            return lines
+        for position in items[:25]:
+            symbol = position.get("symbol") or "?"
+            qty = position.get("qty") or position.get("quantity") or "0"
+            side = (position.get("side") or "").lower()
+            header = f"- {symbol}: {qty}"
+            if side:
+                header += f" {side}"
+            lines.append(header)
+
+            details: List[str] = []
+            avg_price = position.get("avg_entry_price")
+            if avg_price:
+                details.append(f"avg {avg_price}")
+            current_price = position.get("current_price")
+            if current_price:
+                details.append(f"last {current_price}")
+            market_value = position.get("market_value")
+            if market_value:
+                details.append(f"mv {market_value}")
+            unrealized_pl = position.get("unrealized_pl")
+            unrealized_plpc = position.get("unrealized_plpc")
+            if unrealized_pl or unrealized_plpc:
+                pl_parts: List[str] = []
+                if unrealized_pl:
+                    pl_parts.append(str(unrealized_pl))
+                if unrealized_plpc:
+                    pl_parts.append(AlpacaAccountTool._format_percent(unrealized_plpc))
+                details.append("P/L " + " ".join(pl_parts))
+            if details:
+                lines.append(f"  {'; '.join(details)}")
+        remaining = len(items) - 25
+        if remaining > 0:
+            lines.append(f"  … {remaining} more position(s) not shown")
+        return lines
+
+    @staticmethod
+    def _summarize_orders(
+        orders: Any,
+        status: str,
+        direction: str,
+        limit: int,
+    ) -> List[str]:
+        items = orders if isinstance(orders, list) else []
+        lines: List[str] = [f"Recent Orders [status={status}, direction={direction}, limit={limit}] ({len(items)}):"]
+        if not items:
+            lines.append("  (none)")
+            return lines
+
+        for order in items[:limit]:
+            timestamp = order.get("created_at") or order.get("submitted_at") or ""
+            side = (order.get("side") or "").upper()
+            qty = order.get("qty") or order.get("quantity") or order.get("notional") or ""
+            symbol = order.get("symbol") or "?"
+            order_type = order.get("type") or order.get("order_type") or ""
+            status_text = order.get("status") or ""
+
+            parts: List[str] = ["-"]
+            if timestamp:
+                parts.append(timestamp)
+            if side:
+                parts.append(side)
+            if qty:
+                parts.append(str(qty))
+            parts.append(symbol)
+            if order_type:
+                parts.append(order_type)
+            line = " ".join(part for part in parts if part).strip()
+            if status_text:
+                line += f" -> {status_text}"
+            lines.append(line)
+
+            detail_parts: List[str] = []
+            limit_price = order.get("limit_price")
+            if limit_price:
+                detail_parts.append(f"limit {limit_price}")
+            stop_price = order.get("stop_price") or order.get("stop_loss")
+            if stop_price:
+                detail_parts.append(f"stop {stop_price}")
+            filled_qty = order.get("filled_qty") or order.get("filled_quantity")
+            if filled_qty:
+                detail_parts.append(f"filled {filled_qty}")
+            avg_fill_price = order.get("filled_avg_price")
+            if avg_fill_price:
+                detail_parts.append(f"avg {avg_fill_price}")
+            order_id = order.get("id") or order.get("order_id")
+            if order_id:
+                detail_parts.append(f"id {order_id}")
+            if detail_parts:
+                lines.append(f"  {', '.join(detail_parts)}")
+
+        if len(items) > limit:
+            lines.append(f"  … {len(items) - limit} additional order(s) not shown")
+        return lines
+
+    @staticmethod
+    def _format_percent(value: Any) -> str:
+        try:
+            pct = float(value) * 100.0
+        except (TypeError, ValueError):
+            return str(value)
+        return f"{pct:.2f}%"
 
 
 class ReadFileTool(Tool):
@@ -1363,4 +2037,11 @@ class BrowserFindTool(_BrowserToolBase):
 
 if "__all__" not in globals():
     __all__: List[str] = []
-__all__ += ["BrowserSearchTool", "BrowserOpenTool", "BrowserFindTool"]
+__all__ += [
+    "BrowserSearchTool",
+    "BrowserOpenTool",
+    "BrowserFindTool",
+    "DelegateTaskTool",
+    "AgentSessionTool",
+    "AlpacaAccountTool",
+]

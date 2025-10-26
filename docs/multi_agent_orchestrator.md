@@ -52,6 +52,28 @@ Flags of note:
 
 If any step fails (dirty tree, CLI error, non-zero exit), remaining steps are skipped and the failure is reported.
 
+### Natural language delegation
+
+The chat agent now exposes a `delegate_task` tool. When the user requests substantial repository work, Atlas will:
+
+1. Confirm the objective and repository path.
+2. Call `delegate_task` with the chosen agents (defaults to `codex` if unspecified).
+3. Stream orchestrator events back into the chat (step start/completion, diffs, logs).
+
+This enables “codex/claude/droid” workflows directly from conversation without running the CLI manually.
+
+### Conversational loops (preview scaffolding)
+
+Codex now exposes a streaming session adapter which supports JSONL conversations (`codex exec --input-format stream-json --output-format stream-json`). The new `AgentLoopController` (`src/atlas_main/orchestrator/loop.py`) coordinates multi-turn exchanges via a `StreamingAgentSession`. This is the first step toward Atlas opening a loop, sending iterative instructions, and relaying Codex feedback/testing results back to the user without re-running the orchestrator.
+
+You can experiment today via the `agent_session` tool, which exposes actions to `start`, `send`, and `close` a streaming session. Atlas uses it to open a Codex loop, relay messages back into the chat, and keep the session alive until you close it.
+
+Next steps before full UI integration:
+
+- connect the loop controller to the chat agent (tool call + turn management)
+- surface streamed messages in the CLI/desktop app
+- add loop-aware policies (max turns, auto-test triggers, interrupt handling)
+
 ## Extending the slice
 
 1. **Real coding agents**: add adapters for Codex, Claude, Droide CLIs with richer JSON contracts (diffs, tests, reviews).
