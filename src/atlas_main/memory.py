@@ -10,7 +10,6 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, List, Optional, Sequence, Dict
 
-import numpy as np
 import os
 
 # Optional: used for abstractive summarization via local LLM
@@ -21,6 +20,24 @@ except Exception:  # pragma: no cover - type hint only
 
 
 EmbeddingFunction = Callable[[str], Optional[Sequence[float]]]
+
+
+def _to_float_list(values: Sequence[float]) -> List[float]:
+    floats: List[float] = []
+    for value in values:
+        try:
+            floats.append(float(value))
+        except (TypeError, ValueError):
+            return []
+    return floats
+
+
+def _vector_norm(values: Sequence[float]) -> float:
+    return math.sqrt(sum(v * v for v in values))
+
+
+def _dot_product(left: Sequence[float], right: Sequence[float]) -> float:
+    return sum(l * r for l, r in zip(left, right))
 
 
 @dataclass
@@ -351,22 +368,22 @@ class EpisodicMemory(MemoryBackend):
         embedding = self.embedding_fn(query)
         if not embedding:
             return []
-        query_vec = np.asarray(embedding, dtype=float)
-        if not np.isfinite(query_vec).all():
+        query_vec = _to_float_list(embedding)
+        if not query_vec or not all(math.isfinite(x) for x in query_vec):
             return []
 
         scored: list[tuple[float, MemoryRecord]] = []
         for record in self._records:
             if not record.embedding:
                 continue
-            candidate = np.asarray(record.embedding, dtype=float)
-            if candidate.shape != query_vec.shape:
+            candidate = _to_float_list(record.embedding)
+            if not candidate or len(candidate) != len(query_vec):
                 continue
-            denom = np.linalg.norm(query_vec) * np.linalg.norm(candidate)
+            denom = _vector_norm(query_vec) * _vector_norm(candidate)
             if denom == 0:
                 continue
-            score = float(np.dot(query_vec, candidate) / denom)
-            if math.isnan(score):
+            score = _dot_product(query_vec, candidate) / denom
+            if math.isnan(score) or not math.isfinite(score):
                 continue
             scored.append((score, record))
 

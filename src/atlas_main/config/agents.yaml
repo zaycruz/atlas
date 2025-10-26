@@ -26,3 +26,24 @@ agents:
     binary: droid
     timeout: 900
     auto_level: medium
+  planner-deepseek:
+    description: DeepSeek-R1 reasoning planner via Ollama
+    type: reasoning
+    provider: ollama
+    model: deepseek-r1:latest
+    timeout: 300
+    max_tokens: 8000
+  planner-sonnet:
+    description: Claude Sonnet 4.5 planner with tools
+    type: reasoning
+    provider: anthropic
+    model: claude-sonnet-4.5-20250514
+    timeout: 300
+    max_tokens: 8000
+  planner-gpt5:
+    description: OpenAI GPT-5 planner
+    type: reasoning
+    provider: openai
+    model: gpt-5-turbo
+    timeout: 300
+    max_tokens: 8000

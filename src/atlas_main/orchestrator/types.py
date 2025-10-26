@@ -67,6 +67,53 @@ class Plan:
 
 
 @dataclass
+class ParallelGroup:
+    """Group of steps that can execute concurrently."""
+
+    steps: List[StepSpec]
+    merge_strategy: str = "smart"  # smart, sequential, octopus, manual
+
+
+@dataclass
+class BranchConfig:
+    """Branch strategy for a step."""
+
+    base_branch: str = "main"
+    step_branch: str = ""
+    auto_merge: bool = True
+
+
+@dataclass
+class EnhancedStepSpec(StepSpec):
+    """Extended step with branch + parallelization metadata."""
+
+    branch_config: Optional[BranchConfig] = None
+    estimated_duration: Optional[int] = None  # seconds
+    parallel_group_id: Optional[str] = None
+
+
+@dataclass
+class EnhancedPlan(Plan):
+    """Plan with parallel execution groups and planner metadata."""
+
+    parallel_groups: List[ParallelGroup] = field(default_factory=list)
+    codebase_context: Dict[str, Any] = field(default_factory=dict)
+    reasoning_trace: str = ""
+    task_id: str = ""
+
+
+@dataclass
+class PlanningContext:
+    """Context supplied to planner agents for plan generation."""
+
+    objective: str
+    repo_path: str
+    codebase_structure: Dict[str, Any] = field(default_factory=dict)
+    constraints: Dict[str, Any] = field(default_factory=dict)
+    available_agents: List[str] = field(default_factory=list)
+
+
+@dataclass
 class TaskResult:
     """Final aggregation of step outcomes."""
 

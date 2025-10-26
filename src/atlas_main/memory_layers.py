@@ -20,20 +20,35 @@ from typing import Any, Callable, Iterable, List, Optional, Sequence, Tuple
 
 from .telemetry import Telemetry
 
-import numpy as np
-
-
 EmbedFn = Callable[[str], Optional[Sequence[float]]]
 
 
 LOGGER = logging.getLogger(__name__)
 
 
-def _cosine(a: np.ndarray, b: np.ndarray) -> float:
-    denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+def _to_float_vector(values: Sequence[float]) -> Optional[List[float]]:
+    vector: List[float] = []
+    for value in values:
+        try:
+            vector.append(float(value))
+        except (TypeError, ValueError):
+            return None
+    return vector
+
+
+def _dot(left: Sequence[float], right: Sequence[float]) -> float:
+    return sum(l * r for l, r in zip(left, right))
+
+
+def _vector_norm(values: Sequence[float]) -> float:
+    return math.sqrt(sum(v * v for v in values))
+
+
+def _cosine(a: Sequence[float], b: Sequence[float]) -> float:
+    denom = _vector_norm(a) * _vector_norm(b)
     if denom == 0:
         return 0.0
-    return float(np.dot(a, b) / denom)
+    return float(_dot(a, b) / denom)
 
 
 def _estimate_tokens(text: str) -> int:
@@ -253,7 +268,9 @@ class EpisodicSQLiteMemory:
         qvec = self.embed_fn(query)
         if not qvec:
             return []
-        q = np.asarray(qvec, dtype=float)
+        q = _to_float_vector(qvec)
+        if not q:
+            return []
         cur = self._conn.cursor()
         cur.execute("SELECT id, ts, user, assistant, embedding, metadata FROM episodes")
         rows = cur.fetchall()
@@ -263,10 +280,10 @@ class EpisodicSQLiteMemory:
                 continue
             try:
                 emb = json.loads(emb_json)
-                v = np.asarray(emb, dtype=float)
             except Exception:
                 continue
-            if v.shape != q.shape:
+            v = _to_float_vector(emb) if isinstance(emb, Sequence) else None
+            if not v or len(v) != len(q):
                 continue
             s = _cosine(q, v)
             meta: dict[str, Any] = {}
@@ -330,7 +347,7 @@ class SemanticMemory:
         self.json_path = Path(json_path).expanduser()
         self.embed_fn = embed_fn
         self._facts: List[dict] = []
-        self._embeddings: List[Optional[np.ndarray]] = []
+        self._embeddings: List[Optional[List[float]]] = []
         self._load()
         self._last_recalled: List[dict] = []
 
@@ -409,13 +426,13 @@ class SemanticMemory:
             normalized.add(text)
         return sorted(normalized)
 
-    def _find_similar_fact(self, vector: np.ndarray, *, threshold: float = 0.9) -> Optional[int]:
-        if vector.size == 0:
+    def _find_similar_fact(self, vector: Sequence[float], *, threshold: float = 0.9) -> Optional[int]:
+        if not vector:
             return None
         for idx, existing in enumerate(self._embeddings):
             if existing is None:
                 continue
-            if existing.shape != vector.shape:
+            if len(existing) != len(vector):
                 continue
             score = _cosine(existing, vector)
             if score >= threshold:
@@ -488,7 +505,9 @@ class SemanticMemory:
             if self.embed_fn is not None:
                 vec = self.embed_fn(normalized)
                 if vec:
-                    new_vec = np.asarray(vec, dtype=float)
+                    new_vec = _to_float_vector(vec)
+                    if not new_vec:
+                        raise ValueError("invalid embedding vector")
                     duplicate_idx = self._find_similar_fact(new_vec, threshold=0.92)
                     if duplicate_idx is not None:
                         existing = self._facts[duplicate_idx]
@@ -611,7 +630,9 @@ class SemanticMemory:
         qvec = self.embed_fn(query)
         if not qvec:
             return []
-        q = np.asarray(qvec, dtype=float)
+        q = _to_float_vector(qvec)
+        if not q:
+            return []
         query_tokens = self._tokenize_query(query)
         scored: List[Tuple[float, dict, int]] = []
         similarity_weight = max(0.0, float(similarity_weight))
@@ -621,11 +642,12 @@ class SemanticMemory:
             if self._embeddings[i] is None:
                 try:
                     v = self.embed_fn(str(fact.get("text", "")))
-                    self._embeddings[i] = None if not v else np.asarray(v, dtype=float)
+                    vec = _to_float_vector(v) if v else None
+                    self._embeddings[i] = vec
                 except Exception:
                     self._embeddings[i] = None
             v = self._embeddings[i]
-            if v is None or v.shape != q.shape:
+            if v is None or len(v) != len(q):
                 continue
             base = _cosine(q, v)
             bonus = self._tag_bonus(query_tokens, fact.get("tags", []))

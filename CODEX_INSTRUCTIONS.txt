@@ -1,0 +1,174 @@
+====================================
+CODEX: IMPLEMENT SUB-AGENT ARCHITECTURE
+====================================
+
+CONTEXT:
+You're implementing a multi-agent architecture for Atlas that enables:
+1. Intelligent planning via reasoning models (DeepSeek-R1, Sonnet, GPT-5)
+2. Parallel execution of coding agents on separate branches
+3. Feedback-based plan revision
+
+DOCUMENTS TO REVIEW:
+1. docs/SUB_AGENT_ARCHITECTURE.md - Full technical design
+2. docs/SUB_AGENT_PRD.md - Product requirements
+3. docs/IMPLEMENTATION_GUIDE.md - YOUR MAIN REFERENCE (step-by-step tasks)
+
+REPOSITORY STRUCTURE:
+- src/atlas_main/
+  - agents/ - Agent adapters (codex, claude, droid)
+  - orchestrator/ - Task orchestration logic
+  - tools.py - Atlas tools
+  - agent.py - Main Atlas agent class
+  - config/agents.yaml - Agent configurations
+
+CURRENT CAPABILITIES:
+✓ Sequential orchestration (orchestrator/engine.py)
+✓ Agent factory spawns codex/claude/droid
+✓ delegate_task and agent_session tools
+✓ SimplePlanner (hardcoded 3-step plans)
+
+TARGET STATE:
+✓ Reasoning agent adapter (DeepSeek-R1, Sonnet, GPT-5)
+✓ Parallel orchestrator (concurrent agent execution)
+✓ Branch-based isolation (git branch per agent)
+✓ Planning session manager (bounded conversations)
+✓ Codebase context analyzer
+✓ Feedback loop (plan revision on failure)
+✓ plan_and_execute tool in Atlas
+
+====================================
+EXECUTION PLAN
+====================================
+
+PHASE 1: FOUNDATION (Start Here)
+---------------------------------
+Read: docs/IMPLEMENTATION_GUIDE.md section "Phase 1"
+
+Tasks:
+1. Create agents/reasoning.py - ReasoningAgentAdapter
+   - Support Ollama (DeepSeek-R1), Anthropic API, OpenAI API
+   - Implement AgentAdapter protocol
+   - Handle streaming responses
+
+2. Update orchestrator/types.py - Add parallel types
+   - ParallelGroup, BranchConfig, EnhancedStepSpec, EnhancedPlan
+   - PlanningContext
+
+3. Create orchestrator/context.py - CodebaseContext analyzer
+   - Analyze repo structure, detect tech stack
+   - Get git status, recent commits
+
+4. Create orchestrator/planning_session.py - PlanningSession
+   - Bounded conversation (max 8 rounds)
+   - Inject codebase context
+   - Return validated EnhancedPlan
+
+5. Update agents/factory.py
+   - Add "reasoning" agent type support
+
+6. Update config/agents.yaml
+   - Add planner-deepseek, planner-sonnet, planner-gpt5
+
+PHASE 2: PARALLEL EXECUTION
+----------------------------
+Read: docs/IMPLEMENTATION_GUIDE.md section "Phase 2"
+
+Tasks:
+1. Create orchestrator/branches.py - BranchStrategy
+   - Create/merge branches for agent work
+   - Implement merge strategies (smart, sequential, octopus)
+   - Conflict detection
+
+2. Create orchestrator/parallel_engine.py - ParallelOrchestrator
+   - Extend Orchestrator from engine.py
+   - Identify parallel groups from DAG
+   - Execute with asyncio.gather
+   - Branch isolation per step
+
+3. Update orchestrator/planner.py
+   - Replace SimplePlanner with IntelligentPlanner
+   - Use PlanningSession for complex tasks
+   - Fallback logic
+
+PHASE 3: INTEGRATION
+--------------------
+Read: docs/IMPLEMENTATION_GUIDE.md section "Phase 3"
+
+Tasks:
+1. Update tools.py
+   - Add PlanAndExecuteTool
+   - Integrate IntelligentPlanner and ParallelOrchestrator
+
+2. Update agent.py
+   - Register PlanAndExecuteTool
+   - Update DEFAULT_PROMPT with plan_and_execute guidance
+
+PHASE 4: FEEDBACK LOOP
+----------------------
+Read: docs/IMPLEMENTATION_GUIDE.md section "Phase 4"
+
+Tasks:
+1. Create orchestrator/feedback.py - FeedbackCollector
+   - Capture failure context from StepResult
+   - Format for planner consumption
+
+2. Update orchestrator/planning_session.py
+   - Add revise_plan method
+
+3. Update orchestrator/parallel_engine.py
+   - Add run_task_with_revision method
+   - Auto-retry with revised plans (max 3 attempts)
+
+====================================
+TESTING
+====================================
+
+Run tests after each phase:
+- tests/orchestrator/test_planning_session.py
+- tests/orchestrator/test_parallel_engine.py
+- tests/orchestrator/test_branches.py
+- tests/agents/test_reasoning.py
+- tests/integration/test_plan_and_execute.py
+
+====================================
+DEPENDENCIES
+====================================
+
+Add to pyproject.toml if missing:
+- httpx (for Anthropic/OpenAI API calls)
+
+====================================
+VERIFICATION
+====================================
+
+After implementation, verify:
+1. ollama pull deepseek-r1:latest
+2. Test: python -m atlas_main.tools plan_and_execute --objective "Add a health check endpoint"
+3. Should see: planning session → parallel execution → branch merge
+
+====================================
+CODE STYLE NOTES
+====================================
+
+- Use async/await for all I/O
+- Follow existing patterns in engine.py and agents/
+- Add type hints (from typing import ...)
+- Use dataclasses for structured data
+- Emit events for observability
+- Handle errors gracefully (try/except with ToolError)
+- Git safety: check status before branch operations
+
+====================================
+START HERE
+====================================
+
+1. Read docs/IMPLEMENTATION_GUIDE.md fully
+2. Begin with Phase 1, Task 1.1 (agents/reasoning.py)
+3. Work sequentially through tasks
+4. Add tests as you go
+5. Commit after each phase
+
+Good luck! This is a ~1 day implementation.
+Let me know when each phase is complete.
+
+====================================

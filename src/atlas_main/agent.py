@@ -36,6 +36,7 @@ from .tools import (
     BrowserFindTool,
     DelegateTaskTool,
     AgentSessionTool,
+    AgentSessionViewerTool,
 )
 from .tools_memory import (
     SearchEpisodesTool,
@@ -114,6 +115,7 @@ class AtlasAgent:
         self.tools.register(ShellCommandTool())
         self.tools.register(DelegateTaskTool())
         self.tools.register(AgentSessionTool())
+        self.tools.register(AgentSessionViewerTool())
         self.tools.register(AlpacaAccountTool())
         self.tools.register(CurrentTimeTool())
         self.layered_memory_config = layered_memory_config or LayeredMemoryConfig()
@@ -127,7 +129,7 @@ class AtlasAgent:
             self.tools.register(BrowserOpenTool(resolver))
             self.tools.register(BrowserFindTool(resolver))
         else:
-            self.tools.register(WebSearchTool())
+            self.tools.register(WebSearchTool(auto_init=not test_mode))
         self._debug_log_path = os.getenv("ATLAS_AGENT_LOG")
         self._register_memory_tools()
         self._debug_log_path = os.getenv("ATLAS_AGENT_LOG")

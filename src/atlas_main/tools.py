@@ -810,15 +810,25 @@ class WebSearchTool(Tool):
     )
     capabilities = frozenset({"net:http", "net:crawl"})
 
-    def __init__(self, *, session: Optional[requests.Session] = None) -> None:
+    def __init__(
+        self,
+        *,
+        session: Optional[requests.Session] = None,
+        auto_init: bool = True,
+    ) -> None:
         self._session = session or requests.Session()
         self._sync_crawler = None
         self._async_crawler_cls = None
         self._async_cache_mode = None
-        self._init_crawler()
+        self._init_attempted = False
+        if auto_init:
+            self._init_crawler()
 
     def _init_crawler(self) -> None:
         """Detect available Crawl4AI backends."""
+        if self._init_attempted:
+            return
+        self._init_attempted = True
         try:
             from crawl4ai import WebCrawler  # type: ignore
         except Exception:
@@ -860,6 +870,9 @@ class WebSearchTool(Tool):
             domain = domain.strip()
             if domain and f"site:{domain}" not in query:
                 query = f"{query} site:{domain}"
+
+        if not self._init_attempted:
+            self._init_crawler()
 
         # Get search results from DuckDuckGo
         search_results = self._search_duckduckgo(query)
@@ -1508,6 +1521,273 @@ class AlpacaAccountTool(Tool):
         return f"{pct:.2f}%"
 
 
+class AlpacaOrderTool(Tool):
+    """Submit buy or sell orders to the Alpaca Markets trading API."""
+
+    name = "alpaca_order"
+    description = (
+        "Place market, limit, stop, stop-limit, or trailing-stop orders through Alpaca Markets."
+    )
+    args_hint = (
+        "symbol (str); side (buy|sell); qty or notional; order_type (default 'market'); "
+        "time_in_force (default 'day'); limit_price/stop_price/trail_price/trail_percent optional; "
+        "extended_hours (bool)"
+    )
+    capabilities = frozenset({"net:http"})
+    parameters_schema: Dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "symbol": {"type": "string", "description": "Ticker symbol to trade."},
+            "side": {
+                "type": "string",
+                "enum": ["buy", "sell"],
+                "description": "Direction of the order.",
+            },
+            "qty": {
+                "oneOf": [{"type": "string"}, {"type": "number"}],
+                "description": "Number of shares to trade.",
+            },
+            "notional": {
+                "oneOf": [{"type": "string"}, {"type": "number"}],
+                "description": "Dollar amount to trade instead of share quantity.",
+            },
+            "order_type": {
+                "type": "string",
+                "enum": ["market", "limit", "stop", "stop_limit", "trailing_stop"],
+                "default": "market",
+                "description": "Order execution type.",
+            },
+            "time_in_force": {
+                "type": "string",
+                "enum": ["day", "gtc", "opg", "cls", "ioc", "fok"],
+                "default": "day",
+                "description": "Order validity window.",
+            },
+            "limit_price": {
+                "oneOf": [{"type": "string"}, {"type": "number"}],
+                "description": "Limit price for limit or stop-limit orders.",
+            },
+            "stop_price": {
+                "oneOf": [{"type": "string"}, {"type": "number"}],
+                "description": "Stop price for stop or stop-limit orders.",
+            },
+            "extended_hours": {
+                "type": "boolean",
+                "description": "Enable extended-hours trading where allowed.",
+            },
+            "client_order_id": {
+                "type": "string",
+                "description": "Optional client-provided identifier.",
+            },
+            "trail_price": {
+                "oneOf": [{"type": "string"}, {"type": "number"}],
+                "description": "Trail price for trailing stop orders.",
+            },
+            "trail_percent": {
+                "oneOf": [{"type": "string"}, {"type": "number"}],
+                "description": "Trail percent for trailing stop orders.",
+            },
+            "order_class": {
+                "type": "string",
+                "description": "Advanced order class such as bracket, oco, oto.",
+            },
+        },
+        "required": ["symbol", "side"],
+        "anyOf": [
+            {"required": ["qty"]},
+            {"required": ["notional"]},
+        ],
+        "additionalProperties": False,
+    }
+
+    def __init__(
+        self,
+        *,
+        session: Optional[requests.Session] = None,
+        base_url: Optional[str] = None,
+        timeout: float = 10.0,
+    ) -> None:
+        self._session = session or requests.Session()
+        root = base_url or os.getenv("APCA_API_BASE_URL") or "https://paper-api.alpaca.markets"
+        self._base_url = root.rstrip("/")
+        self._timeout = max(timeout, 1.0)
+
+    def run(
+        self,
+        *,
+        agent=None,
+        symbol: str,
+        side: str,
+        qty: Optional[Any] = None,
+        notional: Optional[Any] = None,
+        order_type: str = "market",
+        time_in_force: str = "day",
+        limit_price: Optional[Any] = None,
+        stop_price: Optional[Any] = None,
+        extended_hours: Optional[bool] = None,
+        client_order_id: Optional[str] = None,
+        trail_price: Optional[Any] = None,
+        trail_percent: Optional[Any] = None,
+        order_class: Optional[str] = None,
+    ) -> str:  # type: ignore[override]
+        _load_alpaca_credentials_from_dotenv()
+        key_id = (os.getenv("APCA_API_KEY_ID") or "").strip()
+        secret_key = (os.getenv("APCA_API_SECRET_KEY") or "").strip()
+        if not key_id or not secret_key:
+            raise ToolError("APCA_API_KEY_ID and APCA_API_SECRET_KEY must be set to use this tool")
+
+        symbol_clean = (symbol or "").strip().upper()
+        if not symbol_clean:
+            raise ToolError("symbol is required")
+        side_value = (side or "").strip().lower()
+        if side_value not in {"buy", "sell"}:
+            raise ToolError("side must be 'buy' or 'sell'")
+
+        qty_provided = qty is not None
+        notional_provided = notional is not None
+        if qty_provided and notional_provided:
+            raise ToolError("Specify either qty or notional, not both")
+        if not qty_provided and not notional_provided:
+            raise ToolError("Either qty or notional must be provided")
+
+        order_type_value = (order_type or "market").strip().lower() or "market"
+        valid_types = {"market", "limit", "stop", "stop_limit", "trailing_stop"}
+        if order_type_value not in valid_types:
+            raise ToolError("order_type must be one of: market, limit, stop, stop_limit, trailing_stop")
+
+        time_in_force_value = (time_in_force or "day").strip().lower() or "day"
+        valid_tif = {"day", "gtc", "opg", "cls", "ioc", "fok"}
+        if time_in_force_value not in valid_tif:
+            raise ToolError("time_in_force must be one of: day, gtc, opg, cls, ioc, fok")
+
+        if order_type_value in {"limit", "stop_limit"} and limit_price is None:
+            raise ToolError("limit_price is required for limit or stop_limit orders")
+        if order_type_value in {"stop", "stop_limit"} and stop_price is None:
+            raise ToolError("stop_price is required for stop or stop_limit orders")
+        if order_type_value == "trailing_stop" and trail_price is None and trail_percent is None:
+            raise ToolError("trail_price or trail_percent is required for trailing_stop orders")
+
+        payload: Dict[str, Any] = {
+            "symbol": symbol_clean,
+            "side": side_value,
+            "type": order_type_value,
+            "time_in_force": time_in_force_value,
+        }
+        if qty_provided:
+            payload["qty"] = AlpacaOrderTool._stringify_numeric(qty, "qty")
+        if notional_provided:
+            payload["notional"] = AlpacaOrderTool._stringify_numeric(notional, "notional")
+        if limit_price is not None:
+            payload["limit_price"] = AlpacaOrderTool._stringify_numeric(limit_price, "limit_price")
+        if stop_price is not None:
+            payload["stop_price"] = AlpacaOrderTool._stringify_numeric(stop_price, "stop_price")
+        if trail_price is not None:
+            payload["trail_price"] = AlpacaOrderTool._stringify_numeric(trail_price, "trail_price")
+        if trail_percent is not None:
+            payload["trail_percent"] = AlpacaOrderTool._stringify_numeric(trail_percent, "trail_percent")
+        if client_order_id:
+            payload["client_order_id"] = str(client_order_id).strip()
+        if order_class:
+            payload["order_class"] = str(order_class).strip()
+        if extended_hours is not None:
+            payload["extended_hours"] = bool(extended_hours)
+
+        headers = {
+            "APCA-API-KEY-ID": key_id,
+            "APCA-API-SECRET-KEY": secret_key,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
+        }
+
+        url = f"{self._base_url}/v2/orders"
+        try:
+            response = self._session.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=self._timeout,
+            )
+        except requests.RequestException as exc:
+            raise ToolError(f"Failed to reach Alpaca API: {exc}") from exc
+
+        if response.status_code >= 400:
+            detail = AlpacaAccountTool._extract_error_detail(response)
+            raise ToolError(f"Alpaca API error ({response.status_code}): {detail}")
+
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise ToolError("Alpaca API returned malformed JSON") from exc
+
+        return AlpacaOrderTool._summarize_submission(data, payload)
+
+    @staticmethod
+    def _stringify_numeric(value: Any, field: str) -> str:
+        text = str(value).strip()
+        if not text:
+            raise ToolError(f"{field} cannot be empty")
+        return text
+
+    @staticmethod
+    def _summarize_submission(data: Any, payload: Dict[str, Any]) -> str:
+        details = data if isinstance(data, dict) else {}
+        symbol = (details.get("symbol") or payload.get("symbol") or "").upper()
+        side = (details.get("side") or payload.get("side") or "").upper()
+        quantity = (
+            details.get("qty")
+            or details.get("quantity")
+            or payload.get("qty")
+            or payload.get("notional")
+        )
+        order_type = (details.get("type") or payload.get("type") or "").upper()
+
+        header_parts = [part for part in [side, str(quantity) if quantity else "", symbol, order_type] if part]
+        header = " ".join(header_parts) if header_parts else "Order submitted"
+
+        lines = ["Alpaca Order Submission:", header]
+
+        status = details.get("status") or "submitted"
+        if status:
+            lines.append(f"Status: {status}")
+        order_id = details.get("id") or details.get("order_id")
+        if order_id:
+            lines.append(f"ID: {order_id}")
+        submitted_at = details.get("submitted_at") or details.get("created_at")
+        if submitted_at:
+            lines.append(f"Submitted: {submitted_at}")
+        filled = details.get("filled_qty") or details.get("filled_quantity")
+        if filled:
+            lines.append(f"Filled: {filled}")
+        tif = details.get("time_in_force") or payload.get("time_in_force")
+        if tif:
+            lines.append(f"Time in force: {tif}")
+        extended = details.get("extended_hours")
+        if extended is None:
+            extended = payload.get("extended_hours")
+        if extended:
+            lines.append("Extended hours: enabled")
+
+        price_parts: List[str] = []
+        limit_price = details.get("limit_price") or payload.get("limit_price")
+        if limit_price:
+            price_parts.append(f"limit {limit_price}")
+        stop_price = details.get("stop_price") or payload.get("stop_price")
+        if stop_price:
+            price_parts.append(f"stop {stop_price}")
+        trail_price = details.get("trail_price") or payload.get("trail_price")
+        if trail_price:
+            price_parts.append(f"trail {trail_price}")
+        trail_percent = details.get("trail_percent") or payload.get("trail_percent")
+        if trail_percent:
+            price_parts.append(f"trail% {trail_percent}")
+        if price_parts:
+            lines.append("; ".join(price_parts))
+
+        return "\n".join(lines).strip()
+
+
+
 class ReadFileTool(Tool):
     """Read text from files on disk."""
 
@@ -2057,6 +2337,137 @@ class BrowserFindTool(_BrowserToolBase):
         result = session.find(pattern=pattern, cursor=int(kwargs.get("cursor", -1)))
         return result["pageText"]
 
+
+class AgentSessionViewerTool(Tool):
+    """View and manage active agent sessions in Atlas."""
+
+    name = "agent_session_viewer"
+    description = (
+        "View all active agent sessions, their status, and perform management actions. "
+        "Shows session IDs, agent types, objectives, and repository paths. "
+        "Can also close individual sessions or all sessions."
+    )
+    args_hint = (
+        "action=list|close|close_all session_id=<id> include_details=false"
+    )
+    capabilities = frozenset({"process", "filesystem"})
+    parameters_schema: Dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["list", "close", "close_all"],
+                "description": "Action to perform: list (default), close a specific session, or close all sessions."
+            },
+            "session_id": {
+                "type": "string",
+                "description": "Session ID to close (required for action=close)."
+            },
+            "include_details": {
+                "type": "boolean",
+                "description": "Include detailed context information for each session (default false)."
+            }
+        },
+        "additionalProperties": False
+    }
+
+    def run(self, *, agent=None, **kwargs: Any) -> str:  # type: ignore[override]
+        action = (kwargs.get("action") or "list").strip().lower()
+
+        if action == "list":
+            return self._list_sessions(kwargs.get("include_details", False))
+        elif action == "close":
+            return self._close_session(kwargs.get("session_id"))
+        elif action == "close_all":
+            return self._close_all_sessions()
+        else:
+            raise ToolError(f"Unknown action: {action}. Use list, close, or close_all.")
+
+    def _list_sessions(self, include_details: bool) -> str:
+        """List all active sessions with their information."""
+        active_sessions = _AGENT_SESSION_REGISTRY
+
+        if not active_sessions:
+            return "No active agent sessions."
+
+        lines = [f"Active Agent Sessions ({len(active_sessions)}):"]
+        lines.append("=" * 50)
+
+        for session_id, handle in active_sessions.items():
+            step = handle.get("step")
+            repo_path = handle.get("repo_path", "Unknown")
+            context = handle.get("context", {})
+
+            # Extract basic session info
+            agent_id = step.agent_id if step else "Unknown"
+            description = step.description if step else "No description"
+
+            lines.append(f"Session ID: {session_id}")
+            lines.append(f"  Agent: {agent_id}")
+            lines.append(f"  Repository: {repo_path}")
+            lines.append(f"  Objective: {description[:100]}{'...' if len(description) > 100 else ''}")
+
+            if include_details:
+                lines.append(f"  Step ID: {step.id if step else 'Unknown'}")
+                if context:
+                    context_str = json.dumps(context, indent=2)[:200]
+                    lines.append(f"  Context: {context_str}{'...' if len(context_str) > 200 else ''}")
+                lines.append(f"  Registry Keys: {list(handle.keys())}")
+
+            lines.append("")  # Empty line between sessions
+
+        return "\n".join(lines)
+
+    def _close_session(self, session_id: Optional[str]) -> str:
+        """Close a specific session by ID."""
+        if not session_id:
+            raise ToolError("session_id is required for action=close")
+
+        handle = _AGENT_SESSION_REGISTRY.pop(session_id, None)
+        if not handle:
+            return f"Session '{session_id}' not found or already closed."
+
+        # Close the session properly
+        session = handle.get("session")
+        adapter = handle.get("adapter")
+
+        async def _close_async():
+            try:
+                if session:
+                    await session.close()
+                if adapter:
+                    close_func = getattr(adapter, "close", None)
+                    if close_func:
+                        result = close_func()
+                        if asyncio.iscoroutine(result):
+                            await result
+            except Exception as e:
+                return f"Error during cleanup: {e}"
+            return None
+
+        try:
+            error = asyncio.run(_close_async())
+            if error:
+                return f"Session '{session_id}' closed with warnings: {error}"
+            return f"Session '{session_id}' closed successfully."
+        except Exception as e:
+            return f"Session '{session_id}' closed but cleanup had errors: {e}"
+
+    def _close_all_sessions(self) -> str:
+        """Close all active sessions."""
+        if not _AGENT_SESSION_REGISTRY:
+            return "No active sessions to close."
+
+        session_ids = list(_AGENT_SESSION_REGISTRY.keys())
+        results = []
+
+        for session_id in session_ids:
+            result = self._close_session(session_id)
+            results.append(result)
+
+        return f"Closed {len(session_ids)} session(s):\n" + "\n".join(f"- {result}" for result in results)
+
+
 if "__all__" not in globals():
     __all__: List[str] = []
 __all__ += [
@@ -2065,5 +2476,6 @@ __all__ += [
     "BrowserFindTool",
     "DelegateTaskTool",
     "AgentSessionTool",
+    "AgentSessionViewerTool",
     "AlpacaAccountTool",
 ]

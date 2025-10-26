@@ -11,6 +11,7 @@ from .process import ProcessAgentAdapter
 from .codex import CodexAgentAdapter
 from .claude import ClaudeAgentAdapter
 from .droid import DroidAgentAdapter
+from .reasoning import ReasoningAgentAdapter
 
 
 class AgentFactory:
@@ -74,6 +75,20 @@ class AgentFactory:
                 auto_level=auto_level,
                 env=env,
                 extra_args=extra_args,
+            )
+        if agent_type == "reasoning":
+            model = str(config.get("model", "deepseek-r1"))
+            provider = str(config.get("provider", "ollama"))
+            timeout = float(config.get("timeout", 300))
+            api_key = config.get("api_key")
+            max_tokens = int(config.get("max_tokens", 8000))
+            return ReasoningAgentAdapter(
+                agent_id=agent_id,
+                model=model,
+                provider=provider,
+                timeout=timeout,
+                api_key=api_key,
+                max_tokens=max_tokens,
             )
         raise ValueError(f"Unsupported agent type '{agent_type}' for '{agent_id}'")
 
