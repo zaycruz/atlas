@@ -631,10 +631,17 @@ class PlanAndExecuteTool(Tool):
             id=f"plan-{uuid.uuid4().hex[:8]}",
             objective=objective,
             steps=list(plan.steps),
-            shared_context={"plan": asdict(plan)},
+            shared_context={
+                "plan": asdict(plan),
+                "planner_agent_id": planner_agent_id,
+            },
         )
 
-        result = await orchestrator.run_task(task_spec)
+        run = getattr(orchestrator, "run_task_with_revision", None)
+        if callable(run):
+            result = await run(task_spec, max_revisions=3)
+        else:
+            result = await orchestrator.run_task(task_spec)
         if not result.succeeded:
             failed_steps = [r.step_id for r in result.step_results if r and not r.succeeded]
             raise ToolError(

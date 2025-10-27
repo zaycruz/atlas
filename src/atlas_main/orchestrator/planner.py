@@ -113,6 +113,14 @@ class IntelligentPlanner:
             return True
         return len(normalized.split()) >= 8
 
+    @property
+    def planner_agent_id(self) -> str:
+        return self._planner_agent_id
+
+    @property
+    def max_rounds(self) -> int:
+        return self._max_rounds
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------

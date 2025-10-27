@@ -8,8 +8,9 @@ import pytest
 
 from atlas_main.agents.base import ConversationMessage
 from atlas_main.agents.reasoning import ReasoningAgentAdapter
+from atlas_main.orchestrator.feedback import FailureContext
 from atlas_main.orchestrator.planning_session import PlanningSession, PlanningSessionError
-from atlas_main.orchestrator.types import PlanningContext
+from atlas_main.orchestrator.types import PlanningContext, EnhancedPlan, EnhancedStepSpec
 
 
 class _FakeSession:
@@ -104,5 +105,48 @@ def test_planning_session_retries_invalid_payload(monkeypatch):
             plan = await session.run()
         assert plan.steps[0].id == "impl"
         assert len(planner.session.sent) >= 1
+
+    asyncio.run(_run())
+
+
+def test_planning_session_revise_plan(monkeypatch):
+    revised_payload = {
+        "objective": "Add feature",
+        "steps": [
+            {
+                "id": "fix",
+                "description": "Apply fix",
+                "agent_id": "codex",
+            }
+        ],
+        "parallel_groups": [],
+        "reasoning": "Updated plan",
+    }
+
+    class _RevisionPlanner(_FakePlanner):
+        def __init__(self) -> None:
+            super().__init__()
+            reply = ConversationMessage(role="assistant", content=json.dumps(revised_payload), metadata={})
+            self.session.replies.put_nowait(reply)
+
+    async def _run():
+        planner = _RevisionPlanner()
+        original_plan = EnhancedPlan(
+            objective="Add feature",
+            steps=[
+                EnhancedStepSpec(id="impl", description="Implement", agent_id="codex"),
+            ],
+        )
+        context = PlanningContext(objective="Add feature", repo_path="/repo")
+        failure = FailureContext(
+            step_id="impl",
+            agent_id="codex",
+            error_type="execution_error",
+            error_message="Test failure",
+        )
+        async with PlanningSession(planner=planner, planning_context=context, objective="Add feature", max_rounds=3) as session:
+            plan = await session.revise_plan(original_plan, [failure])
+        assert plan.steps[0].id == "fix"
+        assert planner.session.sent
 
     asyncio.run(_run())

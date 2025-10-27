@@ -8,7 +8,19 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .branches import BranchStrategy
 from .engine import EventCallback, Orchestrator, _call_agent, _maybe_close
-from .types import BranchConfig, EnhancedPlan, EnhancedStepSpec, ParallelGroup, StepResult, StepSpec, TaskResult, TaskSpec
+from .feedback import FeedbackCollector
+from .planning_session import PlanningSession, PlanningSessionError
+from .types import (
+    BranchConfig,
+    EnhancedPlan,
+    EnhancedStepSpec,
+    ParallelGroup,
+    PlanningContext,
+    StepResult,
+    StepSpec,
+    TaskResult,
+    TaskSpec,
+)
 
 
 class ParallelOrchestrator(Orchestrator):
@@ -74,6 +86,60 @@ class ParallelOrchestrator(Orchestrator):
         status = "succeeded" if not failures else "failed"
         ordered_results = [executed.get(step.id) for step in plan.steps if step.id in executed]
         return TaskResult(task_id=task.id, status=status, step_results=ordered_results)
+
+    async def run_task_with_revision(
+        self,
+        task: TaskSpec,
+        *,
+        max_revisions: int = 3,
+    ) -> TaskResult:
+        current_task = task
+        result = await self.run_task(current_task)
+        attempts = 0
+        while not result.succeeded and attempts < max_revisions:
+            failure_results = [sr for sr in result.step_results if sr and sr.status == "failed"]
+            if not failure_results:
+                break
+
+            plan_dict = self._extract_plan_dict(current_task)
+            if not plan_dict:
+                break
+            planner_agent_id = self._extract_planner_agent_id(current_task) or "planner-deepseek"
+            try:
+                planner_agent = await self._agent_factory.create(planner_agent_id)
+            except Exception:
+                break
+
+            plan = self._plan_from_dict(plan_dict)
+            collector = FeedbackCollector()
+            contexts = [collector.capture_failure(sr) for sr in failure_results]
+
+            planning_context = PlanningContext(
+                objective=current_task.objective,
+                repo_path=self._infer_repo_path(current_task),
+                codebase_structure=plan.codebase_context,
+            )
+
+            try:
+                session = PlanningSession(
+                    planner=planner_agent,
+                    planning_context=planning_context,
+                    objective=current_task.objective,
+                    max_rounds=8,
+                )
+                async with session as active:
+                    revised_plan = await active.revise_plan(plan, contexts)
+            except PlanningSessionError:
+                break
+            except Exception:
+                break
+            else:
+                current_task = self._task_from_plan(current_task, revised_plan, planner_agent_id)
+                result = await self.run_task(current_task)
+                attempts += 1
+                continue
+            break
+        return result
 
     # ------------------------------------------------------------------
     # Parallel execution helpers
@@ -276,3 +342,79 @@ class ParallelOrchestrator(Orchestrator):
 
         missing = [steps_by_id[sid] for sid in steps_by_id.keys() - processed]
         return groups, missing
+
+    def _extract_plan_dict(self, task: TaskSpec) -> Optional[Dict[str, Any]]:
+        context = task.shared_context
+        if isinstance(context, dict):
+            plan_data = context.get("plan")
+            if isinstance(plan_data, dict):
+                return plan_data
+        return None
+
+    def _extract_planner_agent_id(self, task: TaskSpec) -> Optional[str]:
+        context = task.shared_context
+        if isinstance(context, dict):
+            value = context.get("planner_agent_id")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    def _plan_from_dict(self, data: Dict[str, Any]) -> EnhancedPlan:
+        steps: List[EnhancedStepSpec] = []
+        for step_data in data.get("steps", []):
+            branch_cfg_data = step_data.get("branch_config")
+            branch_cfg = None
+            if isinstance(branch_cfg_data, dict):
+                branch_cfg = BranchConfig(
+                    base_branch=str(branch_cfg_data.get("base_branch", "main")),
+                    step_branch=str(branch_cfg_data.get("step_branch", "")),
+                    auto_merge=bool(branch_cfg_data.get("auto_merge", True)),
+                )
+            steps.append(
+                EnhancedStepSpec(
+                    id=str(step_data.get("id", "")),
+                    description=str(step_data.get("description", "")),
+                    agent_id=str(step_data.get("agent_id", "")),
+                    inputs=dict(step_data.get("inputs", {})),
+                    tags=list(step_data.get("tags", [])),
+                    depends_on=list(step_data.get("depends_on", [])),
+                    branch_config=branch_cfg,
+                    estimated_duration=step_data.get("estimated_duration"),
+                    parallel_group_id=step_data.get("parallel_group_id"),
+                )
+            )
+        plan = EnhancedPlan(
+            objective=str(data.get("objective", "")),
+            steps=steps,
+            notes=str(data.get("notes", "")),
+        )
+        plan.codebase_context = data.get("codebase_context", {}) or {}
+        plan.reasoning_trace = str(data.get("reasoning_trace", "")) if data.get("reasoning_trace") else ""
+        plan.task_id = str(data.get("task_id", "")) if data.get("task_id") else ""
+        return plan
+
+    def _task_from_plan(
+        self,
+        original_task: TaskSpec,
+        plan: EnhancedPlan,
+        planner_agent_id: str,
+    ) -> TaskSpec:
+        shared_context: Dict[str, Any] = {}
+        if isinstance(original_task.shared_context, dict):
+            shared_context.update(original_task.shared_context)
+        shared_context["plan"] = asdict(plan)
+        shared_context["planner_agent_id"] = planner_agent_id
+        return TaskSpec(
+            id=original_task.id,
+            objective=original_task.objective,
+            steps=list(plan.steps),
+            shared_context=shared_context,
+            metadata=dict(getattr(original_task, "metadata", {}) or {}),
+        )
+
+    def _infer_repo_path(self, task: TaskSpec) -> str:
+        for step in task.steps:
+            inputs = getattr(step, "inputs", {})
+            if isinstance(inputs, dict) and inputs.get("repo_path"):
+                return str(inputs["repo_path"])
+        return ""

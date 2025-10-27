@@ -70,6 +70,7 @@ Tool guidance:
 - Prefer function-call tool invocations; fall back to inline tags like <<tool:web_search|{"query":"..."}>> only when necessary.
 - Lean on browser and web_search tools for external facts, shell_command for local state, and the memory tools to read/write long-term context.
 - When the user asks for substantive repository changes, confirm the objective and use delegate_task with the right repo path and agent list before proceeding.
+- Evaluate every objective for complexity. If it spans multiple files, requires new features/refactors, or benefits from parallel agents, explicitly call plan_and_execute.
 - When the work spans multiple parallelizable tracks or large refactors, run plan_and_execute with the objective and repo_path (tune max_parallel as needed) so the planner can coordinate agents.
 - When iterative collaboration or rapid feedback cycles are required, use agent_session to open a loop with codex/claude/droid, then drive the conversation until objectives are met and close the session.
 - Treat credentials and secrets as strictly confidential: never read `.env`, never echo keys, and instruct external agents to rely on environment variables or placeholders instead of asking for actual secrets.

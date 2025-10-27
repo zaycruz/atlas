@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Mapping, Optional
 
 from ..agents.base import ConversationMessage
 from ..agents.reasoning import ReasoningAgentAdapter
+from .feedback import FailureContext, FeedbackCollector
 from .types import EnhancedPlan, PlanningContext, StepSpec
 
 
@@ -86,6 +87,33 @@ class PlanningSession:
             )
         raise PlanningSessionError("Planner failed to produce a valid plan within round limit")
 
+    async def revise_plan(
+        self,
+        original_plan: EnhancedPlan,
+        failure_contexts: List[FailureContext],
+    ) -> EnhancedPlan:
+        if self._session is None:
+            raise PlanningSessionError("session not started")
+        prompt = self._build_revision_prompt(original_plan, failure_contexts)
+        await self._session.send(
+            ConversationMessage(
+                role="user",
+                content=prompt,
+                metadata={"kind": "revision_request"},
+            )
+        )
+        reply = await self._session.receive(timeout=self._response_timeout)
+        if reply is None:
+            raise PlanningSessionError("Planner did not respond to revision request")
+        candidate = self._extract_plan(reply.content)
+        if candidate is None:
+            raise PlanningSessionError("Planner returned invalid revision plan")
+        candidate.reasoning_trace = reply.metadata.get("reasoning_trace", "")
+        if not candidate.codebase_context:
+            candidate.codebase_context = original_plan.codebase_context
+        candidate.task_id = reply.metadata.get("task_id", original_plan.task_id)
+        return candidate
+
     def _extract_plan(self, payload: str) -> Optional[EnhancedPlan]:
         if not payload:
             return None
@@ -117,3 +145,13 @@ class PlanningSession:
             depends_on=list(data.get("depends_on", [])),
         )
 
+    def _build_revision_prompt(self, original_plan: EnhancedPlan, failures: List[FailureContext]) -> str:
+        collector = FeedbackCollector()
+        failure_reports = "\n\n".join(collector.format_for_planner(failure) for failure in failures)
+        return (
+            "The previous execution plan failed. Review the failure reports and propose a revised plan.\n\n"
+            f"Objective: {self._objective}\n"
+            f"Original Plan Steps: {[step.id for step in original_plan.steps]}\n\n"
+            f"Failure Reports:\n{failure_reports}\n\n"
+            "Please respond with an updated plan in the same JSON format, addressing the reported issues."
+        )
